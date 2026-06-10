@@ -9,6 +9,10 @@ This repo is built for a team: several people benchmark models on their own
 machines, commit the small result files, and merge them into `main`. A clean
 comparison view is then produced automatically.
 
+Benchmarking is the starting point. The project's main work is improving model
+outputs: reducing jitter, fusing cameras, smoothing over time, and fine-tuning for
+the domain. See [docs/improving-models.md](docs/improving-models.md).
+
 Laptops are for functional validation, not speed conclusions. Real
 latency/throughput numbers should come from stronger NVIDIA GPUs, and they are only
 comparable when the run records its full hardware/software metadata (every run does).
@@ -57,6 +61,7 @@ Start here:
 4. [docs/collaboration.md](docs/collaboration.md): what goes to git, and the team workflow
 
 Reference:
+- [docs/improving-models.md](docs/improving-models.md): reducing noise and improving outputs (the core work)
 - [docs/scripts.md](docs/scripts.md): every script explained
 - [docs/configuration.md](docs/configuration.md): the config YAML files
 - [docs/models.md](docs/models.md), [docs/datasets.md](docs/datasets.md), [docs/metrics.md](docs/metrics.md)

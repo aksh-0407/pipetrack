@@ -18,6 +18,7 @@ If you only read one page, read **[getting-started.md](getting-started.md)**.
 
 | Doc | Use it when… |
 | --- | ------------ |
+| [improving-models.md](improving-models.md) | …you're reducing noise, smoothing, fusing cameras, or fine-tuning. This is the core project work. |
 | [scripts.md](scripts.md) | …you want to know exactly what a script does, its inputs/outputs, and its key flags. |
 | [configuration.md](configuration.md) | …you need to read or edit a `configs/*.yaml` file. |
 | [models.md](models.md) | …you're choosing a model or hit a model-specific quirk (OpenPose, Sapiens2, ViTPose). |
