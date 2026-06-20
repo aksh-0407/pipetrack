@@ -16,6 +16,7 @@ FORBIDDEN_TRACKED_PATTERNS = [
     "models/*/checksums/*",
     "data/raw/*",
     "data/derived/*",
+    "drive/dataset/*",
     "benchmarks/artifacts/*",
     "benchmarks/runs/*/predictions/*",
     "benchmarks/runs/*/logs/*",

@@ -46,6 +46,10 @@ data/derived/*
 !data/derived/.gitkeep
 benchmarks/datasets/*
 !benchmarks/datasets/.gitkeep
+# Company drive: commit docs, but never the 14 GB dataset or the personal LaTeX
+# report. (Embedded drive/.git and local junk were removed during cleanup.)
+drive/dataset/
+drive/LaTex Files/
 *.zip
 *.tar
 *.tar.gz
@@ -72,3 +76,9 @@ benchmarks/reports/*
 
 # --- Local research/reference dump; curate source-worthy notes into docs/ ---
 Papers/
+
+# --- Local-only orientation dumps (non-authoritative) ---
+archive/
+
+# --- Local-only presentation handout (generated from the .md script; hidden in VS Code) ---
+presentables/00_presentation_script.pdf
