@@ -1,0 +1,25 @@
+{
+  "schema_version": "cricket_phase1_delivery_run/v1",
+  "run_id": "rtmpose-l-body8-full-db32-pb96",
+  "created_at": "2026-06-25T14:26:08Z",
+  "drive_root": "/home/quidich/pose-estimation-benchmark/drive",
+  "delivery_id": "CCPL080626M1_1_14_1",
+  "model_id": "rtmpose_l_body8",
+  "device": "cuda:0",
+  "inference_mode": "topdown_detector_pose",
+  "input_mode": "opencv_bgr_mmdet_mmpose_batch",
+  "det_batch_size": 32,
+  "pose_batch_size": 96,
+  "io_workers": 8,
+  "prediction_dir": "/home/quidich/pose-estimation-benchmark/benchmarks/runs/rtmpose-l-body8-full-db32-pb96/predictions",
+  "visualizations": "/home/quidich/pose-estimation-benchmark/benchmarks/runs/rtmpose-l-body8-full-db32-pb96/visualizations",
+  "summary": {
+    "camera_count": 7,
+    "records_written": 4200,
+    "records_written_this_run": 0,
+    "records_reused": 4200,
+    "total_players_detected": 13493,
+    "failed_frames": 0,
+    "status": "pass"
+  }
+}
