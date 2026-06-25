@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -104,6 +105,8 @@ def parse_args() -> argparse.Namespace:
                     help="Run inference and timing without writing prediction JSONL or overlays")
     rt.add_argument("--sync-cuda-timing", action="store_true",
                     help="Synchronize CUDA around timed regions for more accurate benchmark timings")
+    rt.add_argument("--show-torch-warnings", action="store_true",
+                    help="Show known upstream torch warnings that are hidden by default")
     rt.set_defaults(resume=True)
     rt.set_defaults(show_progress=True)
 
@@ -543,6 +546,12 @@ def render_overlay(visualizer, image_path: str, results, out_path: Path, kpt_thr
 # --------------------------------------------------------------------------- #
 def main() -> int:
     args = parse_args()
+    if not args.show_torch_warnings:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"torch\.meshgrid: in an upcoming release.*",
+            category=UserWarning,
+        )
     if args.det_batch_size <= 0:
         raise SystemExit("--det-batch-size must be positive")
     if args.pose_batch_size <= 0:
@@ -565,7 +574,7 @@ def main() -> int:
     if args.benchmark_only:
         args.resume = False
         args.overlay = False
-    if args.smoke_overlay and "smoke" in run_id.lower() and not args.overlay:
+    if args.smoke_overlay and not args.benchmark_only and "smoke" in run_id.lower() and not args.overlay:
         args.overlay = True
         print("Smoke run detected; enabling visualizations.", flush=True)
     run_dir = abspath(args.run_dir) if args.run_dir else (ROOT / "benchmarks" / "runs" / run_id)
