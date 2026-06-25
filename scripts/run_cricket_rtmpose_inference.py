@@ -98,8 +98,11 @@ def parse_args() -> argparse.Namespace:
     # Overlays
     ov = parser.add_argument_group("overlays")
     ov.add_argument("--overlay", action="store_true", help="Render keypoint overlay images")
+    ov.add_argument("--no-smoke-overlay", dest="smoke_overlay", action="store_false",
+                    help="Do not auto-enable overlays when --run-id contains 'smoke'")
     ov.add_argument("--overlay-every", type=int, default=1, help="Render every Nth processed frame (default: 1)")
     ov.add_argument("--overlay-limit", type=int, default=30, help="Max overlays per camera (default: 30)")
+    ov.set_defaults(smoke_overlay=True)
 
     return parser.parse_args()
 
@@ -382,15 +385,20 @@ def build_visualizer(pose_model, kpt_thr: float):
 
 def render_overlay(visualizer, image_path: str, results, out_path: Path, kpt_thr: float) -> None:
     import mmcv
-    from mmpose.structures import merge_data_samples
 
     img = mmcv.imread(image_path, channel_order="rgb")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not results:
+        mmcv.imwrite(img[..., ::-1], str(out_path))
+        return
+
+    from mmpose.structures import merge_data_samples
+
     data_samples = merge_data_samples(results)
     visualizer.add_datasample(
         "result", img, data_sample=data_samples, draw_gt=False,
         draw_bbox=True, show=False, kpt_thr=kpt_thr,
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     mmcv.imwrite(visualizer.get_image()[..., ::-1], str(out_path))
 
 
@@ -412,6 +420,9 @@ def main() -> int:
 
     device = resolve_device(args.device, allow_cpu=args.allow_cpu)
     run_id = args.run_id or f"p1-rtmpose-{datetime.now().strftime('%Y%m%dT%H%M%SZ')}"
+    if args.smoke_overlay and "smoke" in run_id.lower() and not args.overlay:
+        args.overlay = True
+        print("Smoke run detected; enabling visualizations.", flush=True)
     run_dir = abspath(args.run_dir) if args.run_dir else (ROOT / "benchmarks" / "runs" / run_id)
     pred_dir = run_dir / "predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -431,6 +442,8 @@ def main() -> int:
         "pose_config": pose_config, "pose_checkpoint": pose_checkpoint,
         "det_config": str(abspath(args.det_config)), "det_checkpoint": str(abspath(args.det_checkpoint)),
         "skeleton": source_skeleton, "started_at": utc_now(),
+        "overlay_enabled": args.overlay, "overlay_limit_per_camera": args.overlay_limit,
+        "visualizations": str(run_dir / "visualizations") if args.overlay else None,
         "cameras": [], "frames_processed": 0, "frames_skipped": 0,
         "total_people": 0, "failed_frames": 0,
     }
@@ -537,7 +550,8 @@ def main() -> int:
         summary["cameras"].append({
             "group": t["group"], "delivery_id": delivery_id, "camera_id": cam_id,
             "frames_processed": cam_processed, "frames_skipped": cam_skipped,
-            "people": cam_people, "failed": cam_failed, "predictions": str(out_jsonl),
+            "people": cam_people, "failed": cam_failed, "overlays": overlays,
+            "predictions": str(out_jsonl),
         })
         summary["frames_processed"] += cam_processed
         summary["frames_skipped"] += cam_skipped
