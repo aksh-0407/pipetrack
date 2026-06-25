@@ -5,7 +5,7 @@ set -euo pipefail
 # median 50.13 FPS, det_batch=32, pose_batch=96, failed=0.
 #
 # By default this also renders five overlay frames per camera/delivery:
-# frame IDs 1, 150, 300, 450, and 600.
+# selected-frame row positions 1, 150, 300, 450, and 600.
 #
 # Extra arguments are passed through to run_cricket_rtmpose_inference.py, e.g.
 #   bash scripts/run_rtmpose_body8_final.sh --groups bt_01 --frame-limit 100
@@ -32,6 +32,6 @@ fi
   --io-workers "${IO_WORKERS}" \
   --run-id "${RUN_ID}" \
   --overlay \
-  --overlay-frame-ids 1 150 300 450 600 \
+  --overlay-row-indices 1 150 300 450 600 \
   --overlay-limit 5 \
   "$@"

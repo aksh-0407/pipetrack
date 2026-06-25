@@ -6,14 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import cv2
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pose_estimation.cricket.dataset import resolve_delivery_camera_dirs
 from pose_estimation.cricket.p1_outputs import COCO_17_EDGES
 
 
@@ -22,9 +23,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drive-root", default="drive")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--artifact-dir", default=None)
-    parser.add_argument("--sample-every", type=int, default=60)
-    parser.add_argument("--max-per-camera", type=int, default=20)
+    parser.add_argument(
+        "--frame-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Render these exact frame IDs from each camera JSONL, e.g. 1 150 300 450 600.",
+    )
+    parser.add_argument(
+        "--row-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Render these one-based JSONL row positions per camera, e.g. 1 150 300 450 600.",
+    )
+    parser.add_argument(
+        "--sample-every",
+        type=int,
+        default=None,
+        help="Fallback sampler when neither --frame-ids nor --row-indices is set. Uses JSONL row position.",
+    )
+    parser.add_argument("--max-per-camera", type=int, default=5)
     parser.add_argument("--keypoint-threshold", type=float, default=0.2)
+    parser.add_argument(
+        "--no-manifest-update",
+        action="store_true",
+        help="Do not add visualization metadata to run/delivery manifests.",
+    )
     return parser.parse_args()
 
 
@@ -36,14 +61,57 @@ def read_jsonl(path: Path):
                 yield json.loads(line)
 
 
-def draw_record(image, record: dict, *, keypoint_threshold: float) -> None:
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def canonical_prediction_parts(path: Path) -> tuple[str, str, str] | None:
+    parts = path.stem.split("__")
+    if len(parts) != 3:
+        return None
+    group, delivery_id, camera_id = parts
+    if not group or not delivery_id or not camera_id.startswith("cam_"):
+        return None
+    return group, delivery_id, camera_id
+
+
+def camera_folder(camera_id: str) -> str:
+    return f"camera{camera_id.replace('cam_', '')}"
+
+
+def should_render_record(
+    *,
+    row_index: int,
+    frame_index: int,
+    row_indices: set[int] | None,
+    rendered_count: int,
+    frame_ids: set[int] | None,
+    sample_every: int | None,
+    max_per_camera: int,
+) -> bool:
+    if rendered_count >= max_per_camera:
+        return False
+    if frame_ids is not None:
+        return frame_index in frame_ids
+    if row_indices is not None:
+        return (row_index + 1) in row_indices
+    if sample_every is None:
+        return rendered_count == 0
+    return row_index % sample_every == 0
+
+
+def draw_record(image, record: dict[str, Any], *, keypoint_threshold: float) -> None:
     for player_index, player in enumerate(record.get("players", []), start=1):
         x, y, w, h = [int(round(value)) for value in player["bbox_xywh_px"]]
         color = (0, 255, 0)
         cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+        score = player.get("track_confidence")
+        score_text = "n/a" if score is None else f"{float(score):.2f}"
         cv2.putText(
             image,
-            f"P? {player.get('track_confidence', 0):.2f}",
+            f"P? {score_text}",
             (x, max(20, y - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -51,8 +119,9 @@ def draw_record(image, record: dict, *, keypoint_threshold: float) -> None:
             2,
             cv2.LINE_AA,
         )
-        keypoints = player["pose_2d"]["keypoints_px"]
-        confidence = player["pose_2d"]["confidence"]
+        pose = player["pose_2d"]
+        keypoints = pose["keypoints_px"]
+        confidence = pose["confidence"]
         for left, right in COCO_17_EDGES:
             if confidence[left] < keypoint_threshold or confidence[right] < keypoint_threshold:
                 continue
@@ -76,47 +145,106 @@ def draw_record(image, record: dict, *, keypoint_threshold: float) -> None:
         )
 
 
+def update_manifest_file(path: Path, updates: dict[str, Any]) -> None:
+    if not path.exists():
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(updates)
+    write_json(path, payload)
+
+
+def update_run_manifests(
+    *,
+    run_dir: Path,
+    artifact_dir: Path,
+    manifest_path: Path,
+    overlay_count: int,
+    overlays_by_delivery: dict[str, int],
+) -> None:
+    updates = {
+        "visualizations": str(artifact_dir),
+        "visual_qa_manifest": str(manifest_path),
+        "visual_qa_overlay_count": overlay_count,
+    }
+    update_manifest_file(run_dir / "run_manifest.json", updates)
+    update_manifest_file(run_dir / "p1_metrics.json", updates)
+    delivery_root = run_dir / "delivery_metrics"
+    for delivery_id, count in overlays_by_delivery.items():
+        delivery_updates = {
+            "visualizations": str(artifact_dir),
+            "visual_qa_manifest": str(manifest_path),
+            "visual_qa_overlay_count": count,
+        }
+        update_manifest_file(delivery_root / delivery_id / "run_manifest.json", delivery_updates)
+        update_manifest_file(delivery_root / delivery_id / "p1_metrics.json", delivery_updates)
+
+
 def main() -> int:
     args = parse_args()
+    if args.max_per_camera < 0:
+        raise SystemExit("--max-per-camera must be >= 0")
+    if args.sample_every is not None and args.sample_every <= 0:
+        raise SystemExit("--sample-every must be positive")
+    if args.frame_ids is not None and args.row_indices is not None:
+        raise SystemExit("Use either --frame-ids or --row-indices, not both")
+
     run_dir = Path(args.run_dir)
     if not run_dir.is_absolute():
         run_dir = ROOT / run_dir
     drive_root = Path(args.drive_root)
     if not drive_root.is_absolute():
         drive_root = ROOT / drive_root
-    manifest = json.loads((run_dir / "run_manifest.json").read_text())
-    delivery_id = manifest["delivery_id"]
-    run_id = manifest["run_id"]
-    artifact_dir = (
-        Path(args.artifact_dir)
-        if args.artifact_dir
-        else ROOT / "benchmarks" / "artifacts" / run_id / "overlays"
-    )
+    artifact_dir = Path(args.artifact_dir) if args.artifact_dir else run_dir / "visualizations"
+    if not artifact_dir.is_absolute():
+        artifact_dir = ROOT / artifact_dir
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    camera_dirs = resolve_delivery_camera_dirs(drive_root, delivery_id)
 
-    written = []
-    for prediction_path in sorted((run_dir / "predictions").glob("cam_*.jsonl")):
-        camera_id = prediction_path.stem
-        camera_dir = camera_dirs.get(camera_id)
-        if camera_dir is None:
+    frame_ids = set(args.frame_ids) if args.frame_ids is not None else None
+    row_indices = set(args.row_indices) if args.row_indices is not None else None
+    written: list[str] = []
+    skipped_missing_images: list[dict[str, Any]] = []
+    overlays_by_camera: dict[str, int] = {}
+    overlays_by_delivery: dict[str, int] = defaultdict(int)
+
+    prediction_paths = sorted((run_dir / "predictions").glob("*.jsonl"))
+    if not prediction_paths:
+        raise SystemExit(f"No prediction JSONL files found under {run_dir / 'predictions'}")
+
+    for prediction_path in prediction_paths:
+        parts = canonical_prediction_parts(prediction_path)
+        if parts is None:
             continue
-        camera_output_dir = artifact_dir / camera_id
+        group, delivery_id, camera_id = parts
+        image_dir = drive_root / "dataset" / group / delivery_id / camera_folder(camera_id)
+        camera_output_dir = artifact_dir / group / delivery_id / camera_id
         camera_output_dir.mkdir(parents=True, exist_ok=True)
         count = 0
-        for index, record in enumerate(read_jsonl(prediction_path)):
-            if index % args.sample_every != 0:
+        camera_key = f"{group}/{delivery_id}/{camera_id}"
+        for row_index, record in enumerate(read_jsonl(prediction_path)):
+            frame_index = int(record["frame_index"])
+            if not should_render_record(
+                row_index=row_index,
+                frame_index=frame_index,
+                row_indices=row_indices,
+                rendered_count=count,
+                frame_ids=frame_ids,
+                sample_every=args.sample_every,
+                max_per_camera=args.max_per_camera,
+            ):
                 continue
-            if count >= args.max_per_camera:
-                break
-            image_path = camera_dir / record["frame_name"]
+            image_path = image_dir / record["frame_name"]
             image = cv2.imread(str(image_path))
             if image is None:
+                skipped_missing_images.append({
+                    "camera": camera_key,
+                    "frame_name": record["frame_name"],
+                    "image_path": str(image_path),
+                })
                 continue
             draw_record(image, record, keypoint_threshold=args.keypoint_threshold)
             cv2.putText(
                 image,
-                f"{camera_id} frame={record['frame_index']} detections={len(record['players'])}",
+                f"{camera_key} frame={frame_index} detections={len(record['players'])}",
                 (24, 42),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
@@ -124,29 +252,46 @@ def main() -> int:
                 3,
                 cv2.LINE_AA,
             )
-            output_path = camera_output_dir / f"{camera_id}_{record['frame_index']}.jpg"
+            output_path = camera_output_dir / f"{Path(record['frame_name']).stem}.jpg"
             cv2.imwrite(str(output_path), image)
             written.append(str(output_path))
             count += 1
+            overlays_by_delivery[delivery_id] += 1
+        overlays_by_camera[camera_key] = count
 
+    manifest_path = artifact_dir / "visual_qa_manifest.json"
     manifest_payload = {
         "schema_version": "cricket_phase1_visual_qa/v1",
-        "run_id": run_id,
-        "delivery_id": delivery_id,
+        "run_id": json.loads((run_dir / "run_manifest.json").read_text()).get("run_id")
+        if (run_dir / "run_manifest.json").exists()
+        else run_dir.name,
         "artifact_dir": str(artifact_dir),
+        "frame_ids": sorted(frame_ids) if frame_ids is not None else None,
+        "row_indices": sorted(row_indices) if row_indices is not None else None,
         "sample_every": args.sample_every,
         "max_per_camera": args.max_per_camera,
+        "keypoint_threshold": args.keypoint_threshold,
         "overlay_count": len(written),
+        "overlays_by_camera": overlays_by_camera,
+        "overlays_by_delivery": dict(sorted(overlays_by_delivery.items())),
+        "skipped_missing_images": skipped_missing_images[:200],
         "sample_overlays": written[:20],
     }
-    with (run_dir / "visual_qa_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(manifest_payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    write_json(manifest_path, manifest_payload)
+    if not args.no_manifest_update:
+        update_run_manifests(
+            run_dir=run_dir,
+            artifact_dir=artifact_dir,
+            manifest_path=manifest_path,
+            overlay_count=len(written),
+            overlays_by_delivery=dict(overlays_by_delivery),
+        )
     print(f"Wrote {len(written)} overlays under {artifact_dir}")
-    print(f"Wrote {run_dir / 'visual_qa_manifest.json'}")
+    print(f"Wrote {manifest_path}")
+    if skipped_missing_images:
+        print(f"Skipped {len(skipped_missing_images)} missing/unreadable source images")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

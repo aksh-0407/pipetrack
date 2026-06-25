@@ -16,6 +16,10 @@ set -euo pipefail
 #   bash scripts/run_yolo26x_final.sh --deliveries CCPL080626M1_1_14_1
 #   bash scripts/run_yolo26x_final.sh --groups bt_01 --list
 #   bash scripts/run_yolo26x_final.sh --frame-limit 100 --no-resume
+#
+# Visualization controls:
+#   YOLO_VISUALIZE=0 bash scripts/run_yolo26x_final.sh
+#   YOLO_OVERLAY_ROW_INDICES="1 150 300 450 600" YOLO_OVERLAY_LIMIT=5 bash scripts/run_yolo26x_final.sh
 
 DRIVE_ROOT="${DRIVE_ROOT:-drive}"
 CAPTURE_GROUPS="${CAPTURE_GROUPS:-bt_01}"
@@ -30,6 +34,10 @@ IOU="${IOU:-0.7}"
 NMS_IOU_THRESHOLD="${NMS_IOU_THRESHOLD:-0.6}"
 RESIZE_LONG_SIDE="${RESIZE_LONG_SIDE:-640}"
 DECODE_WORKERS="${DECODE_WORKERS:-4}"
+YOLO_VISUALIZE="${YOLO_VISUALIZE:-1}"
+YOLO_OVERLAY_ROW_INDICES="${YOLO_OVERLAY_ROW_INDICES:-${YOLO_OVERLAY_FRAME_IDS:-1 150 300 450 600}}"
+YOLO_OVERLAY_LIMIT="${YOLO_OVERLAY_LIMIT:-5}"
+YOLO_OVERLAY_KEYPOINT_THRESHOLD="${YOLO_OVERLAY_KEYPOINT_THRESHOLD:-0.2}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
@@ -105,6 +113,7 @@ fi
 echo "YOLO26x final settings:"
 echo "  model=${MODEL_ID} device=${DEVICE} batch=${BATCH_SIZE} imgsz=${IMGSZ}"
 echo "  resize_long_side=${RESIZE_LONG_SIDE} decode_workers=${DECODE_WORKERS}"
+echo "  visualizations=${YOLO_VISUALIZE} overlay_row_indices=${YOLO_OVERLAY_ROW_INDICES} overlay_limit=${YOLO_OVERLAY_LIMIT}"
 echo "  run_id=${RUN_ID}"
 echo "  run_dir=${RUN_DIR}"
 echo "Selected ${#delivery_ids[@]} delivery run(s):"
@@ -151,3 +160,26 @@ for delivery_id in "${delivery_ids[@]}"; do
     "${command[@]}"
   fi
 done
+
+if [[ "${YOLO_VISUALIZE}" == "1" ]]; then
+  overlay_command=(
+    "${PYTHON_BIN}" scripts/render_cricket_p1_overlays.py
+    --drive-root "${DRIVE_ROOT}"
+    --run-dir "${RUN_DIR}"
+    --artifact-dir "${RUN_DIR}/visualizations"
+    --row-indices
+  )
+  # shellcheck disable=SC2206
+  overlay_row_indices=(${YOLO_OVERLAY_ROW_INDICES})
+  overlay_command+=("${overlay_row_indices[@]}")
+  overlay_command+=(
+    --max-per-camera "${YOLO_OVERLAY_LIMIT}"
+    --keypoint-threshold "${YOLO_OVERLAY_KEYPOINT_THRESHOLD}"
+  )
+  printf '+ '
+  printf '%q ' "${overlay_command[@]}"
+  printf '\n'
+  if [[ "${dry_run}" -eq 0 ]]; then
+    "${overlay_command[@]}"
+  fi
+fi

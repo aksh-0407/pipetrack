@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -38,13 +39,17 @@ sys.path.insert(0, str(ROOT))
 
 import yaml
 
+from pose_estimation.cricket.contract import (
+    SCHEMA_VERSION as P1_SCHEMA_VERSION,
+    SKELETON as P1_SKELETON,
+    validate_group1_frame,
+)
 from pose_estimation.cricket.dataset import FRAME_RE, camera_label, parse_frame_id
 
 MMPOSE_DIR = ROOT / "external" / "mmpose"
 DEFAULT_MODEL_CONFIG = ROOT / "configs" / "model_envs.yaml"
 DEFAULT_DET_CONFIG = ROOT / "external" / "mmpose" / "demo" / "mmdetection_cfg" / "rtmdet_m_640-8xb32_coco-person.py"
 DEFAULT_DET_CHECKPOINT = ROOT / "models" / "rtmdet_m_person" / "weights" / "rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
-SCHEMA_VERSION = "rtmpose_topdown.v1"
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +124,8 @@ def parse_args() -> argparse.Namespace:
     ov.add_argument("--overlay-every", type=int, default=1, help="Render every Nth processed frame (default: 1)")
     ov.add_argument("--overlay-frame-ids", nargs="+", type=int, default=None,
                     help="Render overlays only for these exact frame IDs from filenames, e.g. 1 150 300")
+    ov.add_argument("--overlay-row-indices", nargs="+", type=int, default=None,
+                    help="Render overlays for these one-based selected-frame positions per camera, e.g. 1 150 300")
     ov.add_argument("--overlay-limit", type=int, default=30, help="Max overlays per camera (default: 30)")
     ov.set_defaults(smoke_overlay=True)
 
@@ -484,6 +491,50 @@ def coco17_source_indices(source_skeleton: str) -> list[int] | None:
     return mapping["source_indices"] if mapping else None
 
 
+def finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def select_coco17_pose(
+    keypoints_px: list[list[float]],
+    confidence: list[float],
+    coco17_indices: list[int] | None,
+) -> tuple[list[list[float]], list[float]]:
+    source_indices = coco17_indices or list(range(17))
+    output_keypoints: list[list[float]] = []
+    output_confidence: list[float] = []
+    for source_index in source_indices[:17]:
+        if source_index < len(keypoints_px):
+            x, y = keypoints_px[source_index]
+            output_keypoints.append([finite_float(x), finite_float(y)])
+        else:
+            output_keypoints.append([0.0, 0.0])
+        output_confidence.append(
+            finite_float(confidence[source_index]) if source_index < len(confidence) else 0.0
+        )
+    while len(output_keypoints) < 17:
+        output_keypoints.append([0.0, 0.0])
+        output_confidence.append(0.0)
+    return output_keypoints, output_confidence
+
+
+def bbox_score_from_instance(inst) -> float | None:
+    for name in ("bbox_scores", "bbox_score"):
+        if not hasattr(inst, name):
+            continue
+        values = getattr(inst, name)
+        try:
+            if len(values):
+                return finite_float(values[0])
+        except TypeError:
+            return finite_float(values)
+    return None
+
+
 def player_records(results, source_skeleton: str, width: int, height: int,
                    coco17_indices: list[int] | None) -> list[dict[str, Any]]:
     """Convert mmpose top-down results into player dicts matching the cricket schema."""
@@ -500,31 +551,23 @@ def player_records(results, source_skeleton: str, width: int, height: int,
             x1, y1, x2, y2 = float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
         bw, bh = x2 - x1, y2 - y1
 
-        keypoints_px = [[float(x), float(y)] for x, y in kpts]
-        confidence = [float(s) for s in scores]
+        source_keypoints_px = [[finite_float(x), finite_float(y)] for x, y in kpts]
+        source_confidence = [finite_float(s) for s in scores]
+        keypoints_px, confidence = select_coco17_pose(source_keypoints_px, source_confidence, coco17_indices)
         keypoints_norm = [[x / width, y / height] for x, y in keypoints_px]
-
-        if coco17_indices is not None:
-            coco17_px = [keypoints_px[i] if i < len(keypoints_px) else [None, None] for i in coco17_indices]
-            coco17_conf = [confidence[i] if i < len(confidence) else None for i in coco17_indices]
-        else:
-            coco17_px, coco17_conf = None, None
 
         players.append({
             "bbox_xywh_px": [x1, y1, bw, bh],
             "bbox_xywh_norm": [x1 / width, y1 / height, bw / width, bh / height],
             "global_player_id": None,
             "local_track_id": None,
-            "track_confidence": None,
-            "role": None,
+            "track_confidence": bbox_score_from_instance(inst),
+            "role": "unknown",
             "pose_2d": {
-                "skeleton": source_skeleton,
-                "num_keypoints": len(keypoints_px),
+                "skeleton": P1_SKELETON,
                 "keypoints_px": keypoints_px,
                 "keypoints_norm": keypoints_norm,
                 "confidence": confidence,
-                "coco17_keypoints_px": coco17_px,
-                "coco17_confidence": coco17_conf,
             },
             "pose_3d": None,
         })
@@ -564,6 +607,8 @@ def should_render_overlay(args: argparse.Namespace, entry: dict[str, Any], overl
         return False
     if args.overlay_frame_ids is not None:
         return parse_frame_id(entry["frame_path"]) in args.overlay_frame_ids
+    if args.overlay_row_indices is not None:
+        return (entry["idx"] + 1) in args.overlay_row_indices
     return entry["idx"] % args.overlay_every == 0
 
 
@@ -592,6 +637,12 @@ def main() -> int:
         if any(frame_id < 0 for frame_id in args.overlay_frame_ids):
             raise SystemExit("--overlay-frame-ids must be non-negative")
         args.overlay_frame_ids = set(args.overlay_frame_ids)
+    if args.overlay_row_indices is not None:
+        if any(row_index <= 0 for row_index in args.overlay_row_indices):
+            raise SystemExit("--overlay-row-indices must be positive one-based positions")
+        args.overlay_row_indices = set(args.overlay_row_indices)
+    if args.overlay_frame_ids is not None and args.overlay_row_indices is not None:
+        raise SystemExit("Use either --overlay-frame-ids or --overlay-row-indices, not both")
     targets = discover_targets(args)
     if not targets:
         raise SystemExit("No frames matched the given filters. Try --list to inspect selection.")
@@ -631,7 +682,9 @@ def main() -> int:
     visualizer = build_visualizer(pose_model, args.kpt_thr) if args.overlay else None
 
     summary = {
+        "schema_version": "cricket_phase1_run/v2",
         "run_id": run_id, "model_id": args.model_id, "device": device,
+        "prediction_schema_version": P1_SCHEMA_VERSION,
         "pose_config": pose_config, "pose_checkpoint": pose_checkpoint,
         "det_config": str(abspath(args.det_config)), "det_checkpoint": str(abspath(args.det_checkpoint)),
         "skeleton": source_skeleton, "started_at": utc_now(),
@@ -642,6 +695,7 @@ def main() -> int:
         "sync_cuda_timing": args.sync_cuda_timing,
         "overlay_enabled": args.overlay, "overlay_limit_per_camera": args.overlay_limit,
         "overlay_frame_ids": sorted(args.overlay_frame_ids) if args.overlay_frame_ids is not None else None,
+        "overlay_row_indices": sorted(args.overlay_row_indices) if args.overlay_row_indices is not None else None,
         "visualizations": str(run_dir / "visualizations") if args.overlay else None,
         "prediction_dir": str(pred_dir) if not args.benchmark_only else None,
         "delivery_metrics_dir": str(delivery_metrics_dir) if not args.benchmark_only else None,
@@ -785,7 +839,7 @@ def main() -> int:
                     players = player_records(results, source_skeleton, entry["width"], entry["height"], coco17_indices)
 
                     record = {
-                        "schema_version": SCHEMA_VERSION,
+                        "schema_version": P1_SCHEMA_VERSION,
                         "camera_id": cam_id,
                         "delivery_id": delivery_id,
                         "capture_group": t["group"],
@@ -794,17 +848,31 @@ def main() -> int:
                         "match_id": match_id_from_delivery(delivery_id),
                         "metadata": {
                             "model_id": args.model_id, "run_id": run_id, "device": device,
-                            "image_size_px": [entry["width"], entry["height"]], "skeleton": source_skeleton,
+                            "capture_group": t["group"],
+                            "image_size_px": [entry["width"], entry["height"]],
                             "inference_mode": "topdown_detector_pose",
                             "input_mode": "opencv_bgr_mmdet_mmpose_batch",
                             "det_batch_size_requested": args.det_batch_size,
+                            "det_batch_size_effective": args.det_batch_size,
                             "pose_batch_size_requested": args.pose_batch_size,
+                            "pose_batch_size_effective": args.pose_batch_size,
                             "io_workers": args.io_workers,
                             "detector": "rtmdet_m_person", "bbox_thr": args.bbox_thr,
                             "nms_thr": args.nms_thr,
+                            "model_specific": {
+                                "rtmpose": {
+                                    "source_skeleton": source_skeleton,
+                                    "output_skeleton": P1_SKELETON,
+                                    "pose_config": pose_config,
+                                    "pose_checkpoint": pose_checkpoint,
+                                    "det_config": str(abspath(args.det_config)),
+                                    "det_checkpoint": str(abspath(args.det_checkpoint)),
+                                }
+                            },
                         },
                         "players": players,
                     }
+                    validate_group1_frame(record, final_handoff=False)
                     if handle is not None:
                         start = time.perf_counter()
                         handle.write(json.dumps(record) + "\n")
@@ -870,9 +938,23 @@ def main() -> int:
     )
     summary["failures"] = failures[:500]
     summary["overlay_failures"] = overlay_failures[:500]
+    summary["summary"] = {
+        "delivery_count": len({camera["delivery_id"] for camera in summary["cameras"]}),
+        "camera_count": len(summary["cameras"]),
+        "records_written": summary["frames_processed"] + summary["frames_skipped"],
+        "records_written_this_run": summary["frames_processed"],
+        "records_reused": summary["frames_skipped"],
+        "total_players_detected": summary["total_people"],
+        "failed_frames": summary["failed_frames"],
+        "wall_clock_s": elapsed,
+        "fps_overall": summary["fps"],
+        "timings": summary["timings"],
+        "status": "pass" if summary["failed_frames"] == 0 else "partial",
+    }
     (run_dir / "run_manifest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     p1_metrics = {
         "schema_version": "cricket_phase1_metrics/v2",
+        "prediction_schema_version": P1_SCHEMA_VERSION,
         "run_id": run_id,
         "created_at": summary["finished_at"],
         "delivery_ids": sorted({camera["delivery_id"] for camera in summary["cameras"]}),
@@ -944,6 +1026,7 @@ def main() -> int:
             delivery_dir.mkdir(parents=True, exist_ok=True)
             delivery_metrics = {
                 "schema_version": "cricket_phase1_metrics/v2",
+                "prediction_schema_version": P1_SCHEMA_VERSION,
                 "run_id": run_id,
                 "created_at": summary["finished_at"],
                 "delivery_id": delivery_id,
@@ -992,6 +1075,7 @@ def main() -> int:
             }
             delivery_manifest = {
                 "schema_version": "cricket_phase1_delivery_run/v1",
+                "prediction_schema_version": P1_SCHEMA_VERSION,
                 "run_id": run_id,
                 "created_at": summary["finished_at"],
                 "drive_root": str(abspath(args.drive_root)),

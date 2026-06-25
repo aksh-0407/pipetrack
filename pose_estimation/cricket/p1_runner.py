@@ -25,6 +25,7 @@ from pose_estimation.cricket.dataset import (
     resolve_delivery_camera_dirs,
 )
 from pose_estimation.cricket.p1_outputs import (
+    SCHEMA_VERSION,
     build_phase1_frame_record,
     nms_predictions,
     offset_prediction,
@@ -462,6 +463,7 @@ def aggregate_phase1_run(config: P1RunConfig) -> dict[str, Any]:
     input_mode = configured_input_mode(config)
     aggregate_metrics = {
         "schema_version": "cricket_phase1_metrics/v2",
+        "prediction_schema_version": SCHEMA_VERSION,
         "run_id": config.run_id,
         "created_at": created_at,
         "delivery_ids": sorted(delivery_ids),
@@ -481,6 +483,7 @@ def aggregate_phase1_run(config: P1RunConfig) -> dict[str, Any]:
         "git_sha": git_sha(Path(__file__).resolve().parents[2]),
         "prediction_dir": str(prediction_dir),
         "delivery_metrics_dir": str(delivery_metrics_root),
+        "visualizations": None,
         "summary": {
             "delivery_count": len(delivery_metrics),
             "camera_count": camera_count,
@@ -499,6 +502,7 @@ def aggregate_phase1_run(config: P1RunConfig) -> dict[str, Any]:
     }
     aggregate_manifest = {
         "schema_version": "cricket_phase1_run/v2",
+        "prediction_schema_version": SCHEMA_VERSION,
         "run_id": config.run_id,
         "created_at": created_at,
         "drive_root": str(config.drive_root),
@@ -517,6 +521,7 @@ def aggregate_phase1_run(config: P1RunConfig) -> dict[str, Any]:
         "decode_workers": config.decode_workers,
         "prediction_dir": str(prediction_dir),
         "delivery_metrics_dir": str(delivery_metrics_root),
+        "visualizations": None,
         "summary": aggregate_metrics["summary"],
     }
     write_json(config.run_dir / "p1_metrics.json", aggregate_metrics)
@@ -928,7 +933,8 @@ def run_phase1_delivery(config: P1RunConfig, adapter: PoseAdapter) -> dict[str, 
     wall_clock_s = time.perf_counter() - run_start
     input_mode = configured_input_mode(config)
     metrics = {
-        "schema_version": "cricket_phase1_metrics/v1",
+        "schema_version": "cricket_phase1_metrics/v2",
+        "prediction_schema_version": SCHEMA_VERSION,
         "run_id": config.run_id,
         "created_at": utc_now(),
         "delivery_id": config.delivery_id,
@@ -946,6 +952,8 @@ def run_phase1_delivery(config: P1RunConfig, adapter: PoseAdapter) -> dict[str, 
         "resize_long_side": config.resize_long_side,
         "decode_workers": config.decode_workers,
         "git_sha": git_sha(Path(__file__).resolve().parents[2]),
+        "prediction_dir": str(prediction_dir),
+        "visualizations": None,
         "summary": {
             "camera_count": len(per_camera),
             "records_written": total_records,
@@ -970,6 +978,7 @@ def run_phase1_delivery(config: P1RunConfig, adapter: PoseAdapter) -> dict[str, 
         delivery_metrics_dir / "run_manifest.json",
         {
             "schema_version": "cricket_phase1_delivery_run/v1",
+            "prediction_schema_version": SCHEMA_VERSION,
             "run_id": config.run_id,
             "created_at": metrics["created_at"],
             "drive_root": str(config.drive_root),
@@ -987,6 +996,8 @@ def run_phase1_delivery(config: P1RunConfig, adapter: PoseAdapter) -> dict[str, 
             "resize_long_side": config.resize_long_side,
             "decode_workers": config.decode_workers,
             "prediction_dir": str(prediction_dir),
+            "visualizations": None,
+            "summary": metrics["summary"],
         },
     )
     aggregate_phase1_run(config)

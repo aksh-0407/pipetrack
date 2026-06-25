@@ -23,6 +23,7 @@
   "iou": 0.7,
   "model_id": "yolo26x_pose",
   "prediction_dir": "/home/aksh/quidich/Pose_Estimation/benchmarks/runs/yolo26x-pose-full-db8/predictions",
+  "prediction_schema_version": "g1_player_frame/v0",
   "preload_full_frame": true,
   "resize_long_side": 640,
   "run_id": "yolo26x-pose-full-db8",
@@ -38,5 +39,8 @@
     "status": "pass",
     "total_players_detected": 104369,
     "wall_clock_s": 3227.84471952301
-  }
+  },
+  "visual_qa_manifest": "/home/aksh/quidich/Pose_Estimation/benchmarks/runs/yolo26x-pose-full-db8/visualizations/visual_qa_manifest.json",
+  "visual_qa_overlay_count": 280,
+  "visualizations": "/home/aksh/quidich/Pose_Estimation/benchmarks/runs/yolo26x-pose-full-db8/visualizations"
 }
