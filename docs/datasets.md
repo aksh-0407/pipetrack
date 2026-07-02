@@ -47,7 +47,7 @@ or 3D claims.
 Download + validate (≈1 GB of images, plus a transient ≈241 MB annotation zip):
 
 ```bash
-python3 scripts/download_coco_keypoints.py --remove-archives
+python3 scripts/benchmark/download_coco_keypoints.py --remove-archives
 ```
 
 This lands `data/raw/coco/{val2017/, annotations/, coco17_val2017_manifest.json}` — all

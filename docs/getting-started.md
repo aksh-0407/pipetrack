@@ -22,7 +22,7 @@ You need:
 Quick environment probe (binaries, Python packages, GPU):
 
 ```bash
-python3 scripts/check_environment.py
+python3 scripts/setup/check_environment.py
 ```
 
 **✓ Check:** it prints your Python version and, if a GPU is visible, your CUDA device
@@ -32,7 +32,7 @@ under `nvidia-smi`. Missing entries here tell you what to install.
 
 ```bash
 python3 -m pytest -q
-python3 scripts/audit_repo.py --fail
+python3 scripts/setup/audit_repo.py --fail
 ```
 
 **✓ Check:** tests pass and the audit prints `Repository hygiene audit passed`. You're
@@ -45,17 +45,17 @@ It's the longest step (weights + COCO are several GB).
 
 ```bash
 # Everything (envs + assets + COCO). Add --download-large-assets for Sapiens2.
-python3 scripts/benchmark.py prepare --models all --datasets coco17_val2017
+python3 scripts/benchmark/benchmark.py prepare --models all --datasets coco17_val2017
 ```
 
 Doing a lot the first time? Two smaller, faster paths:
 
 ```bash
 # Just the YOLO path, to get to a result quickly:
-python3 scripts/benchmark.py prepare --models yolo26x_pose --datasets coco17_val2017
+python3 scripts/benchmark/benchmark.py prepare --models yolo26x_pose --datasets coco17_val2017
 
 # See what would run, without doing it:
-python3 scripts/benchmark.py prepare --models all --datasets coco17_val2017 --dry-run
+python3 scripts/benchmark/benchmark.py prepare --models all --datasets coco17_val2017 --dry-run
 ```
 
 Weights land in local-only `models/<id>/weights/`; COCO lands in `data/raw/coco/`.
@@ -70,7 +70,7 @@ Neither is committed.
 ## Step 2 — Confirm assets are present
 
 ```bash
-python3 scripts/check_assets.py --models all --fail-missing
+python3 scripts/setup/check_assets.py --models all --fail-missing
 ```
 
 **✓ Check:** exit code 0 and a table showing each required checkpoint as present. If a
@@ -84,17 +84,17 @@ checkpoint load and produce keypoints. It is **not** a benchmark — it's a 30-s
 
 ```bash
 # One model first is the fastest signal:
-python3 scripts/benchmark.py smoke --models yolo26x_pose
+python3 scripts/benchmark/benchmark.py smoke --models yolo26x_pose
 
 # Then everything:
-python3 scripts/benchmark.py smoke --models all
+python3 scripts/benchmark/benchmark.py smoke --models all
 ```
 
 Some models have device/size caveats:
 
 ```bash
-python3 scripts/benchmark.py smoke --models openpose_body25 --device cpu
-python3 scripts/benchmark.py smoke --models sapiens2_1b_pose --allow-heavy --device cuda:0
+python3 scripts/benchmark/benchmark.py smoke --models openpose_body25 --device cpu
+python3 scripts/benchmark/benchmark.py smoke --models sapiens2_1b_pose --allow-heavy --device cuda:0
 ```
 
 **✓ Check:** each model reports a passing status — `ok`, or `ready_heavy_skipped` /
@@ -112,10 +112,10 @@ protocol note in [models.md](models.md)). We'll use `yolo26x_pose` here. Start s
 
 ```bash
 # A fast 100-image sanity run:
-python3 scripts/benchmark.py run --models yolo26x_pose --datasets coco17_val2017 --limit 100 --batch-size 8
+python3 scripts/benchmark/benchmark.py run --models yolo26x_pose --datasets coco17_val2017 --limit 100 --batch-size 8
 
 # The full COCO val (5000 images):
-python3 scripts/benchmark.py run --models yolo26x_pose --datasets coco17_val2017 --batch-size 8
+python3 scripts/benchmark/benchmark.py run --models yolo26x_pose --datasets coco17_val2017 --batch-size 8
 ```
 
 The run id is generated for you (timestamped, readable). If a run stops partway,
@@ -137,8 +137,8 @@ HTML. On `main`, **CI does this for everyone** — but running it locally is the
 preview your own numbers.
 
 ```bash
-python3 scripts/benchmark.py aggregate
-python3 scripts/benchmark.py report
+python3 scripts/benchmark/benchmark.py aggregate
+python3 scripts/benchmark/benchmark.py report
 ```
 
 **✓ Check:** `results/aggregate_metrics.csv` has a row per run, and

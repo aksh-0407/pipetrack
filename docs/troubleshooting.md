@@ -1,7 +1,7 @@
 # Troubleshooting
 
 Common failures and what to do. When in doubt, start with
-`python3 scripts/check_environment.py` to see what's actually installed.
+`python3 scripts/setup/check_environment.py` to see what's actually installed.
 
 ## Downloads
 
@@ -14,7 +14,7 @@ setup snag. It affects the `.pth` checkpoints for RTMW, RTMO, and ViTPose. Optio
 - Download the file from another network or a verified mirror, then drop it at the exact
   `path` listed for that asset in
   [`configs/model_envs.yaml`](configuration.md#model_envsyaml).
-- Re-check with `python3 scripts/check_assets.py --models <id> --fail-missing`.
+- Re-check with `python3 scripts/setup/check_assets.py --models <id> --fail-missing`.
 
 Some assets ship with a `fallback_urls` mirror in the config (OpenPose, RTMW-X) that the
 downloader tries automatically.
@@ -57,9 +57,9 @@ smoke-only for now. See the readiness matrix in [models.md](models.md) and the r
 The CMU OpenPose binary isn't built. Build the CPU-only validation binary:
 
 ```bash
-python3 scripts/setup_model_envs.py --models openpose_body25 --skip-assets
-python3 scripts/setup_openpose.py --gpu-mode CPU_ONLY --jobs 2
-python3 scripts/benchmark.py smoke --models openpose_body25 --device cpu
+python3 scripts/setup/setup_model_envs.py --models openpose_body25 --skip-assets
+python3 scripts/setup/setup_openpose.py --gpu-mode CPU_ONLY --jobs 2
+python3 scripts/benchmark/benchmark.py smoke --models openpose_body25 --device cpu
 ```
 
 The expected binary path is `external/openpose/build/examples/openpose/openpose.bin`.
@@ -82,7 +82,7 @@ Sapiens2 note in [models.md](models.md#sapiens2-1b-sapiens2_1b_pose).
 
 `vitpose_h` now targets MMPose v1. If its Conda env was built from the older legacy
 ViTPose profile, rebuild or force-install it:
-`python3 scripts/setup_model_envs.py --models vitpose_h --force-install`.
+`python3 scripts/setup/setup_model_envs.py --models vitpose_h --force-install`.
 
 ### DWPose can't find its ONNX files
 

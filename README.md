@@ -26,7 +26,7 @@ from a fresh checkout to your first real benchmark result, step by step.
 
 - `configs/` holds the source of truth: which models, datasets, metrics, and skeletons
   exist. Everything else is driven from it.
-- `scripts/benchmark.py` is the entry point. It has five stages:
+- `scripts/benchmark/benchmark.py` is the entry point. It has five stages:
   `prepare → smoke → run → aggregate → report`.
 - Heavy files stay local and are never committed: model weights, datasets, upstream code
   clones, and raw per-image predictions and logs.

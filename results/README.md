@@ -13,8 +13,8 @@ them would only create merge conflicts. You can regenerate them anytime to previ
 own numbers:
 
 ```bash
-python3 scripts/benchmark.py aggregate
-python3 scripts/benchmark.py report
+python3 scripts/benchmark/benchmark.py aggregate
+python3 scripts/benchmark/benchmark.py report
 ```
 
 On `main`, CI regenerates and publishes them. See

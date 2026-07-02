@@ -58,7 +58,7 @@ def run_smoke(conda: str, model_id: str, env_name: str, args: argparse.Namespace
         "-n",
         env_name,
         "python",
-        "scripts/run_model_smoke.py",
+        "scripts/setup/run_model_smoke.py",
         "--model",
         model_id,
         "--config",

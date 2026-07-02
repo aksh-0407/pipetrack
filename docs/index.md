@@ -32,18 +32,18 @@ If you only read one page, read **[getting-started.md](getting-started.md)**.
 
 ```bash
 # 1. one-time: install model envs + download COCO
-python3 scripts/benchmark.py prepare --models all --datasets coco17_val2017
+python3 scripts/benchmark/benchmark.py prepare --models all --datasets coco17_val2017
 
 # 2. confirm assets are present
-python3 scripts/check_assets.py --models all --fail-missing
+python3 scripts/setup/check_assets.py --models all --fail-missing
 
 # 3. quick readiness check
-python3 scripts/benchmark.py smoke --models all
+python3 scripts/benchmark/benchmark.py smoke --models all
 
 # 4. a real benchmark (benchmark-ready: yolo26x_pose, rtmw_l, rtmw_x, rtmpose_l_wholebody)
-python3 scripts/benchmark.py run --models yolo26x_pose --datasets coco17_val2017
+python3 scripts/benchmark/benchmark.py run --models yolo26x_pose --datasets coco17_val2017
 
 # 5. preview the comparison locally (CI does this for real on main)
-python3 scripts/benchmark.py aggregate
-python3 scripts/benchmark.py report
+python3 scripts/benchmark/benchmark.py aggregate
+python3 scripts/benchmark/benchmark.py report
 ```

@@ -1,6 +1,6 @@
 # The benchmarking workflow
 
-`scripts/benchmark.py` is the master entry point. It has five stages:
+`scripts/benchmark/benchmark.py` is the master entry point. It has five stages:
 
 ```
 prepare → smoke → run → aggregate → report
@@ -13,12 +13,12 @@ evidence should flow through the run folders this command creates.
 A full pass, with the recommended asset check wedged in:
 
 ```bash
-python3 scripts/benchmark.py prepare --models all --datasets coco17_val2017
-python3 scripts/check_assets.py --models all --fail-missing
-python3 scripts/benchmark.py smoke --models all
-python3 scripts/benchmark.py run --models yolo26x_pose --datasets coco17_val2017 --limit 100 --batch-size 8
-python3 scripts/benchmark.py aggregate
-python3 scripts/benchmark.py report
+python3 scripts/benchmark/benchmark.py prepare --models all --datasets coco17_val2017
+python3 scripts/setup/check_assets.py --models all --fail-missing
+python3 scripts/benchmark/benchmark.py smoke --models all
+python3 scripts/benchmark/benchmark.py run --models yolo26x_pose --datasets coco17_val2017 --limit 100 --batch-size 8
+python3 scripts/benchmark/benchmark.py aggregate
+python3 scripts/benchmark/benchmark.py report
 ```
 
 ---
@@ -30,7 +30,7 @@ python3 scripts/benchmark.py report
 `download_coco_keypoints.py`).
 
 ```bash
-python3 scripts/benchmark.py prepare --models all --datasets coco17_val2017
+python3 scripts/benchmark/benchmark.py prepare --models all --datasets coco17_val2017
 ```
 
 Useful flags:
@@ -48,8 +48,8 @@ Downloads-only (no Conda work) is sometimes what you want on a machine that alre
 has the envs:
 
 ```bash
-python3 scripts/setup_model_envs.py --models all --download-assets --download-large-assets --skip-envs
-python3 scripts/download_coco_keypoints.py --remove-archives
+python3 scripts/setup/setup_model_envs.py --models all --download-assets --download-large-assets --skip-envs
+python3 scripts/benchmark/download_coco_keypoints.py --remove-archives
 ```
 
 **Output:** local-only `models/<id>/weights/` and `data/raw/`. Nothing committed.
@@ -62,9 +62,9 @@ checkpoint and confirms the model produces keypoints. It is intentionally tiny a
 full dataset.
 
 ```bash
-python3 scripts/benchmark.py smoke --models all
-python3 scripts/benchmark.py smoke --models openpose_body25 --device cpu
-python3 scripts/benchmark.py smoke --models sapiens2_1b_pose --allow-heavy --device cuda:0
+python3 scripts/benchmark/benchmark.py smoke --models all
+python3 scripts/benchmark/benchmark.py smoke --models openpose_body25 --device cpu
+python3 scripts/benchmark/benchmark.py smoke --models sapiens2_1b_pose --allow-heavy --device cuda:0
 ```
 
 | Flag | Why |
@@ -88,7 +88,7 @@ under `benchmarks/runs/<smoke_run_id>/`):
 `run` evaluates models on datasets and writes a compact, immutable **run folder**.
 
 ```bash
-python3 scripts/benchmark.py run \
+python3 scripts/benchmark/benchmark.py run \
   --models yolo26x_pose \
   --datasets coco17_val2017 \
   --limit 100 \
@@ -135,8 +135,8 @@ a summary HTML. Raw predictions and per-image logs go to local-only
 and flattens them into one CSV. `report` renders that CSV as an HTML table.
 
 ```bash
-python3 scripts/benchmark.py aggregate   # -> results/aggregate_metrics.csv
-python3 scripts/benchmark.py report      # -> benchmarks/reports/aggregate/index.html
+python3 scripts/benchmark/benchmark.py aggregate   # -> results/aggregate_metrics.csv
+python3 scripts/benchmark/benchmark.py report      # -> benchmarks/reports/aggregate/index.html
 ```
 
 Both outputs are **derived and local** — one row per run, pure function of the run

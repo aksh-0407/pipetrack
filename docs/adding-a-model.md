@@ -68,7 +68,7 @@ what makes the model comparable to every other model.
 ## 4. Create the env and download weights
 
 ```bash
-python3 scripts/setup_model_envs.py --models my_pose_model --download-assets
+python3 scripts/setup/setup_model_envs.py --models my_pose_model --download-assets
 ```
 
 Add `--download-large-assets` if you marked any asset `large: true`.
@@ -76,7 +76,7 @@ Add `--download-large-assets` if you marked any asset `large: true`.
 ## 5. Generate the model-store metadata
 
 ```bash
-python3 scripts/sync_model_store.py
+python3 scripts/setup/sync_model_store.py
 ```
 
 This writes `models/my_pose_model/{model.yaml, README.md, checksums/}` and the `.gitkeep`
@@ -86,12 +86,12 @@ stay local.
 ## 6. Verify assets, then smoke
 
 ```bash
-python3 scripts/check_assets.py --models my_pose_model --fail-missing
-python3 scripts/benchmark.py smoke --models my_pose_model
+python3 scripts/setup/check_assets.py --models my_pose_model --fail-missing
+python3 scripts/benchmark/benchmark.py smoke --models my_pose_model
 ```
 
 If your framework isn't one the smoke runner already handles, add a `smoke_profile`
-branch in [`scripts/run_model_smoke.py`](scripts.md#run_model_smokepy) (it dispatches on
+branch in [`scripts/setup/run_model_smoke.py`](scripts.md#run_model_smokepy) (it dispatches on
 the `smoke_profile` field: `mmpose`, `dwpose`, `ultralytics`, `mediapipe`, `vitpose`,
 `sapiens2`, `openpose`). The branch loads the model in its env, runs one image, and
 returns the standard JSON (status, instances, keypoints, latency).
@@ -131,7 +131,7 @@ If your model needs a new runner kind:
    results stay comparable (see
    [models.md](models.md#evaluation-protocols)).
 2. Register the runner kind in `RUNNER_SCRIPTS` in
-   [`scripts/benchmark.py`](scripts.md#benchmarkpy) and handle any runner-specific flags
+   [`scripts/benchmark/benchmark.py`](scripts.md#benchmarkpy) and handle any runner-specific flags
    in `run_native_benchmark`.
 3. Set `benchmark_runner: <your_kind>` on the model in `configs/model_envs.yaml`.
 4. Emit `PredictionRecord`s (native + reduced `coco_17`); see
@@ -140,8 +140,8 @@ If your model needs a new runner kind:
 ## 8. Run it for real and share
 
 ```bash
-python3 scripts/benchmark.py run --models my_pose_model --datasets coco17_val2017 --limit 100
-python3 scripts/benchmark.py run --models my_pose_model --datasets coco17_val2017   # full
+python3 scripts/benchmark/benchmark.py run --models my_pose_model --datasets coco17_val2017 --limit 100
+python3 scripts/benchmark/benchmark.py run --models my_pose_model --datasets coco17_val2017   # full
 ```
 
 Then commit the `configs/` changes + the new `benchmarks/runs/<run_id>/` folder on a

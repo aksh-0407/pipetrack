@@ -102,21 +102,21 @@ def command_prepare(args: argparse.Namespace) -> int:
     failures = 0
     selected_models = resolve_models(args.models)
     if selected_models:
-        command = [sys.executable, "scripts/setup_model_envs.py", "--models", *selected_models, "--download-assets"]
+        command = [sys.executable, "scripts/setup/setup_model_envs.py", "--models", *selected_models, "--download-assets"]
         if args.download_large_assets:
             command.append("--download-large-assets")
         if args.dry_run:
             command.append("--dry-run")
         failures += int(run_command(command, dry_run=False) != 0)
         if args.build_openpose and "openpose_body25" in selected_models:
-            command = [sys.executable, "scripts/setup_openpose.py"]
+            command = [sys.executable, "scripts/setup/setup_openpose.py"]
             if args.dry_run:
                 command.append("--dry-run")
             failures += int(run_command(command, dry_run=False) != 0)
 
     for dataset_id in args.datasets:
         if dataset_id == "coco17_val2017":
-            command = [sys.executable, "scripts/download_coco_keypoints.py"]
+            command = [sys.executable, "scripts/benchmark/download_coco_keypoints.py"]
             if args.remove_archives:
                 command.append("--remove-archives")
             failures += int(run_command(command, dry_run=args.dry_run) != 0)
@@ -127,7 +127,7 @@ def command_prepare(args: argparse.Namespace) -> int:
 
 def command_smoke(args: argparse.Namespace) -> int:
     selected = resolve_models(args.models)
-    command = [sys.executable, "scripts/smoke_model_envs.py", "--models", *selected, "--device", args.device]
+    command = [sys.executable, "scripts/setup/smoke_model_envs.py", "--models", *selected, "--device", args.device]
     if args.allow_heavy:
         command.append("--allow-heavy")
     return run_command(command)
@@ -204,8 +204,8 @@ def command_run(args: argparse.Namespace) -> int:
 # *kind* (rare) is the only change that touches this map.
 BENCHMARK_DATASETS = {"coco17_val2017"}
 RUNNER_SCRIPTS = {
-    "yolo": "scripts/run_yolo_coco_benchmark.py",  # end-to-end detector+pose
-    "mmpose_topdown": "scripts/run_mmpose_coco_benchmark.py",  # GT-bbox top-down
+    "yolo": "scripts/benchmark/run_yolo_coco_benchmark.py",  # end-to-end detector+pose
+    "mmpose_topdown": "scripts/benchmark/run_mmpose_coco_benchmark.py",  # GT-bbox top-down
 }
 
 

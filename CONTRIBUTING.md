@@ -15,9 +15,9 @@ See [docs/getting-started.md](docs/getting-started.md) for the full walkthrough.
 git clone https://github.com/aksh-0407/pose-estimation-benchmark
 cd pose-estimation-benchmark
 pip install -r requirements.txt
-python3 scripts/benchmark.py prepare --models all --datasets coco17_val2017
-python3 scripts/check_assets.py --models all --fail-missing
-python3 scripts/benchmark.py smoke --models all
+python3 scripts/benchmark/benchmark.py prepare --models all --datasets coco17_val2017
+python3 scripts/setup/check_assets.py --models all --fail-missing
+python3 scripts/benchmark/benchmark.py smoke --models all
 ```
 
 The `prepare` step builds a conda environment per model and downloads weights plus COCO.
@@ -28,11 +28,11 @@ It takes a while and some mirrors can be flaky; see
 
 1. Create a branch: `git checkout -b <your-name>/<task>`.
 2. Do the work:
-   - Run a benchmark: `python3 scripts/benchmark.py run --models <id> --datasets coco17_val2017`.
+   - Run a benchmark: `python3 scripts/benchmark/benchmark.py run --models <id> --datasets coco17_val2017`.
    - Or add a model adapter: see [docs/adding-a-model.md](docs/adding-a-model.md).
 3. Before committing, run the checks:
    ```bash
-   python3 scripts/audit_repo.py --fail
+   python3 scripts/setup/audit_repo.py --fail
    python3 -m pytest -q
    ```
 4. Commit only source and compact evidence: the new `benchmarks/runs/<run_id>/` folder and

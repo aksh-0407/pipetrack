@@ -11,7 +11,7 @@ These are different things, and a model can have one without the other:
 
 - A *smoke adapter* loads the model in its Conda env and runs one image, confirming the
   environment, config, and checkpoint are wired up. Implemented per framework in
-  [`scripts/run_model_smoke.py`](scripts.md#run_model_smokepy). All 10 models have one.
+  [`scripts/setup/run_model_smoke.py`](scripts.md#run_model_smokepy). All 10 models have one.
 - A *benchmark adapter* runs a full dataset and produces real scores (COCO OKS AP/AR,
   latency). Implemented as a `scripts/run_*_coco_benchmark.py` runner and enabled per
   model via the `benchmark_runner` field in `configs/model_envs.yaml`. A model with a
@@ -86,8 +86,8 @@ than the Python models. The repo builds a **CPU-only** validation binary at
 [`setup_openpose.py`](scripts.md#setup_openposepy):
 
 ```bash
-python3 scripts/setup_openpose.py --gpu-mode CPU_ONLY --jobs 2
-python3 scripts/benchmark.py smoke --models openpose_body25 --device cpu
+python3 scripts/setup/setup_openpose.py --gpu-mode CPU_ONLY --jobs 2
+python3 scripts/benchmark/benchmark.py smoke --models openpose_body25 --device cpu
 ```
 
 CPU-only is for **functional validation only** — never read speed numbers off it.

@@ -16,7 +16,7 @@ IDs for `camera_id`, `timestamp_ns`, `frame_id`, `player_id`, `event_type`,
 Get the first benchmark dataset (COCO 2017 val keypoints):
 
 ```bash
-python3 scripts/download_coco_keypoints.py --remove-archives
+python3 scripts/benchmark/download_coco_keypoints.py --remove-archives
 ```
 
 Normalize model outputs to `coco_17` via `configs/keypoint_mappings.yaml` before

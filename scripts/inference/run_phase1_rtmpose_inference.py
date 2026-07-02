@@ -396,7 +396,7 @@ def build_models(args: argparse.Namespace, device: str):
         missing = exc.name or "required OpenMMLab package"
         raise SystemExit(
             f"Missing {missing!r} in the active environment. Rebuild/repair this model env with:\n"
-            f"  python3 scripts/setup_model_envs.py --models {args.model_id} --force-install --download-assets\n"
+            f"  python3 scripts/setup/setup_model_envs.py --models {args.model_id} --force-install --download-assets\n"
             f"Then activate the configured Conda env and rerun this script."
         ) from exc
 

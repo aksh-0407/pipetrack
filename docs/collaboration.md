@@ -80,7 +80,7 @@ Run these before you commit. They take seconds and prevent the two classic mista
 (committing a weight file, or a generated CSV):
 
 ```bash
-python3 scripts/audit_repo.py --fail   # no tracked weights/datasets/artifacts/derived files
+python3 scripts/setup/audit_repo.py --fail   # no tracked weights/datasets/artifacts/derived files
 python3 -m pytest -q                    # code still green
 ```
 

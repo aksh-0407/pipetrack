@@ -53,8 +53,8 @@ URLs, with fallbacks, or Hugging Face). Writes an install stamp under
 `.model_env_stamps/` so re-runs skip already-installed envs.
 
 ```bash
-python3 scripts/setup_model_envs.py --models all --download-assets
-python3 scripts/setup_model_envs.py --models sapiens2_1b_pose --download-assets --download-large-assets --skip-envs
+python3 scripts/setup/setup_model_envs.py --models all --download-assets
+python3 scripts/setup/setup_model_envs.py --models sapiens2_1b_pose --download-assets --download-large-assets --skip-envs
 ```
 
 | Flag | Meaning |
@@ -75,7 +75,7 @@ Downloads, extracts, and validates the COCO 2017 validation keypoint set (annota
 + 5000 images), then writes a manifest. The first reproducible 2D benchmark dataset.
 
 ```bash
-python3 scripts/download_coco_keypoints.py --remove-archives
+python3 scripts/benchmark/download_coco_keypoints.py --remove-archives
 ```
 
 | Flag | Meaning |
@@ -95,7 +95,7 @@ setup, configures with CMake, and builds the `openpose.bin` binary. Only needed 
 benchmark machines.
 
 ```bash
-python3 scripts/setup_openpose.py --gpu-mode CPU_ONLY --jobs 2
+python3 scripts/setup/setup_openpose.py --gpu-mode CPU_ONLY --jobs 2
 ```
 
 | Flag | Meaning |
@@ -172,7 +172,7 @@ folder, raw predictions/logs into the **artifact** folder, and a resumable
 `README.md` files are allowed.
 
 ```bash
-python3 scripts/audit_repo.py --fail
+python3 scripts/setup/audit_repo.py --fail
 ```
 
 ### `check_assets.py`
@@ -181,7 +181,7 @@ Reports, per model, whether the required checkpoints exist locally (path, size, 
 — without downloading anything. Use it after `prepare` and before `run`.
 
 ```bash
-python3 scripts/check_assets.py --models all --fail-missing
+python3 scripts/setup/check_assets.py --models all --fail-missing
 ```
 
 `--json` for machine-readable output; `--fail-missing` to exit non-zero on any gap.
