@@ -19,6 +19,17 @@ p4a:
   # is what lets a person P2 failed to tracklet still receive a global id.
   confidence_discard: 0.15
   local_identity_mahalanobis_gate: 25.0
+  # (camera, P2-tracklet) ownership claims expire after this many frames without
+  # re-assertion, so one bad merge can heal instead of poisoning the tracklet.
+  ownership_ttl_frames: 50
+  # Pose-shape temporal tie-breaker (added to the Stage-2 cost inside the chi2 gate
+  # only). pose_match_weight scales a [0,1] bone-ratio distance; 0 disables. A track
+  # must accumulate pose_min_updates confident descriptors before its pose is trusted,
+  # and the two descriptors must share pose_min_shared_segments to compare at all.
+  pose_match_weight: 2.0
+  pose_descriptor_ema: 0.15
+  pose_min_updates: 5
+  pose_min_shared_segments: 4
   role_params:
     bowler: {alpha: 2.0, sigma_a: 3.0, measurement_noise: 0.3}
     striker: {alpha: 1.5, sigma_a: 2.5, measurement_noise: 0.3}

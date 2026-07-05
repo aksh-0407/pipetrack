@@ -11,9 +11,11 @@ import numpy as np
 
 from pose_estimation.cricket.contract import validate_group1_frame
 from pose_estimation.cricket.tracking_metrics import (
+    cross_camera_agreement,
     evaluate_ground_truth,
     identity_collision_metrics,
     identity_fragmentation_proxy,
+    teleport_proxy,
     track_completeness,
 )
 from scripts.association.jsonl_io import load_synchronized_records
@@ -32,6 +34,7 @@ from scripts.global_id.stitching import (
     solve_flow,
 )
 from scripts.global_id.track_manager import TrackManager
+from scripts.tracking.calibration import build_ground_calibrators
 from scripts.tracking.runner import discover_prediction_files, infer_match_id
 
 
@@ -121,6 +124,34 @@ def run_global_id(
         for frame in sorted(records_by_frame)
         for camera in sorted(records_by_frame[frame])
     ]
+
+    # Independent per-detection ground points (bbox bottom-centre projected to
+    # z=0 via calibration only, NOT via P3 clustering) feed the cross-camera
+    # agreement and teleport tripwires -- so those metrics judge the clustering
+    # rather than echo it.
+    try:
+        ground_calibrators = build_ground_calibrators(
+            drive_root, infer_match_id(delivery_id), cameras
+        )
+    except (FileNotFoundError, ValueError):
+        ground_calibrators = {}
+    detection_ground_positions: dict[tuple[int, str, int], np.ndarray] = {}
+    for record in records:
+        calibrator = ground_calibrators.get(str(record["camera_id"]))
+        if calibrator is None:
+            continue
+        frame_index = int(record["frame_index"])
+        camera_id = str(record["camera_id"])
+        for player_index, player in enumerate(record.get("players", [])):
+            if not player.get("global_player_id"):
+                continue
+            bbox = player.get("bbox_xywh_px")
+            if not bbox:
+                continue
+            xy = calibrator.bbox_bottom_center_ground_xy([float(v) for v in bbox])
+            if xy is not None:
+                detection_ground_positions[(frame_index, camera_id, player_index)] = xy
+
     # Ground-plane track table from the online (P4a) assignments.
     ground_positions_accumulator: dict[tuple[str, int], list[np.ndarray]] = defaultdict(list)
     for track, frame_index, ground_xy in ground_observations:
@@ -175,6 +206,25 @@ def run_global_id(
     )
     identity_proxy = identity_fragmentation_proxy(records, switch_report)
     collision_metrics = identity_collision_metrics(records)
+    completeness = track_completeness(records)
+    agreement_metrics = cross_camera_agreement(records, detection_ground_positions)
+    teleport_metrics = teleport_proxy(
+        records,
+        detection_ground_positions,
+        max_speed_mps=config.kinematic_v_max_mps,
+        frame_rate_fps=config.frame_rate_fps,
+    )
+    # Regression guard: the longest-lived tracks are, empirically, the bowler and
+    # other well-tracked players. A/B comparison must not let their camera-support
+    # or confirmed completeness drop.
+    dominant_tracks = sorted(
+        (
+            {"global_player_id": player_id, **stats}
+            for player_id, stats in completeness["per_track"].items()
+        ),
+        key=lambda item: (item["observed_frames"], item["camera_count"]),
+        reverse=True,
+    )[:3]
     metrics = {
         "schema_version": "global_id_metrics/v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -196,7 +246,10 @@ def run_global_id(
         "selected_stitch_link_count": len(switch_report),
         **identity_proxy,
         **collision_metrics,
-        "completeness": track_completeness(records),
+        **agreement_metrics,
+        **teleport_metrics,
+        "dominant_tracks": dominant_tracks,
+        "completeness": completeness,
     }
     if ground_truth is not None:
         metrics["ground_truth"] = evaluate_ground_truth(records, _read_jsonl(ground_truth))

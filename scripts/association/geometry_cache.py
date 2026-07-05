@@ -76,8 +76,15 @@ def build_geometry_cache(
     config: P3AssociationConfig,
     *,
     camera_centers: dict[str, np.ndarray] | None = None,
+    image_wh_by_cam: dict[str, tuple[int, int]] | None = None,
 ) -> GeometryCache:
-    """Precompute per-pair fundamental matrices, degeneracy flags, and weights."""
+    """Precompute per-pair fundamental matrices, degeneracy flags, and weights.
+
+    ``image_wh_by_cam`` supplies each camera's native (width, height); the epipole
+    -in-image degeneracy test uses the *right* camera's size (the right epipole
+    lives in image b). Without it every camera is assumed ``config.image_wh``,
+    which is wrong for C07 (~3775x960 vs the 2560x1440 default).
+    """
 
     cam_ids = sorted(projection_matrices)
     centers = dict(camera_centers) if camera_centers else {}
@@ -88,12 +95,17 @@ def build_geometry_cache(
     huber_delta = config.huber_delta()
     stats = CalibrationStats(config.mu_fine_score, config.sigma_fine_score)
 
+    def _image_wh(cam_id: str) -> tuple[int, int]:
+        if image_wh_by_cam and cam_id in image_wh_by_cam:
+            return image_wh_by_cam[cam_id]
+        return config.image_wh
+
     pairs: dict[tuple[str, str], PairGeometry] = {}
     for cam_a, cam_b in combinations(cam_ids, 2):
         F = compute_fundamental_matrix(projection_matrices[cam_a], projection_matrices[cam_b])
         degenerate = (
             _pair_key(cam_a, cam_b) in forced_degenerate
-            or _epipole_in_image(F, config.image_wh)
+            or _epipole_in_image(F, _image_wh(cam_b))
             or _baseline_is_degenerate(centers[cam_a], centers[cam_b], config.baseline_angle_degen_deg)
         )
         w_epi, w_tri = (0.0, 1.0) if degenerate else (config.w_epi, config.w_tri)

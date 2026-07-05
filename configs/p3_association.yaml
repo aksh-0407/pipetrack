@@ -44,6 +44,59 @@ cycle_reproj_tol_px: 12.0
 triangulation_min_views: 2
 triangulation_reproj_threshold_px: 10.0
 
+# Pose-shape descriptor: view-invariant 3D bone-length ratios emitted per multi-view
+# correspondence. A SOFT signal only -- feeds the P4a temporal tie-breaker and a small
+# confidence down-weight for anthropometrically implausible (likely chimera) clusters.
+# Segments spanning only low-parallax views are excluded (pose_parallax_min_deg), so the
+# cue never relies on the noisy near-collinear facing-pair triangulation.
+pose_descriptor_enabled: true
+pose_min_conf: 0.3
+pose_parallax_min_deg: 12.0
+pose_shoulder_width_m: [0.25, 0.65]
+pose_hip_width_m: [0.15, 0.55]
+pose_torso_len_m: [0.35, 0.85]
+pose_torso_tilt_max_deg: 75.0
+pose_confidence_penalty: 0.15
+
+# Tracklet-graph identity: decide who-is-who once per P2-tracklet pair over the
+# whole delivery (evidence aggregated across all co-visible frames, cues fused as
+# calibrated log-likelihood ratios), then emit per-frame correspondences from the
+# stable bindings. per_frame reproduces the historical per-frame clustering.
+association_mode: tracklet_graph
+graph_sample_gate_m: 6.0
+graph_min_covis_frames: 10
+graph_covis_full_frames: 40
+graph_llr_merge_threshold: 2.0
+graph_llr_veto: -4.5
+graph_llr_positive_cap: 1.5
+graph_llr_ground_neg_clip: 2.0
+graph_move_margin: 0.5
+graph_refine_passes: 2
+graph_cannot_link_overlap_frames: 3
+graph_hard_dist_gate_m: 2.75
+graph_motion_enabled: true
+graph_min_app_samples: 5
+ground_sigma_px_base: 2.0
+ground_sigma_px_bbox_frac: 0.01
+# Floor absorbs cross-camera calibration bias (~0.7-1.2 m same-player residuals).
+ground_var_floor_m: 0.4
+purity_split_enabled: true
+purity_jump_slack: 1.5
+purity_jump_floor_m: 1.0
+frame_rate_fps: 50.0
+kinematic_v_max_mps: 9.0
+# Ground-anchored (billboard) posture: the pose-shape identity layer. Metric,
+# per-camera, no cross-camera triangulation, so it works on the facing pairs.
+posture_enabled: true
+posture_min_samples: 8
+# Cue calibration bootstrapped from this delivery's own unambiguous matches.
+calibration_mode: auto
+cue_calibration_path: ""
+anchor_pair_min_frames: 30
+anchor_pair_dist_m: 1.5
+anchor_pair_isolation_m: 3.0
+diff_pair_min_dist_m: 3.0
+
 chi2_gate_2dof: 5.991
 confidence_high: 0.7
 confidence_discard: 0.3

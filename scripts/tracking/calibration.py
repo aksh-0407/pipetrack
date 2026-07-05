@@ -69,6 +69,43 @@ def load_projection_matrices_from_drive(drive_root: str | Path, match_id: str) -
     return matrices
 
 
+def load_image_sizes_from_drive(
+    drive_root: str | Path, match_id: str
+) -> dict[str, tuple[int, int]]:
+    """Native ``(width, height)`` per camera, from the calibrated principal point.
+
+    The rig is not uniform: C01-C06 are 2560x1440 but C07 is ~3775x960. The
+    bundle-adjusted principal point sits at each image centre, so ``(2*cx, 2*cy)``
+    recovers the native pixel space. Callers that assume a single global size
+    mis-handle C07 (e.g. the epipole-in-image degeneracy test).
+    """
+
+    calibration_dir = current_calibration_dir(drive_root, match_id)
+    path = calibration_dir / "Bundle_Adjusted_intrinsics.json"
+    if not path.exists():
+        raise FileNotFoundError(f"missing calibration file: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        payload: dict[str, Any] = json.load(handle)
+    sizes: dict[str, tuple[int, int]] = {}
+    for key, value in payload.items():
+        if not isinstance(value, dict) or not key.startswith("C"):
+            continue
+        try:
+            camera_id = f"cam_{int(key[1:]):02d}"
+        except ValueError:
+            continue
+        matrix = np.asarray(value.get("camera_matrix"), dtype=float)
+        if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+            continue
+        width = int(round(2.0 * float(matrix[0, 2])))
+        height = int(round(2.0 * float(matrix[1, 2])))
+        if width > 0 and height > 0:
+            sizes[camera_id] = (width, height)
+    if not sizes:
+        raise ValueError(f"no usable intrinsics in {path}")
+    return sizes
+
+
 def build_ground_calibrators(
     drive_root: str | Path,
     match_id: str,

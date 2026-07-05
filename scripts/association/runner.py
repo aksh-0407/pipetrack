@@ -12,10 +12,20 @@ import numpy as np
 import cv2
 
 from pose_estimation.cricket.geometry import derive_facing_pairs
-from pose_estimation.cricket.tracking_metrics import association_proxy_metrics
-from scripts.association.associator import AnchorState, TemporalLinkMemory, associate_frame
+from pose_estimation.cricket.tracking_metrics import (
+    association_proxy_metrics,
+    pair_link_churn,
+)
+from scripts.association.associator import (
+    AnchorState,
+    TemporalLinkMemory,
+    associate_frame,
+    select_anchor,
+)
 from scripts.association.config import P3AssociationConfig
+from scripts.association.cue_calibration import CueCalibration
 from scripts.association.geometry_cache import build_geometry_cache
+from scripts.association.tracklet_graph import TrackletGraphBuilder
 from scripts.association.jsonl_io import (
     apply_correspondences,
     correspondence_row,
@@ -27,6 +37,7 @@ from scripts.association.jsonl_io import (
 from scripts.tracking.calibration import (
     build_ground_calibrators,
     current_calibration_dir,
+    load_image_sizes_from_drive,
     load_projection_matrices_from_drive,
 )
 from scripts.tracking.runner import discover_prediction_files, infer_match_id
@@ -74,7 +85,13 @@ def run_association(
             config, opposite_camera_pairs=[list(pair) for pair in derived_facing_pairs]
         )
     ground_calibrators = build_ground_calibrators(drive_root, match_id, camera_ids)
-    geometry = build_geometry_cache(projections, config)
+    # Per-camera native image sizes so the epipole-in-image degeneracy test is
+    # correct for the non-uniform rig (C07 is ~3775x960, not 2560x1440).
+    try:
+        image_wh_by_cam = load_image_sizes_from_drive(drive_root, match_id)
+    except (FileNotFoundError, ValueError):
+        image_wh_by_cam = None
+    geometry = build_geometry_cache(projections, config, image_wh_by_cam=image_wh_by_cam)
     calibration_preflight = {
         "camera_count": len(projections),
         "pair_count": len(geometry.pairs),
@@ -91,10 +108,9 @@ def run_association(
         raise ValueError("calibration preflight found non-finite fundamental matrices")
     records_by_frame = load_synchronized_records(prediction_files, delivery_id)
 
-    anchor: AnchorState | None = None
-    temporal_memory = TemporalLinkMemory(confirm_frames=config.temporal_confirm_frames)
-    anchor_switch_frames: list[int] = []
-    rows: list[dict] = []
+    # Pass A: build (and cache) per-frame detections once — including appearance
+    # descriptors, which require the frame images.
+    detections_by_frame: dict[int, dict] = {}
     appearance_images_missing = 0
     for frame_index in sorted(records_by_frame):
         camera_records = records_by_frame[frame_index]
@@ -117,10 +133,44 @@ def run_association(
                 ankle_confidence_min=config.ankle_conf_min,
                 max_ankle_above_bbox_fraction=config.max_ankle_above_bbox_fraction,
             )
+        detections_by_frame[frame_index] = detections
+
+    # Pass B (tracklet_graph mode): accumulate tracklet-pair evidence over the
+    # whole delivery, calibrate cue LLRs, and solve persistent identity bindings.
+    graph_builder: TrackletGraphBuilder | None = None
+    graph_solution = None
+    if config.association_mode == "tracklet_graph":
+        graph_builder = TrackletGraphBuilder(config, projections)
+        for frame_index in sorted(detections_by_frame):
+            graph_builder.observe_frame(frame_index, detections_by_frame[frame_index])
+        if config.calibration_mode == "file" and config.cue_calibration_path:
+            calibration = CueCalibration.load(config.cue_calibration_path)
+        elif config.calibration_mode == "defaults":
+            calibration = CueCalibration()
+        else:
+            calibration = graph_builder.harvest_calibration()
+        graph_solution = graph_builder.solve(calibration)
+
+    # Pass C: per-frame correspondences — from stable bindings in graph mode,
+    # from the historical per-frame clustering otherwise.
+    anchor: AnchorState | None = None
+    temporal_memory = TemporalLinkMemory(confirm_frames=config.temporal_confirm_frames)
+    anchor_switch_frames: list[int] = []
+    rows: list[dict] = []
+    for frame_index in sorted(records_by_frame):
+        camera_records = records_by_frame[frame_index]
+        detections = detections_by_frame[frame_index]
         previous_anchor = anchor.anchor_id if anchor is not None else None
-        correspondences, anchor = associate_frame(
-            detections, projections, geometry, anchor, config, temporal_memory
-        )
+        if graph_builder is not None and graph_solution is not None:
+            anchor = select_anchor(detections, anchor, config)
+            correspondences = graph_builder.emit_frame(
+                frame_index, detections, graph_solution, projections,
+                geometry.camera_centers,
+            )
+        else:
+            correspondences, anchor = associate_frame(
+                detections, projections, geometry, anchor, config, temporal_memory
+            )
         if previous_anchor is not None and anchor.anchor_id != previous_anchor:
             anchor_switch_frames.append(frame_index)
         apply_correspondences(camera_records, correspondences)
@@ -131,6 +181,11 @@ def run_association(
     write_prediction_streams(records_by_frame, prediction_files, output_run_dir / "predictions")
     correspondence_path = output_run_dir / "diagnostics" / "correspondences.jsonl"
     write_correspondence_rows(rows, correspondence_path)
+    if graph_solution is not None:
+        _write_json(
+            output_run_dir / "diagnostics" / "tracklet_graph.json",
+            graph_solution.to_json(),
+        )
 
     created_at = datetime.now(timezone.utc).isoformat()
     degenerate_pairs = [
@@ -147,10 +202,28 @@ def run_association(
                 matched_pair_count += 1
                 degenerate_pair_usage_count += int(camera_pair in degenerate_pair_set)
     proxy = association_proxy_metrics(rows, anchor_switch_frames=anchor_switch_frames)
+    churn = pair_link_churn(rows)
     frame_counts = {
         camera: sum(camera in per_camera for per_camera in records_by_frame.values())
         for camera in camera_ids
     }
+    graph_metrics: dict = {"association_mode": config.association_mode}
+    if graph_solution is not None:
+        graph_metrics.update({
+            "binding_count": len(graph_solution.clusters),
+            "multi_camera_binding_count": sum(
+                len({key[0] for key in keys}) >= 2
+                for keys in graph_solution.clusters.values()
+            ),
+            "graph_edge_count": len(graph_solution.edges),
+            "graph_diagnostics": graph_solution.diagnostics,
+            "cue_d_prime": {
+                cue: round(graph_solution.calibration.d_prime(cue), 3)
+                for cue in sorted(graph_solution.calibration.distributions)
+            },
+            "calibration_anchor_pair_count": graph_solution.calibration.anchor_pair_count,
+            "calibration_diff_pair_count": graph_solution.calibration.diff_pair_count,
+        })
     metrics = {
         "schema_version": "association_metrics/v1",
         "created_at": created_at,
@@ -172,6 +245,8 @@ def run_association(
         "calibration_preflight": calibration_preflight,
         "appearance_images_missing": appearance_images_missing,
         **proxy,
+        **churn,
+        **graph_metrics,
     }
     manifest = {
         "schema_version": "association_run/v1",

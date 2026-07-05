@@ -35,12 +35,20 @@ from pose_estimation.cricket.geometry import (
 from pose_estimation.triangulation import (
     ransac_triangulate_point,
     reprojection_errors_for_point,
+    triangulate_skeleton_ransac,
+)
+from pose_estimation.cricket.pose_shape import (
+    PoseProportions,
+    limb_proportion_descriptor,
+    torso_anthropometric_ok,
 )
 from scripts.association.config import P3AssociationConfig
 from scripts.association.appearance import appearance_distance
 from scripts.association.geometry_cache import GeometryCache, PairGeometry
 
 _L_ANKLE, _R_ANKLE = 15, 16  # COCO-17 ankle indices
+# Body joints used by the pose-shape descriptor (skip the 5 face joints 0-4).
+_BODY_JOINTS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,11 @@ class Correspondence:
     mean_reprojection_error_px: float | None = None
     cycle_consistent: bool = True
     ground_spread_m: float | None = None
+    pose_descriptor: PoseProportions | None = None
+    # Persistent tracklet-graph identity (``association_mode: tracklet_graph``).
+    # Same physical player => same binding_id for the whole delivery, across all
+    # cameras. None in per-frame mode and for unbound leftovers.
+    binding_id: str | None = None
 
 
 @dataclass
@@ -202,6 +215,16 @@ def build_cost_matrix(
         if _is_opposite_pair(pg.cam_id_a, pg.cam_id_b, config)
         else config.ground_distance_gate_m
     )
+    # Degenerate (near-collinear / facing) pairs have ill-conditioned epipolar
+    # geometry; geometry_cache already flags them and zeroes ``w_epi``. Honour that
+    # here by dropping the epipolar term for such pairs and reallocating its weight
+    # to the trustworthy ground cue, so the row keeps its tuned 0..1 scale against
+    # ``pair_unmatched_cost``. (These flags were previously computed but never read,
+    # so the co-observing facing pairs -- exactly the pairs that must cluster -- were
+    # scored with a full-weight, unreliable Sampson term, causing under-merges.)
+    epipolar_factor = 0.0 if pg.is_degenerate else 1.0
+    epipolar_weight = config.epipolar_weight * epipolar_factor
+    ground_weight = config.ground_weight + config.epipolar_weight * (1.0 - epipolar_factor)
 
     for i, da in enumerate(dets_a):
         ground_a = _detection_ground_xy(da, P_a, config)
@@ -235,8 +258,8 @@ def build_cost_matrix(
             continuity = temporal_memory.support(da, db) if temporal_memory is not None else 0.0
             cost[i, j] = max(
                 0.0,
-                config.ground_weight * (ground_distance / ground_gate)
-                + config.epipolar_weight * min(epipolar_px / config.epipolar_scale_px, 1.0)
+                ground_weight * (ground_distance / ground_gate)
+                + epipolar_weight * min(epipolar_px / config.epipolar_scale_px, 1.0)
                 + config.appearance_weight * appearance_cost
                 - config.temporal_link_bonus * continuity,
             )
@@ -291,7 +314,7 @@ def associate_frame(
         )
     ordered = _order_clusters(clusters, new_anchor.anchor_id, config)
     correspondences = [
-        _build_correspondence(idx, members, dets_per_cam, proj_matrices, config)
+        _build_correspondence(idx, members, dets_per_cam, proj_matrices, config, geo.camera_centers)
         for idx, members in enumerate(ordered)
     ]
     if temporal_memory is not None:
@@ -483,7 +506,80 @@ def _multiview_reprojection_consistency(members, dets_per_cam, proj_matrices, co
     return result.point_xyz, maximum
 
 
-def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, config):
+def _joint_parallax_ok(points3d, camera_centers, min_deg):
+    """Per-joint mask: True when some member-camera pair triangulates it with >= min_deg parallax.
+
+    Segments spanning only low-parallax (near-collinear / facing) views are noisy in
+    depth, so the descriptor must exclude them -- this is what keeps the pose cue from
+    firing on the very pairs where cross-camera triangulation is unreliable.
+    """
+
+    points3d = np.asarray(points3d, dtype=float).reshape(-1, 3)
+    joints = points3d.shape[0]
+    ok = np.zeros(joints, dtype=bool)
+    centers = [np.asarray(c, dtype=float) for c in camera_centers
+               if c is not None and np.isfinite(np.asarray(c, dtype=float)).all()]
+    if len(centers) < 2:
+        return ok
+    for joint in range(joints):
+        point = points3d[joint]
+        if not np.isfinite(point).all():
+            continue
+        best = 0.0
+        for left in range(len(centers)):
+            for right in range(left + 1, len(centers)):
+                best = max(best, parallax_angle_deg(centers[left], centers[right], point))
+            if best >= min_deg:
+                break
+        ok[joint] = best >= min_deg
+    return ok
+
+
+def _pose_descriptor_for_members(members, dets_per_cam, proj_matrices, camera_centers, config):
+    """Triangulate a reduced skeleton for a cluster and return (descriptor, torso_ok).
+
+    ``torso_ok`` is a soft plausibility flag (None when the torso is not confidently
+    co-observed) used only to down-weight confidence for likely chimeras.
+    """
+
+    cam_order = list(members.keys())
+    keypoints, projections, centers = [], [], []
+    for cam_id in cam_order:
+        detection = dets_per_cam[cam_id][members[cam_id]]
+        kp = np.asarray(detection.keypoints_px, dtype=float).reshape(-1, 2)
+        conf = np.asarray(detection.keypoint_conf, dtype=float).reshape(-1, 1)
+        keypoints.append(np.concatenate([kp[_BODY_JOINTS], conf[_BODY_JOINTS]], axis=1))
+        projections.append(np.asarray(proj_matrices[cam_id], dtype=float))
+        centers.append(camera_centers.get(cam_id) if camera_centers else None)
+
+    body_points, body_conf, _reproj = triangulate_skeleton_ransac(
+        np.asarray(keypoints, dtype=float),
+        np.asarray(projections, dtype=float),
+        reprojection_threshold_px=config.triangulation_reproj_threshold_px,
+        min_views=config.triangulation_min_views,
+    )
+    points3d = np.full((17, 3), np.nan, dtype=float)
+    joint_conf = np.zeros(17, dtype=float)
+    points3d[_BODY_JOINTS] = body_points
+    joint_conf[_BODY_JOINTS] = body_conf
+
+    parallax_ok = _joint_parallax_ok(points3d, centers, config.pose_parallax_min_deg)
+    descriptor = limb_proportion_descriptor(
+        points3d, joint_conf, parallax_ok,
+        min_conf=config.pose_min_conf, n_views=len(members),
+    )
+    torso_ok = torso_anthropometric_ok(
+        points3d, joint_conf,
+        shoulder_width_m=tuple(config.pose_shoulder_width_m),
+        hip_width_m=tuple(config.pose_hip_width_m),
+        torso_len_m=tuple(config.pose_torso_len_m),
+        torso_tilt_max_deg=config.pose_torso_tilt_max_deg,
+        min_conf=config.pose_min_conf,
+    )
+    return descriptor, torso_ok
+
+
+def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, config, camera_centers=None):
     detections = {cam_id: dets_per_cam[cam_id][idx] for cam_id, idx in members.items()}
     if len(members) == 1:
         camera_id, index = next(iter(members.items()))
@@ -521,11 +617,23 @@ def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, conf
         np.clip(1.0 - max_ground_residual / config.ground_cluster_gate_m, 0.0, 1.0)
     )
     support = min(len(members), 4) / 4.0
+    track_confidence = float(np.clip(0.45 + 0.35 * geo_term + 0.20 * support, 0.0, 1.0))
+
+    pose_descriptor: PoseProportions | None = None
+    if config.pose_descriptor_enabled:
+        pose_descriptor, torso_ok = _pose_descriptor_for_members(
+            members, dets_per_cam, proj_matrices, camera_centers or {}, config
+        )
+        # Fail-open: only a *confidently implausible* torso (a likely chimera merging
+        # two different people) trims confidence; None (unobservable) never penalizes.
+        if torso_ok is False:
+            track_confidence = max(0.0, track_confidence - config.pose_confidence_penalty)
+
     return Correspondence(
         cluster_id=cluster_id,
         members=detections,
         ground_xy=ground_xy,
-        track_confidence=float(np.clip(0.45 + 0.35 * geo_term + 0.20 * support, 0.0, 1.0)),
+        track_confidence=track_confidence,
         single_camera=False,
         mean_reprojection_error_px=(mean_reproj if np.isfinite(mean_reproj) else None),
         cycle_consistent=bool(
@@ -533,6 +641,7 @@ def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, conf
             and max_ground_residual <= config.ground_cluster_gate_m
         ),
         ground_spread_m=(max_ground_residual if np.isfinite(max_ground_residual) else None),
+        pose_descriptor=pose_descriptor,
     )
 
 

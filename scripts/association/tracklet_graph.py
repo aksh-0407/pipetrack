@@ -1,0 +1,678 @@
+"""Tracklet-graph cross-camera identity for P3 (``association_mode: tracklet_graph``).
+
+Per-frame clustering decides identity where every cue is noisiest: one frame at a
+time. This module decides it once per **tracklet pair** instead. P2 tracklets are
+long (hundreds of frames) and clean, so aggregating cue evidence over the whole
+co-visible span divides the per-frame noise by sqrt(n) and lets weak-but-honest
+cues (kit colour, ground-anchored posture) contribute meaningfully.
+
+Pipeline (all offline over one delivery, deterministic):
+
+1. ``observe_frame`` — per detection: ground point + covariance + billboard posture
+   sample; per cross-camera detection pair within a wide sample gate: ground
+   residual/Mahalanobis, appearance distance, isolation. Tracklets are split into
+   *chunks* at kinematically impossible ground jumps so a P2 identity switch can
+   never weld two players together.
+2. ``harvest_calibration`` — bootstrap same-player anchors (tight ground agreement
+   + spatial isolation) and different-player pairs (consistently metres apart),
+   fit per-cue LLR distributions (see :mod:`scripts.association.cue_calibration`).
+3. ``solve`` — fuse per-pair aggregated cues into edge LLRs, then constrained
+   agglomerative clustering (cannot-link: same-camera temporal overlap) with a
+   local move-refinement pass. Every cluster becomes a persistent ``binding_id``.
+4. ``emit_frame`` — rebuild per-frame correspondences from the bindings, so the
+   correspondence stream P4 consumes is temporally stable by construction.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
+from itertools import combinations
+
+import numpy as np
+
+from pose_estimation.cricket.geometry import (
+    ground_covariance,
+    ground_mahalanobis_sq,
+)
+from pose_estimation.cricket.pose_shape import (
+    PostureAccumulator,
+    PostureAggregate,
+    ground_anchored_skeleton,
+    posture_distance_z,
+    posture_from_skeleton,
+)
+from scripts.association.appearance import appearance_distance
+from scripts.association.associator import (
+    Correspondence,
+    Detection3,
+    _build_correspondence,
+    _foot_pixel,
+)
+from scripts.association.config import P3AssociationConfig
+from scripts.association.cue_calibration import CueCalibration, fit_cue_calibration
+
+ChunkKey = tuple[str, str, int]  # (cam_id, local_track_id, chunk_index)
+
+
+@dataclass
+class _ChunkState:
+    key: ChunkKey
+    frames: list[int] = field(default_factory=list)
+    ground_by_frame: dict[int, np.ndarray] = field(default_factory=dict)
+    cov_by_frame: dict[int, np.ndarray] = field(default_factory=dict)
+    posture: PostureAccumulator = field(default_factory=PostureAccumulator)
+
+    @property
+    def first_frame(self) -> int:
+        return self.frames[0] if self.frames else 1 << 60
+
+    @property
+    def last_frame(self) -> int:
+        return self.frames[-1] if self.frames else -1
+
+
+@dataclass
+class _PairSamples:
+    frames: list[int] = field(default_factory=list)
+    dist_m: list[float] = field(default_factory=list)
+    maha: list[float] = field(default_factory=list)         # sqrt of Mahalanobis^2
+    appearance: list[float] = field(default_factory=list)
+    isolation_m: list[float] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class GraphEdge:
+    key_a: ChunkKey
+    key_b: ChunkKey
+    llr_total: float
+    llr_ground: float
+    llr_appearance: float
+    llr_posture: float
+    llr_motion: float
+    gated_frames: int
+    median_dist_m: float
+    posture_z: float | None
+
+    def to_json(self) -> dict:
+        return {
+            "a": list(self.key_a), "b": list(self.key_b),
+            "llr_total": round(self.llr_total, 3),
+            "llr_ground": round(self.llr_ground, 3),
+            "llr_appearance": round(self.llr_appearance, 3),
+            "llr_posture": round(self.llr_posture, 3),
+            "llr_motion": round(self.llr_motion, 3),
+            "gated_frames": self.gated_frames,
+            "median_dist_m": round(self.median_dist_m, 3),
+            "posture_z": None if self.posture_z is None else round(self.posture_z, 3),
+        }
+
+
+@dataclass
+class GraphSolution:
+    binding_of_chunk: dict[ChunkKey, str]
+    clusters: dict[str, list[ChunkKey]]
+    edges: list[GraphEdge]
+    calibration: CueCalibration
+    diagnostics: dict
+
+    def to_json(self) -> dict:
+        return {
+            "clusters": {
+                binding: [list(key) for key in sorted(keys)]
+                for binding, keys in sorted(self.clusters.items())
+            },
+            "edges": [edge.to_json() for edge in self.edges],
+            "calibration": self.calibration.summary(),
+            "diagnostics": self.diagnostics,
+        }
+
+
+def _pair_key(a: ChunkKey, b: ChunkKey) -> tuple[ChunkKey, ChunkKey]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _median(values: list[float]) -> float:
+    finite = [v for v in values if np.isfinite(v)]
+    return float(np.median(finite)) if finite else float("nan")
+
+
+class TrackletGraphBuilder:
+    """Accumulate evidence per frame, then solve identity once for the delivery."""
+
+    def __init__(
+        self,
+        config: P3AssociationConfig,
+        projections: dict[str, np.ndarray],
+    ) -> None:
+        self.config = config
+        self.projections = projections
+        self._chunks: dict[ChunkKey, _ChunkState] = {}
+        self._current_chunk: dict[tuple[str, str], int] = {}
+        self._last_seen: dict[tuple[str, str], tuple[int, np.ndarray]] = {}
+        # (frame, cam, local_track_id) -> chunk, so emission is independent of
+        # per-frame player ordering.
+        self._det_chunk: dict[tuple[int, str, str], ChunkKey] = {}
+        self._pairs: dict[tuple[ChunkKey, ChunkKey], _PairSamples] = defaultdict(_PairSamples)
+        self._velocity_cache: dict[ChunkKey, dict[int, np.ndarray | None]] = {}
+        self.diagnostics: dict[str, int] = defaultdict(int)
+
+    # ------------------------------------------------------------- pass A
+
+    def _chunk_for(self, cam_id: str, local_track_id: str, frame_index: int,
+                   ground: np.ndarray) -> ChunkKey:
+        tracklet = (cam_id, local_track_id)
+        index = self._current_chunk.get(tracklet, 0)
+        previous = self._last_seen.get(tracklet)
+        if previous is not None and self.config.purity_split_enabled:
+            gap = max(1, frame_index - previous[0])
+            allowed = (
+                self.config.kinematic_v_max_mps * gap / self.config.frame_rate_fps
+            ) * self.config.purity_jump_slack + self.config.purity_jump_floor_m
+            if float(np.linalg.norm(ground - previous[1])) > allowed:
+                index += 1
+                self._current_chunk[tracklet] = index
+                self.diagnostics["purity_splits"] += 1
+        self._last_seen[tracklet] = (frame_index, ground.copy())
+        return (cam_id, local_track_id, index)
+
+    def observe_frame(self, frame_index: int, dets_per_cam: dict[str, list[Detection3]]) -> None:
+        placed: list[tuple[ChunkKey, Detection3, np.ndarray, np.ndarray]] = []
+        grounds_by_cam: dict[str, list[np.ndarray]] = defaultdict(list)
+        for cam_id in sorted(dets_per_cam):
+            projection = self.projections.get(cam_id)
+            for index, det in enumerate(dets_per_cam[cam_id]):
+                ground = det.ground_xy
+                if ground is None or not np.isfinite(np.asarray(ground, dtype=float)).all():
+                    continue
+                ground = np.asarray(ground, dtype=float)
+                grounds_by_cam[cam_id].append(ground)
+                if det.local_track_id is None or projection is None:
+                    continue
+                key = self._chunk_for(cam_id, det.local_track_id, frame_index, ground)
+                chunk = self._chunks.setdefault(key, _ChunkState(key=key))
+                chunk.frames.append(frame_index)
+                chunk.ground_by_frame[frame_index] = ground
+                foot = _foot_pixel(det, self.config)
+                cov = ground_covariance(
+                    foot, projection,
+                    sigma_px=self._sigma_px(det),
+                    var_floor_m=self.config.ground_var_floor_m,
+                )
+                chunk.cov_by_frame[frame_index] = cov
+                if self.config.posture_enabled:
+                    points3d, valid = ground_anchored_skeleton(
+                        det.keypoints_px, det.keypoint_conf, foot, projection,
+                        min_conf=self.config.pose_min_conf,
+                    )
+                    chunk.posture.add(posture_from_skeleton(points3d, valid))
+                self._det_chunk[(frame_index, cam_id, det.local_track_id)] = key
+                placed.append((key, det, ground, cov))
+
+        for (key_a, det_a, ground_a, cov_a), (key_b, det_b, ground_b, cov_b) in combinations(placed, 2):
+            if key_a[0] == key_b[0]:
+                continue
+            distance = float(np.linalg.norm(ground_a - ground_b))
+            if distance > self.config.graph_sample_gate_m:
+                continue
+            samples = self._pairs[_pair_key(key_a, key_b)]
+            samples.frames.append(frame_index)
+            samples.dist_m.append(distance)
+            m2 = ground_mahalanobis_sq(ground_a, cov_a, ground_b, cov_b)
+            samples.maha.append(float(np.sqrt(m2)) if np.isfinite(m2) else float("nan"))
+            app = appearance_distance(det_a.appearance, det_b.appearance)
+            if app is not None:
+                samples.appearance.append(float(app))
+            # Isolation for anchor bootstrapping: nearest OTHER PERSON. Only the
+            # pair's own two cameras can vouch for that — a detection in a third
+            # camera may be this very player, but one camera never sees one person
+            # twice, so same-camera neighbours are guaranteed different people.
+            midpoint = 0.5 * (ground_a + ground_b)
+            others = [
+                float(np.linalg.norm(g - midpoint))
+                for cam_id, own in ((key_a[0], ground_a), (key_b[0], ground_b))
+                for g in grounds_by_cam[cam_id]
+                if g is not own
+            ]
+            samples.isolation_m.append(min(others) if others else float("inf"))
+
+    def _sigma_px(self, det: Detection3) -> float:
+        bbox_h = float(det.bbox_xywh_px[3]) if len(det.bbox_xywh_px) == 4 else 0.0
+        return (
+            self.config.ground_sigma_px_base
+            + self.config.ground_sigma_px_bbox_frac * max(bbox_h, 0.0)
+        )
+
+    # -------------------------------------------------------- calibration
+
+    def harvest_calibration(self) -> CueCalibration:
+        """Bootstrap same/different populations from geometry and fit cue LLRs."""
+
+        postures = self._chunk_postures()
+        same_samples: dict[str, list[float]] = defaultdict(list)
+        diff_samples: dict[str, list[float]] = defaultdict(list)
+        posture_same_deltas: dict[str, list[float]] = defaultdict(list)
+        same_pairs: list[tuple[ChunkKey, ChunkKey]] = []
+        diff_pairs: list[tuple[ChunkKey, ChunkKey]] = []
+
+        for (key_a, key_b), samples in sorted(self._pairs.items()):
+            if len(samples.frames) < self.config.anchor_pair_min_frames:
+                continue
+            med_dist = _median(samples.dist_m)
+            med_iso = _median(samples.isolation_m)
+            if not np.isfinite(med_dist):
+                continue
+            if (
+                med_dist <= self.config.anchor_pair_dist_m
+                and med_iso >= self.config.anchor_pair_isolation_m
+            ):
+                same_pairs.append((key_a, key_b))
+                same_samples["ground_dist_m"].extend(samples.dist_m)
+                same_samples["ground_maha"].extend(samples.maha)
+                same_samples["appearance"].extend(samples.appearance)
+                agg_a, agg_b = postures.get(key_a), postures.get(key_b)
+                if agg_a is not None and agg_b is not None:
+                    for name in set(agg_a.median) & set(agg_b.median):
+                        posture_same_deltas[name].append(
+                            abs(agg_a.median[name] - agg_b.median[name])
+                        )
+            elif med_dist >= self.config.diff_pair_min_dist_m:
+                diff_pairs.append((key_a, key_b))
+                diff_samples["ground_dist_m"].extend(samples.dist_m)
+                diff_samples["ground_maha"].extend(samples.maha)
+                diff_samples["appearance"].extend(samples.appearance)
+
+        if len(same_pairs) < 3:
+            # Per-frame samples within one pair are correlated; fewer than three
+            # independent anchor pairs cannot support a trustworthy same-player
+            # distribution. Keep the conservative physical defaults.
+            calibration = CueCalibration()
+            calibration.anchor_pair_count = len(same_pairs)
+            calibration.diff_pair_count = len(diff_pairs)
+            self.diagnostics["calibration_fell_back_to_defaults"] = 1
+            return calibration
+
+        calibration = fit_cue_calibration(
+            same_samples={k: v for k, v in same_samples.items()},
+            diff_samples={k: v for k, v in diff_samples.items()},
+            posture_same_deltas={k: v for k, v in posture_same_deltas.items()},
+            anchor_pair_count=len(same_pairs),
+            diff_pair_count=len(diff_pairs),
+        )
+
+        # Second pass: posture z-scores need the fitted systematic sigmas.
+        z_same = [
+            z for pair in same_pairs
+            if (z := self._posture_z(postures, pair, calibration)) is not None
+        ]
+        z_diff = [
+            z for pair in diff_pairs
+            if (z := self._posture_z(postures, pair, calibration)) is not None
+        ]
+        if len(z_same) >= 8 and len(z_diff) >= 8:
+            refit = fit_cue_calibration(
+                same_samples={"posture_z": z_same},
+                diff_samples={"posture_z": z_diff},
+            )
+            calibration.distributions["posture_z"] = refit.distributions["posture_z"]
+        return calibration
+
+    def _posture_z(
+        self,
+        postures: dict[ChunkKey, PostureAggregate | None],
+        pair: tuple[ChunkKey, ChunkKey],
+        calibration: CueCalibration,
+    ) -> float | None:
+        result = posture_distance_z(
+            postures.get(pair[0]), postures.get(pair[1]),
+            sigma_sys=calibration.posture_sigma_sys,
+        )
+        return None if result is None else result[0]
+
+    def _chunk_postures(self) -> dict[ChunkKey, PostureAggregate | None]:
+        return {
+            key: chunk.posture.aggregate(min_samples=self.config.posture_min_samples)
+            for key, chunk in self._chunks.items()
+        }
+
+    # -------------------------------------------------------------- solve
+
+    def _motion_llr(self, key_a: ChunkKey, key_b: ChunkKey, frames: list[int]) -> float:
+        """Motion agreement over the shared window, on heavily-smoothed velocities.
+
+        Raw foot projections carry ~0.3 m of noise, so short-lag finite differences
+        are useless (~5 m/s of speed noise). Velocities here come from median-
+        smoothed positions with a 10-frame central difference. Two verdicts:
+
+        * both clearly moving -> direction cosine (parallel = weak "same",
+          opposite = strong "different");
+        * one sprinting while the other stands -> strong "different" (this is the
+          bowler-vs-non-striker case: co-located during the run-up, but only one
+          of them is running).
+        """
+
+        if not self.config.graph_motion_enabled:
+            return 0.0
+        velocities_a = self._smoothed_velocities(key_a)
+        velocities_b = self._smoothed_velocities(key_b)
+        cosines: list[float] = []
+        asymmetric = 0
+        comparable = 0
+        for frame in frames:
+            va, vb = velocities_a.get(frame), velocities_b.get(frame)
+            if va is None or vb is None:
+                continue
+            speed_a, speed_b = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+            comparable += 1
+            low, high = min(speed_a, speed_b), max(speed_a, speed_b)
+            if high > 2.0 and low < 0.7:
+                asymmetric += 1
+            elif speed_a > 1.2 and speed_b > 1.2:
+                cosines.append(float(va @ vb) / (speed_a * speed_b))
+        if comparable < 10:
+            return 0.0
+        llr = 0.0
+        if len(cosines) >= 10:
+            llr += 1.5 * (float(np.mean(cosines)) - 0.35)
+        if asymmetric >= 10 and asymmetric / comparable >= 0.2:
+            llr -= 1.5
+        return float(np.clip(llr, -2.5, 0.75))
+
+    def _smoothed_velocities(self, key: ChunkKey) -> dict[int, np.ndarray | None]:
+        """Per-frame ground velocity from median-smoothed positions (cached)."""
+
+        cached = self._velocity_cache.get(key)
+        if cached is not None:
+            return cached
+        chunk = self._chunks[key]
+        frames = sorted(chunk.ground_by_frame)
+        half, lag = 5, 10
+        smoothed: dict[int, np.ndarray] = {}
+        for frame in frames:
+            window = [
+                chunk.ground_by_frame[f]
+                for f in range(frame - half, frame + half + 1)
+                if f in chunk.ground_by_frame
+            ]
+            if len(window) >= 3:
+                smoothed[frame] = np.median(np.asarray(window), axis=0)
+        fps = self.config.frame_rate_fps
+        velocities: dict[int, np.ndarray | None] = {}
+        for frame in frames:
+            before, after = smoothed.get(frame - lag), smoothed.get(frame + lag)
+            velocities[frame] = (
+                (after - before) * (fps / (2.0 * lag))
+                if before is not None and after is not None else None
+            )
+        self._velocity_cache[key] = velocities
+        return velocities
+
+    def _build_edges(self, calibration: CueCalibration) -> list[GraphEdge]:
+        postures = self._chunk_postures()
+        edges: list[GraphEdge] = []
+        positive_cap = self.config.graph_llr_positive_cap
+        # Appearance is rig-dependent (inter-camera colour processing can differ
+        # more than kits differ between people — measured d'=0.09 on this rig), so
+        # it must EARN its way in: a measured, separable fit or it abstains. The
+        # physically-anchored cues (metres on the calibrated ground plane, metric
+        # posture) remain usable from their conservative defaults.
+        appearance_dist = calibration.distributions.get("appearance")
+        appearance_usable = (
+            appearance_dist is not None
+            and appearance_dist.fitted
+            and appearance_dist.d_prime() >= 0.5
+        )
+        if not appearance_usable:
+            self.diagnostics["appearance_cue_abstained"] = 1
+        for (key_a, key_b), samples in sorted(self._pairs.items()):
+            gated = len(samples.frames)
+            if gated < self.config.graph_min_covis_frames:
+                continue
+            med_maha = _median(samples.maha)
+            med_dist = _median(samples.dist_m)
+            if not np.isfinite(med_dist) or med_dist > self.config.graph_hard_dist_gate_m:
+                # Consistently farther apart than any observed same-player
+                # cross-camera residual: not mergeable, and no negative edge is
+                # needed (absence already blocks merging).
+                continue
+            # Every cue is clipped asymmetrically: agreement is weak evidence of
+            # identity (players can share position, kit, and build) but strong
+            # disagreement is near-conclusive evidence of difference. Ground gets a
+            # milder NEGATIVE clip than the other cues: inside the hard distance
+            # gate a large residual can also mean a large per-camera-pair
+            # calibration bias (measured up to ~2 m on some facing pairs vs ~1 m
+            # globally), so ground alone must never outvote posture/motion.
+            llr_ground = calibration.llr(
+                "ground_maha", med_maha,
+                clip=self.config.graph_llr_ground_neg_clip, clip_pos=positive_cap,
+            )
+            med_app = (
+                _median(samples.appearance)
+                if appearance_usable
+                and len(samples.appearance) >= self.config.graph_min_app_samples
+                else None
+            )
+            llr_app = calibration.llr("appearance", med_app, clip_pos=positive_cap)
+            z = self._posture_z(postures, (key_a, key_b), calibration)
+            llr_posture = calibration.llr("posture_z", z, clip_pos=positive_cap)
+            llr_motion = self._motion_llr(key_a, key_b, samples.frames)
+            support = min(1.0, gated / max(self.config.graph_covis_full_frames, 1))
+            total = support * (llr_ground + llr_app + llr_posture + llr_motion)
+            edges.append(GraphEdge(
+                key_a=key_a, key_b=key_b, llr_total=total,
+                llr_ground=llr_ground, llr_appearance=llr_app,
+                llr_posture=llr_posture, llr_motion=llr_motion,
+                gated_frames=gated, median_dist_m=med_dist, posture_z=z,
+            ))
+        # More co-visible evidence wins ties created by the positive cap.
+        edges.sort(key=lambda e: (-e.llr_total, -e.gated_frames, e.key_a, e.key_b))
+        return edges
+
+    def _overlap_frames(self, key_a: ChunkKey, key_b: ChunkKey) -> int:
+        return len(set(self._chunks[key_a].frames) & set(self._chunks[key_b].frames))
+
+    def _cluster_compatible(self, members_a: list[ChunkKey], members_b: list[ChunkKey],
+                            llr_lookup: dict[tuple[ChunkKey, ChunkKey], float]) -> bool:
+        """Merging is a vote, not a veto by the noisiest pair.
+
+        Hard blocks: same-camera temporal overlap (two simultaneous tracklets in
+        one camera are two people) and any pair below ``graph_llr_veto`` (a
+        confident contradiction, e.g. posture separating the crouching keeper from
+        the striker). Otherwise the SUM of cross-pair evidence decides, so one
+        noisy 22-frame pair cannot cancel a 600-frame agreement.
+        """
+
+        total = 0.0
+        for a in members_a:
+            for b in members_b:
+                if a[0] == b[0]:
+                    if self._overlap_frames(a, b) > self.config.graph_cannot_link_overlap_frames:
+                        return False
+                else:
+                    llr = llr_lookup.get(_pair_key(a, b))
+                    if llr is not None:
+                        if llr < self.config.graph_llr_veto:
+                            return False
+                        total += llr
+        return total >= 0.0
+
+    def solve(self, calibration: CueCalibration | None = None) -> GraphSolution:
+        calibration = calibration or self.harvest_calibration()
+        edges = self._build_edges(calibration)
+        llr_lookup = {_pair_key(e.key_a, e.key_b): e.llr_total for e in edges}
+
+        parent: dict[ChunkKey, ChunkKey] = {key: key for key in self._chunks}
+        members: dict[ChunkKey, list[ChunkKey]] = {key: [key] for key in self._chunks}
+
+        def find(key: ChunkKey) -> ChunkKey:
+            root = key
+            while parent[root] != root:
+                root = parent[root]
+            while parent[key] != root:
+                parent[key], key = root, parent[key]
+            return root
+
+        merges = 0
+        for edge in edges:
+            if edge.llr_total < self.config.graph_llr_merge_threshold:
+                break
+            root_a, root_b = find(edge.key_a), find(edge.key_b)
+            if root_a == root_b:
+                continue
+            if not self._cluster_compatible(members[root_a], members[root_b], llr_lookup):
+                self.diagnostics["merges_blocked"] += 1
+                continue
+            parent[root_b] = root_a
+            members[root_a] = sorted(members[root_a] + members[root_b])
+            del members[root_b]
+            merges += 1
+        self.diagnostics["merges_accepted"] = merges
+
+        cluster_members: dict[int, list[ChunkKey]] = {
+            index: sorted(keys)
+            for index, keys in enumerate(sorted(members.values(), key=lambda keys: keys[0]))
+        }
+        cluster_of: dict[ChunkKey, int] = {
+            key: cid for cid, keys in cluster_members.items() for key in keys
+        }
+        moves = self._refine(cluster_members, cluster_of, llr_lookup)
+        self.diagnostics["refine_moves"] = moves
+
+        clusters_raw = sorted(
+            cluster_members.values(),
+            key=lambda keys: (min(self._chunks[k].first_frame for k in keys), keys[0]),
+        )
+        binding_of_chunk: dict[ChunkKey, str] = {}
+        clusters: dict[str, list[ChunkKey]] = {}
+        for index, keys in enumerate(clusters_raw):
+            binding = f"B{index + 1:03d}"
+            clusters[binding] = sorted(keys)
+            for key in keys:
+                binding_of_chunk[key] = binding
+        return GraphSolution(
+            binding_of_chunk=binding_of_chunk,
+            clusters=clusters,
+            edges=edges,
+            calibration=calibration,
+            diagnostics=dict(sorted(self.diagnostics.items())),
+        )
+
+    def _refine(
+        self,
+        cluster_members: dict[int, list[ChunkKey]],
+        cluster_of: dict[ChunkKey, int],
+        llr_lookup: dict[tuple[ChunkKey, ChunkKey], float],
+    ) -> int:
+        """Move single chunks between clusters while total LLR improves.
+
+        This is the escape hatch greedy single-linkage lacks: an early bad merge
+        (or a chunk welded in by a since-outvoted edge) can be reconsidered. A
+        chunk whose affinity to its own cluster is clearly negative may also split
+        out into a fresh singleton.
+        """
+
+        moves = 0
+        next_cluster_id = max(cluster_members, default=-1) + 1
+        for _ in range(max(0, self.config.graph_refine_passes)):
+            changed = False
+            for key in sorted(self._chunks):
+                current_id = cluster_of[key]
+                rest = [m for m in cluster_members[current_id] if m != key]
+                current_score = sum(
+                    llr_lookup.get(_pair_key(key, other), 0.0) for other in rest
+                )
+                best_id, best_gain = None, 0.0
+                for candidate_id in sorted(cluster_members):
+                    if candidate_id == current_id:
+                        continue
+                    candidate = cluster_members[candidate_id]
+                    if not self._cluster_compatible([key], candidate, llr_lookup):
+                        continue
+                    score = sum(
+                        llr_lookup.get(_pair_key(key, other), 0.0) for other in candidate
+                    )
+                    gain = score - current_score
+                    if gain > best_gain + self.config.graph_move_margin:
+                        best_id, best_gain = candidate_id, gain
+                if best_id is None and rest and current_score < -self.config.graph_move_margin:
+                    cluster_members[next_cluster_id] = []
+                    best_id = next_cluster_id
+                    next_cluster_id += 1
+                if best_id is None:
+                    continue
+                if rest:
+                    cluster_members[current_id] = rest
+                else:
+                    del cluster_members[current_id]
+                cluster_members[best_id] = sorted(cluster_members[best_id] + [key])
+                cluster_of[key] = best_id
+                moves += 1
+                changed = True
+            if not changed:
+                break
+        return moves
+
+    # --------------------------------------------------------------- emit
+
+    def emit_frame(
+        self,
+        frame_index: int,
+        dets_per_cam: dict[str, list[Detection3]],
+        solution: GraphSolution,
+        proj_matrices: dict[str, np.ndarray],
+        camera_centers: dict[str, np.ndarray] | None = None,
+    ) -> list[Correspondence]:
+        """Group one frame's detections by binding and build correspondences."""
+
+        groups: dict[str, dict[str, int]] = defaultdict(dict)
+        leftovers: list[tuple[str, int]] = []
+        for cam_id in sorted(dets_per_cam):
+            for det in dets_per_cam[cam_id]:
+                chunk = (
+                    self._det_chunk.get((frame_index, cam_id, det.local_track_id))
+                    if det.local_track_id is not None else None
+                )
+                binding = solution.binding_of_chunk.get(chunk) if chunk else None
+                if binding is None:
+                    leftovers.append((cam_id, det.player_index))
+                    continue
+                existing = groups[binding].get(cam_id)
+                if existing is not None:
+                    # <=cannot_link_overlap_frames same-camera overlap can reach here;
+                    # keep the higher-confidence detection, spill the other.
+                    current = dets_per_cam[cam_id][existing]
+                    if det.confidence > current.confidence:
+                        groups[binding][cam_id] = det.player_index
+                        leftovers.append((cam_id, existing))
+                    else:
+                        leftovers.append((cam_id, det.player_index))
+                    self.diagnostics["emit_same_camera_conflicts"] += 1
+                else:
+                    groups[binding][cam_id] = det.player_index
+
+        index_of = {
+            cam_id: {det.player_index: i for i, det in enumerate(dets)}
+            for cam_id, dets in dets_per_cam.items()
+        }
+        correspondences: list[Correspondence] = []
+        cluster_id = 0
+        for binding in sorted(groups):
+            member_map = {
+                cam_id: index_of[cam_id][player_index]
+                for cam_id, player_index in sorted(groups[binding].items())
+            }
+            corr = _build_correspondence(
+                cluster_id, member_map, dets_per_cam, proj_matrices, self.config,
+                camera_centers or {},
+            )
+            correspondences.append(replace(corr, binding_id=binding))
+            cluster_id += 1
+        for cam_id, player_index in sorted(leftovers):
+            member_map = {cam_id: index_of[cam_id][player_index]}
+            corr = _build_correspondence(
+                cluster_id, member_map, dets_per_cam, proj_matrices, self.config,
+                camera_centers or {},
+            )
+            correspondences.append(corr)
+            cluster_id += 1
+        return correspondences

@@ -15,6 +15,8 @@ from typing import Any, get_type_hints
 import yaml
 
 _MATCHING_MODES = {"pairwise_anchor", "multiway_cycle"}
+_ASSOCIATION_MODES = {"per_frame", "tracklet_graph"}
+_CALIBRATION_MODES = {"auto", "file", "defaults"}
 _DEFAULT_ANCHOR_PRIORITY = ["cam_01", "cam_04", "cam_02", "cam_03", "cam_05", "cam_06", "cam_07"]
 # FACING (co-observing) pairs, per configs/facing.jpeg and verified against the
 # calibration optical axes: each pair looks at the SAME ground strip from opposite
@@ -70,6 +72,62 @@ class P3AssociationConfig:
     cycle_reproj_tol_px: float = 12.0
     triangulation_min_views: int = 2
     triangulation_reproj_threshold_px: float = 10.0
+    # Pose-shape descriptor (view-invariant 3D bone-length ratios). Emitted per
+    # multi-view correspondence as a SOFT signal: it feeds the P4a temporal
+    # tie-breaker and (via torso plausibility) a small confidence down-weight for
+    # likely chimera clusters. Never a hard gate -- see changes_tbd.md.
+    pose_descriptor_enabled: bool = True
+    pose_min_conf: float = 0.3
+    pose_parallax_min_deg: float = 12.0
+    pose_shoulder_width_m: list = field(default_factory=lambda: [0.25, 0.65])
+    pose_hip_width_m: list = field(default_factory=lambda: [0.15, 0.55])
+    pose_torso_len_m: list = field(default_factory=lambda: [0.35, 0.85])
+    pose_torso_tilt_max_deg: float = 75.0
+    pose_confidence_penalty: float = 0.15
+    # --- tracklet-graph identity (association_mode: tracklet_graph) ---------
+    # per_frame reproduces the historical per-frame clustering byte-for-byte;
+    # tracklet_graph decides identity once per P2-tracklet pair over the whole
+    # delivery and emits per-frame correspondences from those bindings.
+    association_mode: str = "per_frame"
+    graph_sample_gate_m: float = 6.0          # wide evidence gate (also feeds calibration)
+    graph_min_covis_frames: int = 10          # min gated co-visible frames for an edge
+    graph_covis_full_frames: int = 40         # support saturation for full edge weight
+    # Min aggregated LLR to merge. Above the single-cue positive cap by design:
+    # capped ground agreement alone can never merge two tracklets — at least one
+    # corroborating cue (posture, motion, appearance) must also vote "same".
+    graph_llr_merge_threshold: float = 2.0
+    graph_llr_veto: float = -4.5              # only a CONFIDENT contradiction blocks a merge
+    graph_llr_positive_cap: float = 1.5       # per-cue cap on "same" evidence
+    graph_llr_ground_neg_clip: float = 2.0    # ground's negative clip (bias tolerance)
+    graph_move_margin: float = 0.5            # refinement move hysteresis
+    graph_refine_passes: int = 2
+    graph_cannot_link_overlap_frames: int = 3  # same-camera overlap => different people
+    graph_hard_dist_gate_m: float = 2.75      # median ground residual ceiling for edges
+    graph_motion_enabled: bool = True
+    graph_min_app_samples: int = 5
+    # Per-detection ground covariance (pixel noise through the ray-plane Jacobian).
+    # The floor absorbs cross-camera calibration bias: measured same-player ground
+    # residuals on this rig are ~0.7-1.2 m median, far above pure pixel noise.
+    ground_sigma_px_base: float = 2.0
+    ground_sigma_px_bbox_frac: float = 0.01   # + frac * bbox_height_px
+    ground_var_floor_m: float = 0.4
+    # Tracklet purity: split a P2 tracklet at kinematically impossible ground jumps
+    purity_split_enabled: bool = True
+    purity_jump_slack: float = 1.5
+    purity_jump_floor_m: float = 1.0
+    frame_rate_fps: float = 50.0
+    kinematic_v_max_mps: float = 9.0
+    # Ground-anchored (billboard) posture cue -- the pose-shape identity layer
+    posture_enabled: bool = True
+    posture_min_samples: int = 8
+    # Cue calibration: auto = bootstrap same/diff populations from this delivery,
+    # file = load cue_calibration_path, defaults = conservative built-ins.
+    calibration_mode: str = "auto"
+    cue_calibration_path: str = ""
+    anchor_pair_min_frames: int = 30
+    anchor_pair_dist_m: float = 1.5
+    anchor_pair_isolation_m: float = 3.0
+    diff_pair_min_dist_m: float = 3.0
     # Confidence / gating
     chi2_gate_2dof: float = 5.991
     confidence_high: float = 0.7
@@ -86,6 +144,38 @@ class P3AssociationConfig:
             _require_positive_int(name, getattr(self, name))
         if self.matching_mode not in _MATCHING_MODES:
             raise ValueError(f"matching_mode must be one of {sorted(_MATCHING_MODES)}")
+        if self.association_mode not in _ASSOCIATION_MODES:
+            raise ValueError(f"association_mode must be one of {sorted(_ASSOCIATION_MODES)}")
+        if self.calibration_mode not in _CALIBRATION_MODES:
+            raise ValueError(f"calibration_mode must be one of {sorted(_CALIBRATION_MODES)}")
+        if not isinstance(self.cue_calibration_path, str):
+            raise ValueError("cue_calibration_path must be a string (may be empty)")
+        for name in ("graph_sample_gate_m", "graph_covis_full_frames",
+                     "graph_hard_dist_gate_m", "graph_llr_positive_cap",
+                     "graph_llr_ground_neg_clip",
+                     "ground_sigma_px_base",
+                     "ground_var_floor_m", "purity_jump_slack", "purity_jump_floor_m",
+                     "frame_rate_fps", "kinematic_v_max_mps",
+                     "anchor_pair_dist_m", "anchor_pair_isolation_m",
+                     "diff_pair_min_dist_m"):
+            _require_positive(name, getattr(self, name))
+        for name in ("graph_min_covis_frames", "graph_refine_passes",
+                     "graph_cannot_link_overlap_frames", "graph_min_app_samples",
+                     "posture_min_samples", "anchor_pair_min_frames"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        for name in ("graph_llr_merge_threshold", "graph_llr_veto", "graph_move_margin"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be a finite number")
+        _require_range("ground_sigma_px_bbox_frac", self.ground_sigma_px_bbox_frac, 0.0, 1.0)
+        for name in ("graph_motion_enabled", "purity_split_enabled", "posture_enabled"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        if self.anchor_pair_dist_m >= self.diff_pair_min_dist_m:
+            raise ValueError("anchor_pair_dist_m must be < diff_pair_min_dist_m")
         for name in ("baseline_angle_degen_deg", "parallax_full_deg", "mu_fine_score",
                      "sigma_fine_score", "dummy_cost_scale", "cycle_xy_tol_m",
                      "cycle_reproj_tol_px", "triangulation_reproj_threshold_px",
@@ -99,8 +189,15 @@ class P3AssociationConfig:
                      "confidence_high", "confidence_discard", "single_camera_confidence",
                      "untracked_single_camera_confidence",
                      "max_ankle_above_bbox_fraction", "ground_weight", "epipolar_weight",
-                     "appearance_weight", "temporal_link_bonus"):
+                     "appearance_weight", "temporal_link_bonus",
+                     "pose_min_conf", "pose_confidence_penalty"):
             _require_range(name, getattr(self, name), 0.0, 1.0)
+        if type(self.pose_descriptor_enabled) is not bool:
+            raise ValueError("pose_descriptor_enabled must be a boolean")
+        _require_positive("pose_parallax_min_deg", self.pose_parallax_min_deg)
+        _require_positive("pose_torso_tilt_max_deg", self.pose_torso_tilt_max_deg)
+        for name in ("pose_shoulder_width_m", "pose_hip_width_m", "pose_torso_len_m"):
+            _require_meter_range(name, getattr(self, name))
         if self.confidence_discard > self.confidence_high:
             raise ValueError("confidence_discard must be <= confidence_high")
         for name in ("triangulation_min_views", "anchor_hysteresis_margin", "anchor_hysteresis_frames",
@@ -146,6 +243,15 @@ def _require_range(name: str, value: float, low: float, high: float) -> None:
     numeric = float(value)
     if not math.isfinite(numeric) or numeric < low or numeric > high:
         raise ValueError(f"{name} must be in [{low}, {high}]")
+
+
+def _require_meter_range(name: str, value: Any) -> None:
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in value)):
+        raise ValueError(f"{name} must be a [low, high] pair of metres")
+    low, high = float(value[0]), float(value[1])
+    if not (math.isfinite(low) and math.isfinite(high)) or low <= 0.0 or low >= high:
+        raise ValueError(f"{name} must satisfy 0 < low < high")
 
 
 def _validate_pair_list(name: str, value: Any) -> None:

@@ -9,6 +9,7 @@ become available.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from itertools import combinations
 from typing import Any, Iterable
 
 import numpy as np
@@ -70,6 +71,53 @@ def association_proxy_metrics(
         "anchor_switch_count": len(anchor_switch_frames),
         "anchor_switch_frames": anchor_switch_frames,
         "anchor_switch_frequency": len(anchor_switch_frames) / max(len(rows), 1),
+    }
+
+
+def pair_link_churn(correspondence_rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Frame-to-frame stability of cross-camera tracklet co-clustering.
+
+    For every pair of P2 tracklets (different cameras) co-clustered at frame f,
+    check whether the pair is still co-clustered at the next row where **both**
+    tracklets are present in any cluster. A break is the per-frame flicker that
+    turns into cross-camera ID disagreement downstream; a temporally-stable
+    association keeps this near zero by construction.
+    """
+
+    rows = sorted(correspondence_rows, key=lambda row: int(row["frame_index"]))
+    links_per_row: list[set[tuple[str, str, str, str]]] = []
+    present_per_row: list[set[tuple[str, str]]] = []
+    for row in rows:
+        links: set[tuple[str, str, str, str]] = set()
+        present: set[tuple[str, str]] = set()
+        for cluster in row.get("clusters", []):
+            members = [
+                (member["cam_id"], member["local_track_id"])
+                for member in cluster.get("members", [])
+                if member.get("local_track_id")
+            ]
+            present.update(members)
+            for (cam_a, track_a), (cam_b, track_b) in combinations(sorted(members), 2):
+                if cam_a != cam_b:
+                    links.add((cam_a, track_a, cam_b, track_b))
+        links_per_row.append(links)
+        present_per_row.append(present)
+
+    evaluated = 0
+    broken = 0
+    for index in range(len(rows) - 1):
+        next_links = links_per_row[index + 1]
+        next_present = present_per_row[index + 1]
+        for cam_a, track_a, cam_b, track_b in links_per_row[index]:
+            if (cam_a, track_a) not in next_present or (cam_b, track_b) not in next_present:
+                continue
+            evaluated += 1
+            if (cam_a, track_a, cam_b, track_b) not in next_links:
+                broken += 1
+    return {
+        "pair_link_evaluated_count": evaluated,
+        "pair_link_broken_count": broken,
+        "pair_link_churn_rate": (broken / evaluated) if evaluated else 0.0,
     }
 
 
@@ -170,6 +218,132 @@ def identity_collision_metrics(records: Iterable[dict[str, Any]]) -> dict[str, A
         "same_camera_identity_collision_frames": collision_frames,
         "same_camera_duplicate_identity_assignments": duplicate_assignments,
         "same_camera_identity_collision_examples": examples,
+    }
+
+
+def cross_camera_agreement(
+    records: Iterable[dict[str, Any]],
+    ground_positions: dict[tuple[int, str, int], Any],
+    *,
+    group_radius_m: float = 1.5,
+) -> dict[str, Any]:
+    """Proxy for cross-camera identity agreement -- the target metric for the
+    "different cameras give the same player different global IDs" symptom.
+
+    For every pair of detections in *different* cameras whose bbox-bottom ground
+    projections fall within ``group_radius_m`` (very likely the same physical
+    player), measure whether they were assigned the same ``global_player_id``.
+
+    ``ground_positions`` maps ``(frame_index, camera_id, player_index)`` to a
+    world ``(x, y)`` derived from calibration alone (NOT from P3 clustering), so
+    the metric does not merely echo the clustering it is meant to judge. It is a
+    proxy: two distinct players standing closer than the radius are counted as an
+    expected match and will (correctly) disagree, so read it as a tripwire beside
+    the mosaic video, never as an optimization target.
+    """
+
+    by_frame: dict[int, list[tuple[str, str, np.ndarray]]] = defaultdict(list)
+    for record in records:
+        frame_index = int(record["frame_index"])
+        camera_id = str(record["camera_id"])
+        for player_index, player in enumerate(record.get("players", [])):
+            player_id = player.get("global_player_id")
+            if not player_id:
+                continue
+            xy = ground_positions.get((frame_index, camera_id, player_index))
+            if xy is None:
+                continue
+            point = np.asarray(xy, dtype=float)
+            if point.shape != (2,) or not np.isfinite(point).all():
+                continue
+            by_frame[frame_index].append((camera_id, str(player_id), point))
+
+    radius_sq = float(group_radius_m) ** 2
+    total_pairs = 0
+    agreeing_pairs = 0
+    examples: list[dict[str, Any]] = []
+    for frame_index in sorted(by_frame):
+        detections = by_frame[frame_index]
+        for i in range(len(detections)):
+            cam_i, id_i, xy_i = detections[i]
+            for j in range(i + 1, len(detections)):
+                cam_j, id_j, xy_j = detections[j]
+                if cam_i == cam_j:
+                    continue
+                if float(np.sum((xy_i - xy_j) ** 2)) > radius_sq:
+                    continue
+                total_pairs += 1
+                if id_i == id_j:
+                    agreeing_pairs += 1
+                elif len(examples) < 20:
+                    examples.append({
+                        "frame_index": frame_index,
+                        "camera_ids": sorted((cam_i, cam_j)),
+                        "global_player_ids": sorted((id_i, id_j)),
+                    })
+    return {
+        "group_radius_m": float(group_radius_m),
+        "cross_camera_pair_count": total_pairs,
+        "cross_camera_agreeing_pair_count": agreeing_pairs,
+        "cross_camera_agreement_rate": (agreeing_pairs / total_pairs) if total_pairs else 1.0,
+        "cross_camera_disagreement_examples": examples,
+    }
+
+
+def teleport_proxy(
+    records: Iterable[dict[str, Any]],
+    ground_positions: dict[tuple[int, str, int], Any],
+    *,
+    max_speed_mps: float = 9.0,
+    frame_rate_fps: float = 50.0,
+    slack: float = 1.5,
+) -> dict[str, Any]:
+    """Flag global IDs that jump faster than a human between consecutive frames.
+
+    A near-static same-kit ID swap does not teleport, so this is silent on that
+    case; it catches the coarser swaps where an identity leaps across the field.
+    Position per ``(id, frame)`` is the mean ground point over the cameras that
+    saw it.
+    """
+
+    per_id_frame: dict[str, dict[int, list[np.ndarray]]] = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        frame_index = int(record["frame_index"])
+        camera_id = str(record["camera_id"])
+        for player_index, player in enumerate(record.get("players", [])):
+            player_id = player.get("global_player_id")
+            if not player_id:
+                continue
+            xy = ground_positions.get((frame_index, camera_id, player_index))
+            if xy is None:
+                continue
+            point = np.asarray(xy, dtype=float)
+            if point.shape == (2,) and np.isfinite(point).all():
+                per_id_frame[str(player_id)][frame_index].append(point)
+
+    threshold_mps = float(max_speed_mps) * float(slack)
+    events = 0
+    examples: list[dict[str, Any]] = []
+    for player_id in sorted(per_id_frame):
+        frames = sorted(per_id_frame[player_id])
+        means = {f: np.mean(np.asarray(per_id_frame[player_id][f], dtype=float), axis=0) for f in frames}
+        for prev_frame, curr_frame in zip(frames, frames[1:]):
+            dt = (curr_frame - prev_frame) / float(frame_rate_fps)
+            if dt <= 0:
+                continue
+            speed = float(np.linalg.norm(means[curr_frame] - means[prev_frame])) / dt
+            if speed > threshold_mps:
+                events += 1
+                if len(examples) < 20:
+                    examples.append({
+                        "global_player_id": player_id,
+                        "frames": [prev_frame, curr_frame],
+                        "speed_mps": speed,
+                    })
+    return {
+        "max_speed_mps": float(max_speed_mps),
+        "teleport_event_count": events,
+        "teleport_examples": examples,
     }
 
 

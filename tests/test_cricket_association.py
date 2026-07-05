@@ -69,3 +69,42 @@ def test_cost_matrix_contains_only_real_pair_costs():
 def test_optional_assignment_does_not_force_bad_real_pairs():
     cost = np.array([[0.2, 1e6], [1e6, 1e6]], dtype=float)
     assert solve_optional_assignment(cost, unmatched_cost=0.75) == [(0, 0)]
+
+
+def test_degenerate_pair_reallocates_epipolar_weight_to_ground():
+    # Facing (co-observing) pairs are flagged degenerate because their epipolar
+    # geometry is ill-conditioned. The cost must then drop the epipolar term and
+    # reallocate its weight to the trustworthy ground cue, instead of scoring the
+    # pair with a full-weight, unreliable Sampson term.
+    import pytest
+    from pose_estimation.cricket.geometry import pixel_to_ground_xy
+
+    projection_a = np.array([[800.0, 0.0, 640.0, 0.0], [0.0, 800.0, 360.0, 0.0], [0, 0, 1, 5.0]])
+    projection_b = projection_a.copy()
+    projection_b[0, 3] = 50.0
+    center_a = np.array([0.0, 0.0, -5.0])
+    center_b = np.array([-0.0625, 0.0, -5.0])
+    fundamental = compute_fundamental_matrix(projection_a, projection_b)
+    dets_a = [_det("cam_01")]
+    dets_b = [_det("cam_02")]
+    config = P3AssociationConfig()
+
+    def _cost(is_degenerate: bool) -> float:
+        w_epi = 0.0 if is_degenerate else config.w_epi
+        w_tri = 1.0 if is_degenerate else config.w_tri
+        pair = PairGeometry("cam_01", "cam_02", fundamental, is_degenerate, w_epi, w_tri, 10.0)
+        return float(build_cost_matrix(
+            dets_a, dets_b, projection_a, projection_b, center_a, center_b, pair, config,
+        )[0, 0])
+
+    ground_a = pixel_to_ground_xy(_foot_pixel(dets_a[0], config), projection_a)
+    ground_b = pixel_to_ground_xy(_foot_pixel(dets_b[0], config), projection_b)
+    ground_distance = float(np.linalg.norm(ground_a - ground_b))
+    assert ground_distance <= config.ground_distance_gate_m  # a real (finite) cost
+    # appearance is None on both -> 0.5; no temporal continuity.
+    expected = (config.ground_weight + config.epipolar_weight) * (
+        ground_distance / config.ground_distance_gate_m
+    ) + config.appearance_weight * 0.5
+    assert _cost(True) == pytest.approx(expected, abs=1e-9)
+    # A healthy pair keeps a separate, F-dependent epipolar term -> different value.
+    assert _cost(False) != pytest.approx(expected, abs=1e-6)

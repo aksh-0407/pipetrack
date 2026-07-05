@@ -143,3 +143,161 @@ def test_every_confident_grounded_detection_receives_a_track():
     manager.update(corrs, 1)
     assignments = manager.update(corrs, 2)
     assert all(assignments[cluster].global_player_id is not None for cluster in (0, 1, 2))
+
+
+def _skeleton(shin_z: float) -> tuple[np.ndarray, np.ndarray]:
+    points = np.full((17, 3), np.nan)
+    points[5] = [-0.20, 0.0, 1.40]; points[6] = [0.20, 0.0, 1.40]   # shoulders
+    points[7] = [-0.25, 0.0, 1.10]; points[8] = [0.25, 0.0, 1.10]   # elbows
+    points[9] = [-0.28, 0.0, 0.85]; points[10] = [0.28, 0.0, 0.85]  # wrists
+    points[11] = [-0.12, 0.0, 0.95]; points[12] = [0.12, 0.0, 0.95]  # hips
+    points[13] = [-0.13, 0.0, 0.50]; points[14] = [0.13, 0.0, 0.50]  # knees
+    points[15] = [-0.13, 0.0, shin_z]; points[16] = [0.13, 0.0, shin_z]  # ankles vary
+    conf = np.ones(17); conf[[0, 1, 2, 3, 4]] = 0.0
+    return points, conf
+
+
+def _descriptor(shin_z: float):
+    from pose_estimation.cricket.pose_shape import limb_proportion_descriptor
+    points, conf = _skeleton(shin_z)
+    return limb_proportion_descriptor(points, conf, n_views=3)
+
+
+def _pose_corr(cluster_id, xy, descriptor, local_track_id):
+    detection = Detection3(
+        "cam_01", 0, [100.0, 100.0, 40.0, 100.0], np.zeros((17, 2)),
+        np.ones(17), 0.8, local_track_id,
+    )
+    return Correspondence(cluster_id, {"cam_01": detection}, np.asarray(xy, float), 0.8, False,
+                          pose_descriptor=descriptor)
+
+
+def test_pose_tiebreaker_reranks_two_gate_admissible_tracks():
+    # Two mature tracks both fall inside the chi2 gate of one new observation, and
+    # geometry alone would pick the nearer track A. But the observation's body
+    # proportions match track B, so with pose enabled the id follows the pose.
+    desc_a = _descriptor(0.05)   # normal shins
+    desc_b = _descriptor(-0.45)  # much longer shins -> distinct proportions
+    obs_like_b = _descriptor(-0.45)
+
+    def run(pose_weight):
+        manager = TrackManager(_config(
+            confirm_hits=1, pose_match_weight=pose_weight,
+            pose_min_updates=1, pose_min_shared_segments=4,
+        ))
+        # Birth + confirm two tracks at distinct spots with their own pose descriptors.
+        manager.update([
+            _pose_corr(0, (0.0, 0.0), desc_a, "cam_01_trk_A"),
+            _pose_corr(1, (0.6, 0.0), desc_b, "cam_01_trk_B"),
+        ], 0)
+        track_a, track_b = manager.tracks[0], manager.tracks[1]
+        assert track_a.pose_update_count >= 1 and track_b.pose_update_count >= 1
+        # Observation nearer to A (0.25 vs 0.35) but with B's proportions and no
+        # local-track id, so it is resolved by the Stage-2 geometric+pose cost.
+        assignments = manager.update(
+            [_pose_corr(2, (0.25, 0.0), obs_like_b, None)], 1
+        )
+        return assignments[2], track_a, track_b
+
+    winner_geo, geo_a, _ = run(pose_weight=0.0)
+    assert winner_geo is geo_a  # geometry alone assigns the nearer track
+
+    winner_pose, _, pose_b = run(pose_weight=50.0)
+    assert winner_pose is pose_b  # pose re-ranks the assignment to the matching track
+
+
+def _bound_correspondence(
+    cluster_id: int,
+    binding_id: str,
+    cameras: tuple[str, ...] = ("cam_01", "cam_04"),
+    xy=(0.0, 0.0),
+    confidence: float = 0.8,
+) -> Correspondence:
+    members = {
+        cam_id: Detection3(
+            cam_id, 0, [100.0, 100.0, 40.0, 100.0], np.zeros((17, 2)),
+            np.ones(17), confidence, f"{cam_id}_trk_0001",
+        )
+        for cam_id in cameras
+    }
+    return Correspondence(
+        cluster_id, members, np.asarray(xy, float), confidence, len(cameras) == 1,
+        binding_id=binding_id,
+    )
+
+
+def test_binding_keeps_one_id_when_membership_flickers():
+    """The historical failure: P3 splits a player's cameras apart for a few frames
+    and the split half mints a new ID. With a binding the split halves keep
+    resolving to the same persistent track."""
+
+    manager = TrackManager(_config(confirm_hits=2))
+    manager.update([_bound_correspondence(0, "B001")], 0)
+    manager.update([_bound_correspondence(0, "B001")], 1)
+    track = manager.tracks[0]
+    assert track.global_player_id == "P001"
+
+    # Frames 2-4: the correspondence "splits" — only one camera at a time, but
+    # the binding persists, so no new track may appear.
+    for frame, cameras in ((2, ("cam_01",)), (3, ("cam_04",)), (4, ("cam_01",))):
+        assignments = manager.update(
+            [_bound_correspondence(0, "B001", cameras=cameras, xy=(0.02 * frame, 0.0))],
+            frame,
+        )
+        assert assignments[0] is track
+    assert len(manager.tracks) == 1
+    assert manager.diagnostics.get("tracks_spawned", 0) == 1
+    assert manager.diagnostics["binding_matches"] == 4
+
+
+def test_distinct_bindings_never_share_a_track():
+    manager = TrackManager(_config(confirm_hits=2))
+    for frame in range(3):
+        manager.update(
+            [
+                _bound_correspondence(0, "B001", xy=(0.0, 0.0)),
+                _bound_correspondence(1, "B002", xy=(1.5, 0.0)),
+            ],
+            frame,
+        )
+    identifiers = {track.global_player_id for track in manager.tracks}
+    assert identifiers == {"P001", "P002"}
+
+
+def test_binding_outlier_ground_becomes_identity_only_hit():
+    manager = TrackManager(_config(confirm_hits=2))
+    manager.update([_bound_correspondence(0, "B001")], 0)
+    manager.update([_bound_correspondence(0, "B001")], 1)
+    position_before = manager.tracks[0].kalman.pos_world_xy.copy()
+    manager.update([_bound_correspondence(0, "B001", xy=(30.0, 0.0))], 2)
+    assert manager.diagnostics["binding_ground_outliers"] == 1
+    assert np.allclose(manager.tracks[0].kalman.pos_world_xy, position_before, atol=0.5)
+
+
+def test_ownership_claim_expires_and_transfers():
+    manager = TrackManager(_config(confirm_hits=2, ownership_ttl_frames=10))
+    manager.update([_correspondence(0)], 0)
+    manager.update([_correspondence(1)], 1)
+    owner = manager.tracks[0]
+
+    # A second track appears elsewhere and (wrongly) tries to claim the tracklet
+    # while the owner's claim is fresh: refused.
+    intruder_det = Detection3(
+        "cam_01", 1, [500.0, 100.0, 40.0, 100.0], np.zeros((17, 2)),
+        np.ones(17), 0.8, "cam_01_trk_0009",
+    )
+    intruder = Correspondence(7, {"cam_01": intruder_det}, np.asarray((8.0, 0.0)), 0.8, True)
+    manager.update([_correspondence(2), intruder], 2)
+    intruder_track = next(t for t in manager.tracks if t is not owner)
+    refused = manager._claim_local_ids(
+        intruder_track, {"cam_01": "cam_01_trk_0001"}, 3
+    )
+    assert refused == {}
+    assert manager.diagnostics["local_track_reassignment_conflicts_prevented"] == 1
+
+    # After the TTL lapses without the owner re-asserting, the claim transfers.
+    accepted = manager._claim_local_ids(
+        intruder_track, {"cam_01": "cam_01_trk_0001"}, 20
+    )
+    assert accepted == {"cam_01": "cam_01_trk_0001"}
+    assert manager.diagnostics["local_track_ownership_transfers"] == 1

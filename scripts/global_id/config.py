@@ -50,18 +50,33 @@ class P4AConfig:
     confidence_high: float = 0.7
     confidence_discard: float = 0.3
     local_identity_mahalanobis_gate: float = 25.0
+    # A (camera, P2-tracklet) -> global-track ownership claim expires after this
+    # many frames without being re-asserted, so one bad P3 merge can no longer
+    # weld two players together permanently. 0 keeps the legacy permanent claims.
+    ownership_ttl_frames: int = 50
+    # Pose-shape temporal tie-breaker: added to the Stage-2 cost INSIDE the chi2
+    # gate only, so it re-ranks admissible candidates but never opens/blocks a
+    # match. 0 disables. Needs empirical tuning (no identity ground truth).
+    pose_match_weight: float = 2.0
+    pose_descriptor_ema: float = 0.15
+    pose_min_updates: int = 5
+    pose_min_shared_segments: int = 4
     role_params: dict[str, dict[str, float]] = field(default_factory=_default_role_params)
 
     def __post_init__(self) -> None:
         for name in ("confirm_hits", "lost_window_frames", "bowler_lost_window_frames",
-                     "reentry_temporal_gate_frames", "role_latch_frames"):
+                     "reentry_temporal_gate_frames", "role_latch_frames",
+                     "pose_min_updates", "pose_min_shared_segments"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if type(self.ownership_ttl_frames) is not int or self.ownership_ttl_frames < 0:
+            raise ValueError("ownership_ttl_frames must be a non-negative integer")
         for name in ("chi2_gate_2dof", "reentry_mahalanobis_gate", "reentry_gap_scale_frames",
                      "reentry_kinematic_slack", "cap_max_pos_var",
                      "local_identity_mahalanobis_gate"):
             _positive(name, getattr(self, name))
-        for name in ("confidence_high", "confidence_discard"):
+        _nonnegative("pose_match_weight", self.pose_match_weight)
+        for name in ("confidence_high", "confidence_discard", "pose_descriptor_ema"):
             _range(name, getattr(self, name), 0.0, 1.0)
         if self.confidence_discard > self.confidence_high:
             raise ValueError("confidence_discard must be <= confidence_high")

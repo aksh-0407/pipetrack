@@ -214,6 +214,100 @@ def pixel_to_ground_xy(pixel_xy: np.ndarray, projection_matrix: np.ndarray) -> n
     return result if np.isfinite(result).all() else np.full(2, np.nan)
 
 
+def ground_covariance(
+    pixel_xy: np.ndarray,
+    projection_matrix: np.ndarray,
+    *,
+    sigma_px: float = 2.0,
+    var_floor_m: float = 0.05,
+) -> np.ndarray:
+    """2x2 world-XY covariance of a ground projection under isotropic pixel noise.
+
+    Propagates ``sigma_px`` through the image->ground homography Jacobian
+    (evaluated numerically at the pixel). The result is strongly anisotropic —
+    elongated along the viewing ray, growing with distance — which is exactly the
+    structure a fixed scalar ground gate cannot represent. ``var_floor_m`` adds an
+    isotropic floor for calibration/model error. Returns an inf-diagonal matrix
+    when the projection is invalid so callers can gate on finiteness.
+    """
+
+    invalid = np.diag([np.inf, np.inf])
+    point = np.asarray(pixel_xy, dtype=float)
+    if point.shape != (2,) or not np.isfinite(point).all():
+        return invalid
+    step = 0.5
+    jacobian = np.zeros((2, 2), dtype=float)
+    for axis in range(2):
+        offset = np.zeros(2)
+        offset[axis] = step
+        plus = pixel_to_ground_xy(point + offset, projection_matrix)
+        minus = pixel_to_ground_xy(point - offset, projection_matrix)
+        if not (np.isfinite(plus).all() and np.isfinite(minus).all()):
+            return invalid
+        jacobian[:, axis] = (plus - minus) / (2.0 * step)
+    covariance = float(sigma_px) ** 2 * jacobian @ jacobian.T
+    covariance += float(var_floor_m) ** 2 * np.eye(2)
+    if not np.isfinite(covariance).all():
+        return invalid
+    return covariance
+
+
+def ground_mahalanobis_sq(
+    xy_a: np.ndarray,
+    cov_a: np.ndarray,
+    xy_b: np.ndarray,
+    cov_b: np.ndarray,
+) -> float:
+    """Squared Mahalanobis distance between two ground points under summed covariance."""
+
+    a = np.asarray(xy_a, dtype=float)
+    b = np.asarray(xy_b, dtype=float)
+    S = np.asarray(cov_a, dtype=float) + np.asarray(cov_b, dtype=float)
+    if not (np.isfinite(a).all() and np.isfinite(b).all() and np.isfinite(S).all()):
+        return float("inf")
+    diff = a - b
+    try:
+        solved = np.linalg.solve(S, diff)
+    except np.linalg.LinAlgError:
+        return float("inf")
+    value = float(diff @ solved)
+    return value if np.isfinite(value) and value >= 0.0 else float("inf")
+
+
+def fuse_ground_estimates(
+    points_xy: np.ndarray,
+    covariances: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse-covariance-weighted fusion of per-camera ground estimates.
+
+    Returns ``(fused_xy, fused_cov)``; NaN/inf entries are skipped. Falls back to
+    NaN when no member is usable.
+    """
+
+    points = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    covs = np.asarray(covariances, dtype=float).reshape(-1, 2, 2)
+    information = np.zeros((2, 2), dtype=float)
+    weighted = np.zeros(2, dtype=float)
+    used = 0
+    for point, cov in zip(points, covs):
+        if not (np.isfinite(point).all() and np.isfinite(cov).all()):
+            continue
+        try:
+            inv = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            continue
+        information += inv
+        weighted += inv @ point
+        used += 1
+    if used == 0:
+        return np.full(2, np.nan), np.diag([np.inf, np.inf])
+    try:
+        fused_cov = np.linalg.inv(information)
+    except np.linalg.LinAlgError:
+        return np.full(2, np.nan), np.diag([np.inf, np.inf])
+    return fused_cov @ weighted, fused_cov
+
+
 def huber_cost(r: float, delta: float) -> float:
     """Huber cost: quadratic for ``r <= delta``, linear beyond; continuous at delta."""
 

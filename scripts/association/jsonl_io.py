@@ -168,6 +168,10 @@ def correspondence_row(frame_index: int, correspondences: Iterable[Correspondenc
                 "mean_reprojection_error_px": corr.mean_reprojection_error_px,
                 "cycle_consistent": bool(corr.cycle_consistent),
                 "ground_spread_m": corr.ground_spread_m,
+                "pose_descriptor": (
+                    corr.pose_descriptor.to_json() if corr.pose_descriptor is not None else None
+                ),
+                "binding_id": corr.binding_id,
             }
         )
     return {"frame_index": int(frame_index), "clusters": clusters}

@@ -7,10 +7,15 @@ cross-camera association: each :class:`Correspondence` is one world detection wh
 per camera. P4a only has to solve *temporal* association — link those world detections
 into persistent tracks and mint a stable ``global_player_id``.
 
-Per frame the tracker runs three small, independently-correct stages:
+Per frame the tracker runs four small, independently-correct stages:
 
+0. **Binding continuity** — a correspondence carrying a tracklet-graph ``binding_id``
+   maps 1:1 to a persistent track for the whole delivery: the graph already solved
+   who-is-who globally, so P4a must never re-litigate it per frame.
 1. **Identity continuity** — a correspondence whose P2 ``local_track_id`` is already owned
    by exactly one live track sticks to that track (rescues tracks across drift/occlusion).
+   Ownership claims expire after ``ownership_ttl_frames`` without re-assertion, so a
+   transient bad P3 merge can no longer weld two players together permanently.
 2. **Geometric assignment** — remaining correspondences ↔ remaining tracks by a
    chi2-gated Mahalanobis ground distance solved with the Hungarian algorithm.
 3. **Re-entry / birth** — an unmatched correspondence revives a kinematically-consistent
@@ -31,6 +36,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from pose_estimation.cricket.ground_kalman import RoleParams, SingerGroundKalman
+from pose_estimation.cricket.pose_shape import descriptor_distance
 from scripts.association.associator import Correspondence
 from scripts.global_id.config import P4Config
 from scripts.global_id.global_track import CONFIRMED, DELETED, LOST, TENTATIVE, GlobalTrack
@@ -47,7 +53,10 @@ class TrackManager:
         self.deleted_pool: list[GlobalTrack] = []
         self._next_id = 1
         self._last_frame: int | None = None
-        self._local_owners: dict[tuple[str, str], GlobalTrack] = {}
+        # (camera_id, local_track_id) -> (owning track, frame of last claim).
+        self._local_owners: dict[tuple[str, str], tuple[GlobalTrack, int]] = {}
+        # tracklet-graph binding_id -> persistent track (Stage 0).
+        self._binding_tracks: dict[str, GlobalTrack] = {}
         # Retained as an empty mapping for runner write-back compatibility; the
         # rebuilt tracker assigns whole correspondences, never split members.
         self.last_member_assignments: dict[tuple[int, str], GlobalTrack] = {}
@@ -78,15 +87,29 @@ class TrackManager:
         camera_id = sorted(correspondence.members)[0]
         return correspondence.members[camera_id].bbox_xywh_px
 
-    def _claim_local_ids(self, track: GlobalTrack, local_ids: dict[str, str]) -> dict[str, str]:
-        """Bind each (camera, P2 tracklet) to ``track`` unless another track owns it."""
+    def _claim_local_ids(
+        self, track: GlobalTrack, local_ids: dict[str, str], frame_index: int
+    ) -> dict[str, str]:
+        """Bind each (camera, P2 tracklet) to ``track`` unless another track owns it.
 
+        A conflicting claim is refused while the current owner's claim is fresh, but
+        succeeds once the owner has not re-asserted it for ``ownership_ttl_frames`` —
+        the revocability that lets a transient bad merge heal instead of poisoning
+        the tracklet for the rest of the delivery.
+        """
+
+        ttl = self.config.p4a.ownership_ttl_frames
         accepted: dict[str, str] = {}
         for camera_id, local_track_id in local_ids.items():
             key = (camera_id, local_track_id)
-            owner = self._local_owners.get(key)
-            if owner is None or owner is track:
-                self._local_owners[key] = track
+            entry = self._local_owners.get(key)
+            expired = (
+                entry is not None and ttl > 0 and frame_index - entry[1] > ttl
+            )
+            if entry is None or entry[0] is track or expired:
+                if expired and entry[0] is not track:
+                    self.diagnostics["local_track_ownership_transfers"] += 1
+                self._local_owners[key] = (track, frame_index)
                 accepted[camera_id] = local_track_id
             else:
                 self.diagnostics["local_track_reassignment_conflicts_prevented"] += 1
@@ -98,13 +121,15 @@ class TrackManager:
 
         A P2 tracklet id is unique to one physical person within a camera, so an exact
         match is decisive even across a deletion — stronger than any foot projection.
+        Expired claims still count here (continuity is preserved); expiry only allows
+        a *different* track to take over in :meth:`_claim_local_ids`.
         """
 
         owners = {
-            id(owner): owner
+            id(entry[0]): entry[0]
             for camera_id, local_track_id in local_ids.items()
-            if (owner := self._local_owners.get((camera_id, local_track_id))) is not None
-            and id(owner) not in hit
+            if (entry := self._local_owners.get((camera_id, local_track_id))) is not None
+            and id(entry[0]) not in hit
         }
         if len(owners) == 1:
             return next(iter(owners.values()))
@@ -126,14 +151,15 @@ class TrackManager:
     def _apply_match(self, observation: Correspondence, track: GlobalTrack, frame_index: int) -> None:
         """Full Kalman update from a correspondence's ground point."""
 
-        local_ids = self._claim_local_ids(track, self._local_ids(observation))
+        local_ids = self._claim_local_ids(track, self._local_ids(observation), frame_index)
         track.apply_hit(
             observation.ground_xy,
             self._representative_bbox(observation),
-            None,
+            observation.pose_descriptor,
             frame_index,
             single_camera=observation.single_camera,
             local_track_ids_by_cam=local_ids,
+            pose_ema_rate=self.config.p4a.pose_descriptor_ema,
         )
 
     def _spawn(self, observation: Correspondence, frame_index: int) -> GlobalTrack:
@@ -155,8 +181,11 @@ class TrackManager:
             single_camera=observation.single_camera,
             local_track_ids_by_cam=self._local_ids(observation),
         )
+        if observation.pose_descriptor is not None and observation.pose_descriptor.is_defined():
+            track.pose_proportions = observation.pose_descriptor
+            track.pose_update_count = 1
         self.tracks.append(track)
-        self._claim_local_ids(track, self._local_ids(observation))
+        self._claim_local_ids(track, self._local_ids(observation), frame_index)
         self.diagnostics["tracks_spawned"] += 1
         return track
 
@@ -176,7 +205,20 @@ class TrackManager:
             for ti, track in enumerate(tracks):
                 mahalanobis = track.kalman.mahalanobis_sq(observation.ground_xy)
                 if mahalanobis <= self.config.p4a.chi2_gate_2dof:
-                    cost[oi, ti] = mahalanobis
+                    # Pose is added INSIDE the gate only: it re-ranks candidates that
+                    # geometry already admits, and contributes nothing (None distance)
+                    # until a track has a mature descriptor and the two share enough
+                    # segments -- so behaviour is unchanged when pose is absent.
+                    pose_penalty = 0.0
+                    if track.pose_update_count >= self.config.p4a.pose_min_updates:
+                        distance = descriptor_distance(
+                            track.pose_proportions,
+                            observation.pose_descriptor,
+                            min_shared=self.config.p4a.pose_min_shared_segments,
+                        )
+                        if distance is not None:
+                            pose_penalty = self.config.p4a.pose_match_weight * distance
+                    cost[oi, ti] = mahalanobis + pose_penalty
         rows, columns = linear_sum_assignment(cost)
         matches: list[tuple[int, int]] = []
         unmatched_observations = set(range(len(observations)))
@@ -258,10 +300,56 @@ class TrackManager:
 
         assignments: dict[int, GlobalTrack] = {}
         hit: set[int] = set()
+        claimed: set[int] = set()
+
+        # --- Stage 0: tracklet-graph binding continuity ------------------------
+        # The graph solved identity globally; a binding maps 1:1 to a persistent
+        # track for the whole delivery, so cross-camera agreement holds by
+        # construction wherever bindings exist.
+        for observation in sorted(
+            (corr for corr in usable if corr.binding_id is not None),
+            key=lambda item: item.cluster_id,
+        ):
+            has_ground = bool(np.isfinite(observation.ground_xy).all())
+            track = self._binding_tracks.get(observation.binding_id)
+            if track is None:
+                if not has_ground:
+                    continue  # cannot seed a motion model without a ground point
+                track = self._spawn(observation, frame_index)
+                self._binding_tracks[observation.binding_id] = track
+                self.diagnostics["binding_tracks_spawned"] += 1
+            else:
+                if id(track) in hit:
+                    # Two same-frame correspondences claiming one binding cannot
+                    # both be right; keep the first, let the rest fall through.
+                    self.diagnostics["binding_same_frame_conflicts"] += 1
+                    continue
+                self._revive_owned_track(track, frame_index)  # no-op if already active
+                local_ids = self._local_ids(observation)
+                if (
+                    has_ground
+                    and track.kalman.mahalanobis_sq(observation.ground_xy)
+                    <= self.config.p4a.local_identity_mahalanobis_gate
+                ):
+                    self._apply_match(observation, track, frame_index)
+                else:
+                    # Keep the identity, protect the filter from an outlier foot.
+                    self._claim_local_ids(track, local_ids, frame_index)
+                    track.apply_identity_only_hit(
+                        self._representative_bbox(observation), frame_index,
+                        local_track_ids_by_cam=local_ids,
+                    )
+                    if has_ground:
+                        self.diagnostics["binding_ground_outliers"] += 1
+                self.diagnostics["binding_matches"] += 1
+            hit.add(id(track))
+            assignments[observation.cluster_id] = track
+            claimed.add(observation.cluster_id)
 
         # --- Stage 1: exact P2 tracklet continuity (strongest evidence) -------
-        claimed: set[int] = set()
         for observation in sorted(grounded, key=lambda item: item.cluster_id):
+            if observation.cluster_id in claimed:
+                continue
             local_ids = self._local_ids(observation)
             if not local_ids:
                 continue
@@ -275,7 +363,7 @@ class TrackManager:
             else:
                 # Trust the P2 identity but do not corrupt the filter with a foot
                 # projection that the motion model rejects (likely a bad ankle).
-                self._claim_local_ids(track, local_ids)
+                self._claim_local_ids(track, local_ids, frame_index)
                 track.apply_identity_only_hit(
                     self._representative_bbox(observation), frame_index,
                     local_track_ids_by_cam=local_ids,
@@ -315,6 +403,8 @@ class TrackManager:
         # the filter, but it can still inherit an established identity so the
         # detection is not left without a global id.
         for observation in no_ground:
+            if observation.cluster_id in claimed:
+                continue
             local_ids = self._local_ids(observation)
             if not local_ids:
                 continue
@@ -322,7 +412,7 @@ class TrackManager:
             if track is None:
                 continue
             self._revive_owned_track(track, frame_index)  # no-op if already active
-            self._claim_local_ids(track, local_ids)
+            self._claim_local_ids(track, local_ids, frame_index)
             track.apply_identity_only_hit(
                 self._representative_bbox(observation), frame_index,
                 local_track_ids_by_cam=local_ids,
