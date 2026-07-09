@@ -92,8 +92,8 @@ def parse_args() -> argparse.Namespace:
                      help="List cameras/frames that would run, then exit (no GPU needed)")
 
     mdl = parser.add_argument_group("model")
-    mdl.add_argument("--model-id", default="rtmpose_l_body8",
-                     help="Key in configs/model_envs.yaml (default: rtmpose_l_body8)")
+    mdl.add_argument("--model-id", default="rtmpose_x_body8",
+                     help="Key in configs/model_envs.yaml (default: rtmpose_x_body8, Halpe-26)")
     mdl.add_argument("--model-config", default=str(p1.DEFAULT_MODEL_CONFIG))
     mdl.add_argument("--pose-config", default=None, help="Override pose config path")
     mdl.add_argument("--pose-checkpoint", default=None, help="Override pose checkpoint path")

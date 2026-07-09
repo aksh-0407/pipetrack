@@ -83,8 +83,11 @@ def parse_args() -> argparse.Namespace:
 
     # Model / weights
     mdl = parser.add_argument_group("model")
-    mdl.add_argument("--model-id", default="rtmpose_l_body8",
-                     help="Key in configs/model_envs.yaml supplying pose config+checkpoint")
+    mdl.add_argument("--model-id", default="rtmpose_x_body8",
+                     help="Key in configs/model_envs.yaml supplying pose config+checkpoint. "
+                          "Default rtmpose_x_body8 (Halpe-26, accuracy-first); its first 17 "
+                          "keypoints are COCO-17 and the full 26 (incl. feet) are kept in "
+                          "pose_2d_native.")
     mdl.add_argument("--model-config", default=str(DEFAULT_MODEL_CONFIG))
     mdl.add_argument("--pose-config", default=None, help="Override pose config path")
     mdl.add_argument("--pose-checkpoint", default=None, help="Override pose checkpoint path")
