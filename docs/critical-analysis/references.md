@@ -9,7 +9,7 @@ logs.
 **Measured results / issue logs (the source of every metric quoted):**
 - `wip/id_issues.md` — identity failure modes ID-1…ID-6 with per-delivery evidence.
 - `wip/3d_location_issues.md`, `wip/3d_location_issues_v2.md` — 3D-location issues (12 → resolved/open).
-- `wip/3d_location_methods_log.md` — accept/reject lab notebook (M0…M11; z0_reproj win, calibration audit).
+- `wip/methods_log.md` — accept/reject lab notebook (M0…M11; z0_reproj win, calibration audit).
 - `wip/3d_location_redesign.md` — SOTA-mapped redesign + the empirical A/B pivot.
 - `implementation_plan.md`, `changes_tbd.md`, `CHANGELOG.md` — plan, deferred work, round-by-round history.
 - Committed metrics: `benchmarks/runs/**/{association_metrics,global_id_metrics,stabilization_metrics}.json`.

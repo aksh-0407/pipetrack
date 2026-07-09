@@ -178,7 +178,7 @@ All changes behind config flags (`configs/p3_association_v5.yaml`,
 delivery 1) and all 152 unit tests green. Baseline frozen at
 `benchmarks/runs/pipetrack_v3/_baseline_snapshot`; runs land in `pipetrack_v5`.
 Batch driver: `scripts/pipetrack/run_id_pipeline.py`. Method log:
-`wip/id_methods_log.md`.
+`wip/methods_log.md`.
 
 **ID-1 cross-camera under-merge (the 0.50 agreement on _7).** Root cause: the graph
 merge threshold (2.0) exceeds the single-cue positive cap (1.5), so on the

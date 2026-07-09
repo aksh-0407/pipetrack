@@ -166,6 +166,7 @@ def triangulate_canonical_run(
 
     successful = 0
     extrapolated_joint_frames = 0
+    measured_errors: list[np.ndarray] = []
     for key, views in observations.items():
         if key not in raw:
             continue
@@ -177,6 +178,7 @@ def triangulate_canonical_run(
         # the contract validates; their low confidence already flags them as priors.
         errors = np.asarray(raw[key][2], dtype=float).copy()
         was_measured = np.isfinite(errors)
+        measured_errors.append(errors[was_measured])
         errors[~was_measured] = 100.0
         if not was_measured.all():
             extrapolated_joint_frames += 1
@@ -202,8 +204,13 @@ def triangulate_canonical_run(
                 handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
 
     created_at = datetime.now(timezone.utc).isoformat()
+    all_measured = (
+        np.concatenate(measured_errors)
+        if measured_errors and any(chunk.size for chunk in measured_errors)
+        else np.empty(0)
+    )
     metrics = {
-        "schema_version": "triangulation_metrics/v1",
+        "schema_version": "triangulation_metrics/v2",
         "created_at": created_at,
         "match_id": match_id,
         "delivery_id": delivery_id,
@@ -215,6 +222,11 @@ def triangulate_canonical_run(
         "fully_valid_identity_frames": successful,
         "frames_with_extrapolated_joints": extrapolated_joint_frames,
         "triangulation_success_rate": successful / len(raw) if raw else 0.0,
+        "triangulation_coverage": successful / len(observations) if observations else 0.0,
+        "mean_reprojection_error_px": float(all_measured.mean()) if all_measured.size else None,
+        "p95_reprojection_error_px": (
+            float(np.percentile(all_measured, 95)) if all_measured.size else None
+        ),
     }
     manifest = {
         "schema_version": "triangulation_run/v1",

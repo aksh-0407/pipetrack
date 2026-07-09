@@ -10,7 +10,7 @@ code does today) and a **proposed re-ordered** pipeline that lets each phase bet
   frames/delivery, 2560×1440 (camera 07 is ~3775×960).
 - **Calibration** — `drive/dataset/calibration-data/<match>/calibration_data/{camera,pitch}_calibration_config.json`:
   bundle-adjusted 3×4 projection matrices + pitch geometry. **Centimetre-accurate**
-  (ball reprojection p95 ≤ 4.5 px, `wip/3d_location_methods_log.md`).
+  (ball reprojection p95 ≤ 4.5 px, `wip/methods_log.md`).
 - **Events** — `drive/dataset/events-data/<delivery>_V*/`: ball positions for the render.
 
 Every stage reads and writes a **canonical run directory**: `predictions/<capture_group>__<delivery>__cam_NN.jsonl`
