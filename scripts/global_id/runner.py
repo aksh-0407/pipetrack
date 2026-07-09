@@ -242,7 +242,17 @@ def run_global_id(
     # (temporal + spatial + role + velocity-continuity costs). ``remap_ids`` forbids any
     # merge whose two histories ever share a (camera, frame) cell, so post-hoc stitching
     # can never manufacture a same-camera-frame identity collision.
-    segments = extract_segments(records, ground_positions)
+    # Accumulated pose-shape descriptor per P4a id, so stitching can require
+    # body-shape agreement before merging two fragments (ID-2 / ghost-verification).
+    pose_by_id: dict[str, object] = {}
+    for track in list(manager.tracks) + list(manager.deleted_pool):
+        if (
+            track.global_player_id is not None
+            and track.pose_proportions is not None
+            and track.pose_update_count >= config.p4a.pose_min_updates
+        ):
+            pose_by_id[track.global_player_id] = track.pose_proportions
+    segments = extract_segments(records, ground_positions, pose_by_id)
     edges = build_link_costs(segments, config) if config.p4b.enabled else []
     links = solve_flow(segments, edges, config) if config.p4b.enabled else {}
     switch_report = remap_ids(records, segments, links) if config.p4b.enabled else []
@@ -251,9 +261,38 @@ def run_global_id(
     for player_id in list(id_remap):
         while id_remap[player_id] in id_remap:
             id_remap[player_id] = id_remap[id_remap[player_id]]
+
+    # ID-2 cardinality prior: after stitching, drop any global id whose total
+    # frame-span is below min_emit_frames (a fragment/shadow, not a real player who
+    # is present the whole delivery). Applied to the FINAL (post-remap) ids so a
+    # short fragment already stitched into a long track is safe.
+    dropped_short_ids: set[str] = set()
+    if config.p4a.min_emit_frames > 0:
+        frames_by_id: dict[str, set[int]] = defaultdict(set)
+        for record in records:
+            frame_index = int(record["frame_index"])
+            for player in record.get("players", []):
+                pid = player.get("global_player_id")
+                if pid is not None:
+                    frames_by_id[id_remap.get(pid, pid)].add(frame_index)
+        dropped_short_ids = {
+            pid for pid, frames in frames_by_id.items()
+            if len(frames) < config.p4a.min_emit_frames
+        }
+        if dropped_short_ids:
+            for record in records:
+                for player in record.get("players", []):
+                    pid = player.get("global_player_id")
+                    if pid is not None and id_remap.get(pid, pid) in dropped_short_ids:
+                        player["global_player_id"] = None
+                        player["track_state"] = "tentative"
+
     stitched_ground: dict[tuple[str, int], list[np.ndarray]] = defaultdict(list)
     for (player_id, frame_index), point in ground_positions.items():
-        stitched_ground[(id_remap.get(player_id, player_id), frame_index)].append(point)
+        final_id = id_remap.get(player_id, player_id)
+        if final_id in dropped_short_ids:
+            continue
+        stitched_ground[(final_id, frame_index)].append(point)
     ground_rows_by_frame: dict[int, list[dict]] = defaultdict(list)
     for (player_id, frame_index), points in stitched_ground.items():
         ground_rows_by_frame[frame_index].append(

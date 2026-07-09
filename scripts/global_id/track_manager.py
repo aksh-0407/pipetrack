@@ -217,6 +217,12 @@ class TrackManager:
                             min_shared=self.config.p4a.pose_min_shared_segments,
                         )
                         if distance is not None:
+                            veto = self.config.p4a.pose_gate_veto_distance
+                            if veto > 0.0 and distance > veto:
+                                # Clearly the wrong build: veto rather than penalise, so
+                                # a mis-shapen candidate cannot capture this track (ID-3).
+                                self.diagnostics["pose_gate_vetoes"] += 1
+                                continue
                             pose_penalty = self.config.p4a.pose_match_weight * distance
                     cost[oi, ti] = mahalanobis + pose_penalty
         rows, columns = linear_sum_assignment(cost)
@@ -252,9 +258,17 @@ class TrackManager:
                 best, best_distance = track, mahalanobis
         return best
 
-    def _try_reentry(self, ground_xy: np.ndarray, frame_index: int) -> GlobalTrack | None:
-        """Revive a deleted track whose coasted state still explains this observation."""
+    def _try_reentry(self, observation: Correspondence, frame_index: int) -> GlobalTrack | None:
+        """Revive a deleted track whose coasted state still explains this observation.
 
+        Kinematic reachability gates position; when ``reentry_pose_max_distance`` is
+        set, the revived track's body-shape descriptor must additionally agree with
+        the observation (abstaining when either is immature/unshared). This blocks the
+        kinematically-plausible-but-wrong-person re-entries that read as teleports.
+        """
+
+        ground_xy = observation.ground_xy
+        pose_veto = self.config.p4a.reentry_pose_max_distance
         candidates: list[tuple[float, str, GlobalTrack, np.ndarray, np.ndarray]] = []
         H = np.zeros((2, 6), dtype=float)
         H[0, 0] = H[1, 1] = 1.0
@@ -284,6 +298,14 @@ class TrackManager:
             if distance > maximum_distance:
                 self.diagnostics["reentry_kinematic_rejects"] += 1
                 continue
+            if pose_veto > 0.0 and track.pose_update_count >= self.config.p4a.pose_min_updates:
+                pose_distance = descriptor_distance(
+                    track.pose_proportions, observation.pose_descriptor,
+                    min_shared=self.config.p4a.pose_min_shared_segments,
+                )
+                if pose_distance is not None and pose_distance > pose_veto:
+                    self.diagnostics["reentry_pose_rejects"] += 1
+                    continue
             candidates.append((mahalanobis, track.global_player_id or "", track, x_pred, P_pred))
         if not candidates:
             return None
@@ -440,7 +462,7 @@ class TrackManager:
         # --- Stage 3: re-entry from the deleted pool, else birth --------------
         for observation_index in still_unmatched:
             observation = remaining[observation_index]
-            track = self._try_reentry(observation.ground_xy, frame_index)
+            track = self._try_reentry(observation, frame_index)
             if track is not None:
                 track.state = CONFIRMED
                 self._apply_match(observation, track, frame_index)
@@ -535,6 +557,8 @@ class TrackManager:
                 confirm_hits=self.config.p4a.confirm_hits,
                 lost_window_frames=self.config.p4a.lost_window_frames,
                 bowler_lost_window_frames=self.config.p4a.bowler_lost_window_frames,
+                adaptive_lost_window=self.config.p4a.adaptive_lost_window,
+                lost_window_max_frames=self.config.p4a.lost_window_max_frames,
             ):
                 track.state = DELETED
                 if track.global_player_id is not None:

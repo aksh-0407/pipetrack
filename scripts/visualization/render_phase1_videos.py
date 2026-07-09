@@ -10,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 import cv2
 import numpy as np
@@ -27,6 +27,10 @@ from pose_estimation.cricket.dataset import (
     parse_prediction_filename,
     repo_relative,
     resolve_delivery_camera_dirs,
+)
+from pose_estimation.cricket.geometry import (
+    ground_point_visible_in,
+    project_ground_to_pixel,
 )
 from pose_estimation.cricket.phase1_outputs import COCO_17_EDGES
 from scripts.visualization.identity_colors import (
@@ -118,6 +122,7 @@ class VideoSink:
         self.fps = fps
         self.process: subprocess.Popen | None = None
         self.writer: cv2.VideoWriter | None = None
+        self.encoder = "opencv/mp4v"  # actual encoder used (set below); reported in the manifest
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         if use_ffmpeg and shutil.which("ffmpeg"):
@@ -134,8 +139,10 @@ class VideoSink:
                     "-vcodec", "h264_nvenc", "-preset", "p4", "-tune", "hq",
                     "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p",
                 ]
+                self.encoder = "ffmpeg/h264_nvenc"
             else:
                 codec = ["-vcodec", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+                self.encoder = "ffmpeg/libx264"
             self.process = subprocess.Popen([*common, *codec, str(path)], stdin=subprocess.PIPE)
         else:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -653,7 +660,7 @@ def render_feed_frame(
     ball_trail: list[tuple[float, float]] | None = None,
     show: str = "p4",
     mirror: bool = False,
-    ghosts: list[tuple[str, tuple[float, float]]] | None = None,
+    ghosts: list[Ghost] | None = None,
 ) -> np.ndarray:
     output_width, output_height = output_size
     source_height, source_width = image.shape[:2]
@@ -667,8 +674,8 @@ def render_feed_frame(
             ball_trail = [(1.0 - cx, cy) for cx, cy in ball_trail]
         if ghosts:
             ghosts = [
-                (player_id, (source_width - foot_x, foot_y))
-                for player_id, (foot_x, foot_y) in ghosts
+                ghost._replace(foot=(source_width - ghost.foot[0], ghost.foot[1]))
+                for ghost in ghosts
             ]
     sx = output_width / source_width
     sy = output_height / source_height
@@ -711,22 +718,38 @@ def render_feed_frame(
     return frame
 
 
+class Ghost(NamedTuple):
+    """A reprojected marker for a player NOT detected in this camera this frame.
+
+    ``status`` is ``"occluded"`` (still tracked by another camera — the fused
+    position is current) or ``"lost"`` (undetected in every camera — drawn from the
+    last-known fused position, so its ground area can be inspected wherever it is
+    visible). ``alpha`` in [0, 1] fades the marker as the last observation ages.
+    """
+
+    player_id: str
+    foot: tuple[float, float]
+    status: str = "occluded"
+    alpha: float = 1.0
+
+
 def draw_ghost_markers(
     image: np.ndarray,
-    ghosts: list[tuple[str, tuple[float, float]]],
+    ghosts: list[Ghost],
     *,
     sx: float,
     sy: float,
     avoid_rects: list[tuple[int, int, int, int]] | None = None,
 ) -> None:
-    """Mark players occluded in THIS camera but tracked by the others.
+    """Mark players undetected in THIS camera but placed by the tracker elsewhere.
 
-    The detector produces nothing while one player fully covers another, so the
-    binding's fused ground position (from the other cameras) is reprojected here
-    and drawn as an explicitly-labelled ghost — a viewer aid only; no synthetic
-    detection ever enters the pipeline data. The chip dodges detection boxes and
-    previously-placed ghost chips so it never covers a visible player or another
-    ghost label (the occluder usually stands exactly where the ghost is).
+    An ``occluded`` ghost is a player another camera still sees (the detector
+    produced nothing here because someone stands in front); a ``lost`` ghost is a
+    player no camera sees this frame, drawn from its last-known fused ground position
+    so a viewer can see exactly where a disappeared id "should" be in every camera
+    that frames that ground. Viewer aid only — no synthetic detection enters the
+    pipeline. The chip dodges detection boxes and earlier ghost chips so it never
+    covers a visible player.
     """
 
     height, width = image.shape[:2]
@@ -739,17 +762,32 @@ def draw_ghost_markers(
                 return True
         return False
 
-    for player_id, (foot_x, foot_y) in sorted(ghosts):
+    def _fade(color: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
+        # Fade toward the dark tile background so an aging ghost visibly dims.
+        bg = np.array((10, 14, 21), dtype=float)
+        blended = bg + (np.array(color, dtype=float) - bg) * float(np.clip(alpha, 0.15, 1.0))
+        return tuple(int(round(v)) for v in blended)
+
+    for ghost in sorted(ghosts):
+        player_id, (foot_x, foot_y) = ghost.player_id, ghost.foot
         x, y = int(round(foot_x * sx)), int(round(foot_y * sy))
         if not (0 <= x < width and 0 <= y < height):
             continue
-        color = color_for_global_id(player_id)
-        cv2.ellipse(image, (x, y), (18, 7), 0, 0, 360, (12, 16, 24), 3, cv2.LINE_AA)
-        cv2.ellipse(image, (x, y), (18, 7), 0, 0, 360, color, 1, cv2.LINE_AA)
-        for angle in range(0, 360, 45):  # dashed inner ring: reads as "not a detection"
-            cv2.ellipse(image, (x, y), (11, 4), 0, angle, angle + 22, color, 1, cv2.LINE_AA)
+        base = color_for_global_id(player_id)
+        lost = ghost.status == "lost"
+        # A "lost" ghost is desaturated (greyed) toward its id colour so it reads as
+        # "no camera sees this" without losing the id association; occluded stays vivid.
+        color = _fade(base if not lost else tuple((c + 150) // 2 for c in base), ghost.alpha)
+        ring = (18, 7) if not lost else (20, 8)
+        cv2.ellipse(image, (x, y), ring, 0, 0, 360, (12, 16, 24), 3, cv2.LINE_AA)
+        cv2.ellipse(image, (x, y), ring, 0, 0, 360, color, 1, cv2.LINE_AA)
+        step = 45 if not lost else 30
+        for angle in range(0, 360, step):  # dashed inner ring: reads as "not a detection"
+            cv2.ellipse(image, (x, y), (11, 4), 0, angle, angle + step // 2, color, 1, cv2.LINE_AA)
+        if lost:
+            cv2.drawMarker(image, (x, y), color, cv2.MARKER_TILTED_CROSS, 10, 1, cv2.LINE_AA)
 
-        label = f"{player_id}  occluded"
+        label = f"{player_id}  {ghost.status}"
         (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
         chip_w, chip_h = text_w + 20, text_h + 14
         candidates = (
@@ -940,30 +978,69 @@ def draw_bev_panel(
     frame_index: int,
     trails: dict[str, list[tuple[int, int]]],
     single_ids: set[str] | None = None,
+    ghost_grounds: dict[str, tuple[float, float]] | None = None,
     trail_len: int = 120,
 ) -> np.ndarray:
     """QT-style bird's-eye tile: each player's world (x,y) as an id-coloured dot + trail.
 
     Replaces the text delivery-monitor tile in the mosaic. ``trails`` is mutated across
     frames so short motion tails persist. ``extents`` is the fixed world window.
+    ``ghost_grounds`` are ids currently detected by no camera — drawn as greyed hollow
+    markers at their last-known position so a disappearance is visible on the field plot.
     """
 
     width, height = size
-    margin = 40
+    margin = 30
+    header_h = 34
     x_min, x_max, y_min, y_max = extents
-    panel = np.full((height, width, 3), (14, 45, 25), dtype=np.uint8)  # grass
+    panel = np.full((height, width, 3), (26, 58, 34), dtype=np.uint8)  # deep grass
+
+    # Uniform metric scale (px per world-metre) so the field and its circles are not
+    # distorted by the tile aspect ratio — the previous panel stretched them.
+    world_w = max(x_max - x_min, 1e-6)
+    world_h = max(y_max - y_min, 1e-6)
+    avail_w = width - 2 * margin
+    avail_h = height - 2 * margin - header_h
+    scale = min(avail_w / world_w, avail_h / world_h)
+    cxw, cyw = (x_min + x_max) / 2.0, (y_min + y_max) / 2.0
+    origin_px = (width / 2.0, (header_h + height) / 2.0)
 
     def w2p(x: float, y: float) -> tuple[int, int]:
-        px = margin + (x - x_min) / max(x_max - x_min, 1e-6) * (width - 2 * margin)
-        py = height - margin - (y - y_min) / max(y_max - y_min, 1e-6) * (height - 2 * margin)
-        return int(round(px)), int(round(py))
+        return (
+            int(round(origin_px[0] + (x - cxw) * scale)),
+            int(round(origin_px[1] - (y - cyw) * scale)),
+        )
 
-    # boundary + pitch strip + centre lines
-    cv2.rectangle(panel, (margin, margin), (width - margin, height - margin), (95, 170, 105), 2, cv2.LINE_AA)
-    cx, cy = (x_min + x_max) / 2.0, (y_min + y_max) / 2.0
-    axes = (int((width - 2 * margin) * 0.49), int((height - 2 * margin) * 0.49))
-    cv2.ellipse(panel, w2p(cx, cy), axes, 0, 0, 360, (70, 120, 85), 1, cv2.LINE_AA)
-    cv2.rectangle(panel, w2p(-1.525, 10.06), w2p(1.525, -10.06), (185, 205, 190), 1, cv2.LINE_AA)
+    def w_circle(cx: float, cy: float, radius_m: float, color, thickness: int) -> None:
+        cv2.circle(panel, w2p(cx, cy), max(1, int(round(radius_m * scale))), color, thickness, cv2.LINE_AA)
+
+    # Subtle mowing stripes for depth.
+    for i in range(0, width, max(24, int(6 * scale))):
+        shade = 4 if (i // max(24, int(6 * scale))) % 2 == 0 else -4
+        panel[header_h:, i:i + max(12, int(3 * scale))] = np.clip(
+            panel[header_h:, i:i + max(12, int(3 * scale))].astype(int) + shade, 0, 255
+        ).astype(np.uint8)
+
+    # Field reference geometry (metric): 30-yard ring (27.4 m) + a decorative
+    # boundary arc + the pitch strip and popping creases from world coordinates.
+    w_circle(0.0, 0.0, 68.0, (58, 96, 66), 2)          # nominal boundary
+    w_circle(0.0, 0.0, 27.43, (150, 205, 165), 1)      # 30-yard inner ring
+    # Pitch strip (3.05 m x 20.12 m along the y axis) as a filled tan rectangle.
+    p1, p2 = w2p(-1.525, 10.06), w2p(1.525, -10.06)
+    cv2.rectangle(panel, p1, p2, (150, 180, 200), -1, cv2.LINE_AA)
+    blend_rect(panel, (min(p1[0], p2[0]), min(p1[1], p2[1])),
+               (max(p1[0], p2[0]), max(p1[1], p2[1])), (120, 150, 175), 0.35)
+    cv2.rectangle(panel, p1, p2, (210, 225, 235), 1, cv2.LINE_AA)
+    for crease_y in (8.84, -8.84):  # popping creases
+        cv2.line(panel, w2p(-1.83, crease_y), w2p(1.83, crease_y), (235, 245, 250), 1, cv2.LINE_AA)
+    for stump_y in (10.06, -10.06):  # stumps
+        cv2.circle(panel, w2p(0.0, stump_y), 2, (245, 250, 255), -1, cv2.LINE_AA)
+
+    # Scale bar (10 m).
+    bar = int(round(10.0 * scale))
+    bx, by = 16, height - 14
+    cv2.line(panel, (bx, by), (bx + bar, by), (220, 230, 240), 2, cv2.LINE_AA)
+    draw_text(panel, "10 m", (bx + bar + 6, by + 4), scale=0.34, color=(210, 220, 232))
 
     live = sorted(frame_grounds)
     for player_id in live:
@@ -978,17 +1055,42 @@ def draw_bev_panel(
         color = color_for_global_id(str(player_id))
         if len(trail) >= 2:
             cv2.polylines(panel, [np.asarray(trail, np.int32)], False, color, 1, cv2.LINE_AA)
-        cv2.circle(panel, pixel, 6, (10, 18, 13), -1, cv2.LINE_AA)
-        if single_ids is not None and str(player_id) in single_ids:
-            cv2.circle(panel, pixel, 5, color, 2, cv2.LINE_AA)  # hollow = single-camera
+        single = single_ids is not None and str(player_id) in single_ids
+        cv2.circle(panel, pixel, 7, (8, 14, 10), -1, cv2.LINE_AA)          # dark halo
+        if single:
+            cv2.circle(panel, pixel, 5, color, 2, cv2.LINE_AA)             # hollow = 1 camera
         else:
-            cv2.circle(panel, pixel, 4, color, -1, cv2.LINE_AA)
-        draw_text(panel, str(player_id), (pixel[0] + 7, pixel[1] - 6), scale=0.4, color=color)
-    cv2.line(panel, (0, 0), (width, 0), (82, 220, 255), 4, cv2.LINE_AA)
-    draw_text(panel, "BIRD'S-EYE VIEW", (16, 30), scale=0.62, color=(250, 252, 255), thickness=2)
-    draw_text(panel, f"frame {frame_index}   players {len(live)}   (hollow=1cam)",
-              (16, height - 16), scale=0.4, color=(204, 214, 230))
+            cv2.circle(panel, pixel, 5, color, -1, cv2.LINE_AA)
+            cv2.circle(panel, pixel, 5, (245, 248, 255), 1, cv2.LINE_AA)   # white keyline
+        _bev_label(panel, str(player_id), pixel, color)
+    # Ghost (disappeared) ids: greyed marker at last-known position, no trail growth.
+    for player_id, (x, y) in sorted((ghost_grounds or {}).items()):
+        if not (np.isfinite(x) and np.isfinite(y)) or str(player_id) in frame_grounds:
+            continue
+        pixel = w2p(float(x), float(y))
+        base = color_for_global_id(str(player_id))
+        grey = tuple(int((c + 150) // 2) for c in base)
+        cv2.circle(panel, pixel, 6, (8, 14, 10), -1, cv2.LINE_AA)
+        cv2.circle(panel, pixel, 5, grey, 1, cv2.LINE_AA)
+        cv2.drawMarker(panel, pixel, grey, cv2.MARKER_TILTED_CROSS, 8, 1, cv2.LINE_AA)
+        _bev_label(panel, str(player_id), pixel, grey)
+
+    # Header bar.
+    blend_rect(panel, (0, 0), (width, header_h), (12, 20, 16), 0.7)
+    cv2.line(panel, (0, 0), (width, 0), (82, 220, 255), 3, cv2.LINE_AA)
+    draw_text(panel, "BIRD'S-EYE VIEW", (14, 23), scale=0.56, color=(250, 252, 255), thickness=2)
+    ghost_note = f"  ghost {len(ghost_grounds)}" if ghost_grounds else ""
+    draw_text(panel, f"f{frame_index}  live {len(live)}{ghost_note}",
+              (width - 168, 23), scale=0.42, color=(206, 216, 232))
     return panel
+
+
+def _bev_label(panel: np.ndarray, text: str, pixel: tuple[int, int], color) -> None:
+    """Small readable id label beside a bird's-eye marker (dark keyline for contrast)."""
+
+    x, y = pixel[0] + 8, pixel[1] - 6
+    cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (8, 12, 10), 3, cv2.LINE_AA)
+    cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
 
 
 def compute_ground_extents(
@@ -1121,6 +1223,7 @@ def render_mosaic_video(
     projections: dict[str, np.ndarray] | None = None,
     ground_positions: dict[int, dict[str, tuple[float, float]]] | None = None,
     ghost_window_frames: int = 150,
+    ghost_decay_frames: int = 100,
     roles: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     width, height = settings.mosaic_size
@@ -1138,6 +1241,10 @@ def render_mosaic_video(
     # Bird's-eye tile replaces the text delivery monitor: fixed world window + per-id trails.
     bev_extents = compute_ground_extents(ground_positions)
     bev_trails: dict[str, list[tuple[int, int]]] = {}
+    # Last-known fused ground position per global id, updated every frame it is
+    # placed. Lets a ghost be drawn for an id that has vanished from EVERY camera
+    # (its fused position is no longer emitted) for up to ``ghost_decay_frames``.
+    last_known_ground: dict[str, tuple[tuple[float, float], int]] = {}
 
     # Per (camera, id) detection frames — used to decide when a missing player is
     # "occluded HERE" (seen in this camera nearby in time) vs simply out of view.
@@ -1194,6 +1301,21 @@ def render_mosaic_video(
                     if player.get("global_player_id")
                 }
             frame_grounds = ground_positions.get(synchronized_frame, {})
+            for player_id, xy in frame_grounds.items():
+                if np.isfinite(xy[0]) and np.isfinite(xy[1]):
+                    last_known_ground[str(player_id)] = (
+                        (float(xy[0]), float(xy[1])), synchronized_frame,
+                    )
+            # Ids placed on the pitch but detected by NO camera this frame: draw them
+            # greyed in the BEV so a full disappearance is visible where it happens.
+            detected_anywhere = set().union(*detected_by_camera.values()) if detected_by_camera else set()
+            ghost_grounds = {
+                pid: pos
+                for pid, (pos, seen) in last_known_ground.items()
+                if pid not in detected_anywhere
+                and pid not in frame_grounds
+                and synchronized_frame - seen <= ghost_decay_frames
+            }
             for row, slots in enumerate(layout.grid):
                 for col, slot in enumerate(slots):
                     if slot == MONITOR_SLOT:
@@ -1207,25 +1329,42 @@ def render_mosaic_video(
                     camera_id = slot
                     record_index, record = record_maps[camera_id][synchronized_frame]
                     image = load_image_for_record(camera_dirs[camera_id], record)
-                    ghosts: list[tuple[str, tuple[float, float]]] = []
+                    ghosts: list[Ghost] = []
                     projection = projections.get(camera_id)
                     if projection is not None and settings.show == "p4":
+                        image_wh = (image.shape[1], image.shape[0])
+                        detected_here = detected_by_camera.get(camera_id, set())
                         others_see = set().union(*(
                             ids for cam, ids in detected_by_camera.items() if cam != camera_id
                         )) if len(detected_by_camera) > 1 else set()
-                        for player_id, (gx, gy) in frame_grounds.items():
-                            if player_id in detected_by_camera.get(camera_id, set()):
+                        # A ghost is drawn for any id NOT detected in THIS camera whose
+                        # (fused or last-known) ground point is geometrically visible here.
+                        # "occluded" = another camera still sees it (current position);
+                        # "lost" = no camera sees it this frame (last-known, faded by age).
+                        for player_id, (pos, seen_frame) in last_known_ground.items():
+                            if player_id in detected_here:
                                 continue
-                            if player_id not in others_see:
+                            age = synchronized_frame - seen_frame
+                            if age > ghost_decay_frames:
                                 continue
-                            if not seen_here_nearby(camera_id, player_id, synchronized_frame):
+                            gx, gy = pos
+                            if not ground_point_visible_in(projection, (gx, gy), image_wh):
                                 continue
-                            homogeneous = projection @ np.array([gx, gy, 0.0, 1.0])
-                            if abs(float(homogeneous[2])) < 1e-9:
+                            foot = project_ground_to_pixel(projection, (gx, gy))
+                            if not np.isfinite(foot).all():
                                 continue
-                            foot = homogeneous[:2] / homogeneous[2]
-                            if 0 <= foot[0] < image.shape[1] and 0 <= foot[1] < image.shape[0]:
-                                ghosts.append((player_id, (float(foot[0]), float(foot[1]))))
+                            occluded = player_id in others_see
+                            if not occluded and not seen_here_nearby(
+                                camera_id, player_id, synchronized_frame
+                            ):
+                                # never seen here recently and gone everywhere: still
+                                # show it (that is the point), but only within decay.
+                                pass
+                            alpha = 1.0 if occluded else max(0.2, 1.0 - age / max(ghost_decay_frames, 1))
+                            ghosts.append(Ghost(
+                                player_id, (float(foot[0]), float(foot[1])),
+                                "occluded" if occluded else "lost", alpha,
+                            ))
                     tile = render_feed_frame(
                         image,
                         record,
@@ -1267,6 +1406,7 @@ def render_mosaic_video(
                 frame_index=synchronized_frame,
                 trails=bev_trails,
                 single_ids=single_ids,
+                ghost_grounds={str(pid): xy for pid, xy in ghost_grounds.items()},
             )
             roster_panel = draw_roster_panel(
                 size=(cell_width, cell_height),
@@ -1543,7 +1683,10 @@ def main() -> int:
             "mosaic_size": list(settings.mosaic_size),
             "sample_every": settings.sample_every,
             "max_frames": settings.max_frames,
-            "encoder": "ffmpeg/libx264" if settings.use_ffmpeg and shutil.which("ffmpeg") else "opencv/mp4v",
+            "encoder": (
+                ("ffmpeg/h264_nvenc" if _ffmpeg_has_nvenc() else "ffmpeg/libx264")
+                if settings.use_ffmpeg and shutil.which("ffmpeg") else "opencv/mp4v"
+            ),
             "crf": settings.crf,
             "preset": settings.preset,
             "show": show,

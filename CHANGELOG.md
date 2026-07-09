@@ -170,3 +170,53 @@ its true fix is upstream P1/P2 quality in low light). Known issue handed to the
 roles work: v0 role assignments on delivery 1 look end-swapped — the assigner
 derives the bowling-direction sign from FUSED tracks (unreliable; use
 per-camera tracklets as mosaic_layout does) and scores the run with abs().
+
+## Round 5 — v5 ID overhaul: under-merge + fragmentation + ghost markers — CURRENT
+
+All changes behind config flags (`configs/p3_association_v5.yaml`,
+`configs/p4_global_id_v5.yaml`); flags off ⇒ byte-identical baseline (proven on
+delivery 1) and all 152 unit tests green. Baseline frozen at
+`benchmarks/runs/pipetrack_v3/_baseline_snapshot`; runs land in `pipetrack_v5`.
+Batch driver: `scripts/pipetrack/run_id_pipeline.py`. Method log:
+`wip/id_methods_log.md`.
+
+**ID-1 cross-camera under-merge (the 0.50 agreement on _7).** Root cause: the graph
+merge threshold (2.0) exceeds the single-cue positive cap (1.5), so on the
+low-parallax facing pairs — where appearance/motion abstain — ground alone can
+never merge a genuine same-player pair. Fix (`tracklet_graph.py`): a
+corroboration-aware second merge pass (`graph_corrob_merge`) that admits a
+below-threshold edge only with full support, no disagreeing cue, mutual-unambiguous
+best, and cannot-link respected; plus a parallax-adaptive facing-pair gate
+(`graph_facing_gate_scale`). **Result: _7 agreement 0.498 → 0.600 (+0.102)**,
+teleports −13, single-camera rate −0.051; easy clips byte-identical; collisions 0.
+
+**ID-2 fragmentation (18–25 ids for a ~13–15 roster).** Root cause, measured: the
+graph already yields ~10–11 clean bindings, but P4 emitted 18–25 ids because P4b
+stitching selected **0** links (its dummy "new-trajectory" cost 0.5 undercut every
+real stitch) and many *demoted* clusters briefly confirmed as ultra-short ids
+(6–25 frames). Fixes: stitching v2 (`stitching.py`) — pose-shape descriptor per
+segment + hard pose gate (`p4b.pose_stitch_max_distance`), Kalman-smoothed
+exit/entry velocities, and a usable `new_traj_cost_factor`; a cardinality prior
+(`p4a.min_emit_frames`) dropping any id whose whole-clip span is < 30 frames (a
+fragment, not a player present the full 12 s); adaptive lost-window, pose veto in
+the chi² gate, and descriptor-gated re-entry in P4a. **Result (all 8): every clip's
+id count collapsed toward the roster** (e.g. _6 25→16, _7 22→15, M2 20→14, _3 18→13)
+and **teleports fell on every clip** (_1 11→2, _4 15→6, _6 52→40, _7 59→44), with
+agreement stable-or-up and same-camera collisions still 0.
+
+**Ghost markers v2 + mosaic/BEV modernization.** `geometry.ground_point_visible_in`
+(cheirality + in-frame per camera) drives ghost markers for *disappeared* ids in
+**every** camera that frames that ground (occluded vs lost, aged/faded), a
+last-known-position store, and greyed ghost dots in the bird's-eye view. The BEV
+tile was rebuilt as a metric cricket-field radar (uniform scale, 30-yard ring,
+pitch strip + creases, scale bar). Colour system unified on `identity_colors`
+(standalone BEV join bug + golden-ratio hash retired); NVENC is now reported
+correctly in the manifest. The same pose-corroborated fragment merge doubles as the
+in-pipeline "ghost verification" (a lost id's fragment only re-joins when body shape
+agrees). Audit fixes: `ground_kalman.cap_covariance` (both axes), fragment
+posture-veto aggregate.
+
+**Remaining:** M2 teleports (166) are largely a teleport-*proxy* artifact on M2's
+noisy single-camera foot projections (worst single-cam rate 0.61), not emitted-
+trajectory jumps; the emitted Kalman posterior stays smooth. Config promotion to the
+committed defaults is held for the WS5 review.

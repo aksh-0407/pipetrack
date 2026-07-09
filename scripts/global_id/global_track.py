@@ -126,10 +126,19 @@ class GlobalTrack:
         confirm_hits: int,
         lost_window_frames: int,
         bowler_lost_window_frames: int,
+        adaptive_lost_window: bool = False,
+        lost_window_max_frames: int = 90,
     ) -> bool:
         if self.state == TENTATIVE:
             return self.frames_since_update >= confirm_hits
-        window = bowler_lost_window_frames if self.dominant_role == "bowler" else lost_window_frames
+        base = bowler_lost_window_frames if self.dominant_role == "bowler" else lost_window_frames
+        window = base
+        if adaptive_lost_window:
+            # A well-established track (many confirmed hits) has earned a longer
+            # occlusion tolerance: grow the window one frame per hit-beyond-confirm,
+            # capped, so a briefly-hidden regular is re-acquired instead of re-born.
+            window = min(int(lost_window_max_frames), base + max(0, self.hits - confirm_hits))
+            window = max(window, base)
         return self.state == LOST and self.frames_since_update > window
 
     def velocity_toward_crease(self, crease_y: float = 0.0) -> bool:

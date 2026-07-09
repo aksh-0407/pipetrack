@@ -98,6 +98,22 @@ class P3AssociationConfig:
     graph_llr_merge_threshold: float = 2.0
     graph_llr_veto: float = -4.5              # only a CONFIDENT contradiction blocks a merge
     graph_llr_positive_cap: float = 1.5       # per-cue cap on "same" evidence
+    # Corroboration-aware single-cue merge (ID-1 under-merge on the facing pairs).
+    # On the low-parallax facing pairs appearance abstains, motion abstains for
+    # static players, and posture can abstain for crouched/oblique bodies, leaving
+    # ground alone -- which the positive cap (1.5) holds below the 2.0 threshold, so
+    # a genuine same-player pair never merges (the 0.50 cross-camera agreement on
+    # _7). When enabled, a second pass merges an edge in [single, threshold) ONLY if
+    # it has full co-visible support, NO observable cue disagrees, it is the mutual
+    # unambiguous best for both endpoints, and it passes the cannot-link/veto check.
+    graph_corrob_merge: bool = False
+    graph_llr_merge_single: float = 1.2
+    # Parallax-adaptive facing-pair gate: the facing (opposite) pairs use the tighter
+    # opposite_pair_ground_gate_m (2.5) which, under foot-projection noise, can itself
+    # split a correct 2-view merge. When enabled the graph hard-distance gate is
+    # widened by this factor for facing pairs (lean on posture/appearance there),
+    # never below the general gate. 1.0 = disabled (byte-identical).
+    graph_facing_gate_scale: float = 1.0
     graph_llr_ground_neg_clip: float = 2.0    # ground's negative clip (bias tolerance)
     graph_move_margin: float = 0.5            # refinement move hysteresis
     graph_refine_passes: int = 2
@@ -228,9 +244,13 @@ class P3AssociationConfig:
                     or not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be a finite number")
         _require_range("ground_sigma_px_bbox_frac", self.ground_sigma_px_bbox_frac, 0.0, 1.0)
-        for name in ("graph_motion_enabled", "purity_split_enabled", "posture_enabled"):
+        for name in ("graph_motion_enabled", "purity_split_enabled", "posture_enabled",
+                     "graph_corrob_merge"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
+        _require_positive("graph_llr_merge_single", self.graph_llr_merge_single)
+        if self.graph_facing_gate_scale < 1.0:
+            raise ValueError("graph_facing_gate_scale must be >= 1.0")
         if self.anchor_pair_dist_m >= self.diff_pair_min_dist_m:
             raise ValueError("anchor_pair_dist_m must be < diff_pair_min_dist_m")
         for name in ("baseline_angle_degen_deg", "parallax_full_deg", "mu_fine_score",

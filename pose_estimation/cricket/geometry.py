@@ -738,6 +738,70 @@ def camera_axis_lookat(
     return C, v, (C + t * v)[:2]
 
 
+def project_ground_to_pixel(
+    projection_matrix: np.ndarray,
+    xy: np.ndarray,
+    *,
+    height_m: float = 0.0,
+) -> np.ndarray:
+    """Forward-project a world point ``(x, y, height_m)`` to image ``[u, v]`` pixels.
+
+    The inverse of :func:`pixel_to_ground_xy`. Returns NaNs when the point is on or
+    behind the image plane (``w <= 0``) or the projection is invalid. Used to place a
+    ghost marker's known ground position into every camera and to reproject a lost
+    track for the ghost-verification pass.
+    """
+
+    P = np.asarray(projection_matrix, dtype=float)
+    point = np.asarray(xy, dtype=float)
+    if P.shape != (3, 4) or point.shape != (2,) or not np.isfinite(point).all():
+        return np.full(2, np.nan)
+    homogeneous = P @ np.array([point[0], point[1], float(height_m), 1.0])
+    if not np.isfinite(homogeneous).all() or abs(float(homogeneous[2])) < 1e-9:
+        return np.full(2, np.nan)
+    return homogeneous[:2] / homogeneous[2]
+
+
+def ground_point_visible_in(
+    projection_matrix: np.ndarray,
+    xy: np.ndarray,
+    image_wh: tuple[int, int] | np.ndarray,
+    *,
+    toward: np.ndarray | None = None,
+    margin_px: float = 0.0,
+    height_m: float = 0.0,
+) -> bool:
+    """Whether a world ground point is visible in a camera (cheirality + in-frame).
+
+    A point can reproject *inside* the image rectangle while lying **behind** the
+    camera (the projective ambiguity the current ghost code ignores), so this first
+    enforces cheirality — the point must be on the same side of the camera as the
+    pitch (using :func:`camera_axis_lookat`'s pitch-oriented forward axis) — and only
+    then checks the reprojected pixel falls within ``image_wh`` (expanded by
+    ``margin_px``). This is the per-camera ground-visibility test the ghost markers and
+    ghost-verification pass need to decide "is this ground location seen by camera X".
+    """
+
+    P = np.asarray(projection_matrix, dtype=float)
+    point = np.asarray(xy, dtype=float)
+    if P.shape != (3, 4) or point.shape != (2,) or not np.isfinite(point).all():
+        return False
+    centre, forward, _ = camera_axis_lookat(P, toward=toward)
+    if not (np.isfinite(centre).all() and np.isfinite(forward).all()):
+        return False
+    world = np.array([point[0], point[1], float(height_m)], dtype=float)
+    if float((world - centre) @ forward) <= 0.0:  # behind the camera
+        return False
+    pixel = project_ground_to_pixel(P, point, height_m=height_m)
+    if not np.isfinite(pixel).all():
+        return False
+    width, height = float(image_wh[0]), float(image_wh[1])
+    return (
+        -margin_px <= float(pixel[0]) < width + margin_px
+        and -margin_px <= float(pixel[1]) < height + margin_px
+    )
+
+
 def derive_facing_pairs(
     projection_matrices: dict[str, np.ndarray],
     *,

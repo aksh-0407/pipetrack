@@ -35,6 +35,7 @@ from dataclasses import replace as dc_replace
 
 from pose_estimation.cricket.geometry import (
     camera_center_from_P,
+    derive_facing_pairs,
     ground_covariance,
     ground_mahalanobis_sq,
     upper_body_ground_estimate,
@@ -283,6 +284,23 @@ class TrackletGraphBuilder:
         self._syn_of_det: dict[tuple[int, str, int], str] = {}
         self._support_lookup: dict[tuple[ChunkKey, ChunkKey], int] = {}
         self.diagnostics: dict[str, int] = defaultdict(int)
+        # Facing (co-observing, low-parallax) camera pairs derived from calibration —
+        # the same relationship the runner uses. Used to widen the hard-distance gate
+        # on exactly those pairs where a tight gate splits a correct merge (ID-1).
+        self._facing_pairs: set[frozenset[str]] = set()
+        if self.config.graph_facing_gate_scale > 1.0 and len(projections) >= 2:
+            try:
+                self._facing_pairs = {
+                    frozenset(pair) for pair in derive_facing_pairs(projections)
+                }
+            except Exception:
+                self._facing_pairs = set()
+
+    def _hard_dist_gate(self, cam_a: str, cam_b: str) -> float:
+        gate = float(self.config.graph_hard_dist_gate_m)
+        if frozenset((cam_a, cam_b)) in self._facing_pairs:
+            gate *= float(self.config.graph_facing_gate_scale)
+        return gate
 
     # ------------------------------------------------------------- pass A
 
@@ -650,7 +668,7 @@ class TrackletGraphBuilder:
                 continue
             med_maha = _median(samples.maha)
             med_dist = _median(samples.dist_m)
-            if not np.isfinite(med_dist) or med_dist > self.config.graph_hard_dist_gate_m:
+            if not np.isfinite(med_dist) or med_dist > self._hard_dist_gate(key_a[0], key_b[0]):
                 # Consistently farther apart than any observed same-player
                 # cross-camera residual: not mergeable, and no negative edge is
                 # needed (absence already blocks merging).
@@ -752,6 +770,11 @@ class TrackletGraphBuilder:
             merges += 1
         self.diagnostics["merges_accepted"] = merges
 
+        if self.config.graph_corrob_merge:
+            self.diagnostics["corroboration_merges"] = self._corroboration_merge_pass(
+                edges, parent, members, find, llr_lookup
+            )
+
         cluster_members: dict[int, list[ChunkKey]] = {
             index: sorted(keys)
             for index, keys in enumerate(sorted(members.values(), key=lambda keys: keys[0]))
@@ -794,6 +817,76 @@ class TrackletGraphBuilder:
             calibration=calibration,
             diagnostics=dict(sorted(self.diagnostics.items())),
         )
+
+    def _corroboration_merge_pass(
+        self,
+        edges: list[GraphEdge],
+        parent: dict[ChunkKey, ChunkKey],
+        members: dict[ChunkKey, list[ChunkKey]],
+        find,
+        llr_lookup: dict[tuple[ChunkKey, ChunkKey], float],
+    ) -> int:
+        """Merge strong-but-single-cue facing-pair edges when unambiguous (ID-1).
+
+        A pair whose only discriminative cue is ground (appearance/motion/posture
+        structurally abstain on the low-parallax facing pairs) caps at
+        ``graph_llr_positive_cap`` < ``graph_llr_merge_threshold`` and so never
+        merges, even when it is a genuine same-player pair with no contradicting
+        evidence. This second pass admits such an edge only under strict conditions:
+        full co-visible support, NO observable cue disagreeing (every present cue
+        >= 0), the edge is the mutual unambiguous best for BOTH endpoints' clusters,
+        and the merge passes the cannot-link/veto compatibility check. Conservative
+        by construction, so it cannot manufacture the chimeras a blanket threshold
+        drop would.
+        """
+
+        threshold = self.config.graph_llr_merge_threshold
+        single = self.config.graph_llr_merge_single
+        full = max(self.config.graph_covis_full_frames, 1)
+        candidates = [
+            edge for edge in edges
+            if single <= edge.llr_total < threshold
+            and edge.gated_frames >= full
+            # nothing observable disagrees: abstaining cues are 0, only a negative
+            # cue (a real contradiction) disqualifies corroboration.
+            and edge.llr_ground >= 0.0 and edge.llr_appearance >= 0.0
+            and edge.llr_posture >= 0.0 and edge.llr_motion >= 0.0
+        ]
+        candidates.sort(key=lambda e: (-e.llr_total, -e.gated_frames, e.key_a, e.key_b))
+
+        def best_partner(root: ChunkKey) -> tuple[ChunkKey | None, float]:
+            """Best candidate-edge partner root for ``root`` (unambiguity check)."""
+            best_root, best_llr = None, -np.inf
+            for edge in candidates:
+                ra, rb = find(edge.key_a), find(edge.key_b)
+                if ra == rb:
+                    continue
+                other = rb if ra == root else (ra if rb == root else None)
+                if other is None:
+                    continue
+                if edge.llr_total > best_llr:
+                    best_root, best_llr = other, edge.llr_total
+            return best_root, best_llr
+
+        merged = 0
+        for edge in candidates:
+            root_a, root_b = find(edge.key_a), find(edge.key_b)
+            if root_a == root_b:
+                continue
+            # Mutual unambiguous best: each cluster's strongest corroboration edge
+            # must point at the other, so we never grab the wrong nearby cluster.
+            pa, _ = best_partner(root_a)
+            pb, _ = best_partner(root_b)
+            if pa != root_b or pb != root_a:
+                self.diagnostics["corroboration_ambiguous"] += 1
+                continue
+            if not self._cluster_compatible(members[root_a], members[root_b], llr_lookup):
+                continue
+            parent[root_b] = root_a
+            members[root_a] = sorted(members[root_a] + members[root_b])
+            del members[root_b]
+            merged += 1
+        return merged
 
     def _refine(
         self,
@@ -977,11 +1070,21 @@ class TrackletGraphBuilder:
                     if median_distance > self.config.graph_traj_attach_gate_m:
                         continue
                     # Posture veto: a fragment that clearly belongs to a different
-                    # build must not ride a nearby trajectory.
+                    # build must not ride a nearby trajectory. Use the fragment's
+                    # best-supported posture aggregate (most samples), not just its
+                    # first chunk, whose aggregate is often undefined for a short
+                    # fragment — so the veto actually gets a chance to fire.
+                    fragment_posture = max(
+                        (postures.get(k) for k in keys),
+                        key=lambda agg: (
+                            sum(agg.count.values()) if agg is not None and agg.is_defined() else -1
+                        ),
+                        default=None,
+                    )
                     veto = False
                     for target_key in cluster_members[target_id]:
                         z = posture_distance_z(
-                            postures.get(keys[0]), postures.get(target_key),
+                            fragment_posture, postures.get(target_key),
                         )
                         if z is not None and z[0] > 3.5:
                             veto = True

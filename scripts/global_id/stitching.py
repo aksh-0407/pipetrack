@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from pose_estimation.cricket.pose_shape import PoseProportions, descriptor_distance
 from scripts.global_id.config import P4Config
 
 
@@ -22,6 +23,8 @@ class Segment:
     last_ground_pos: np.ndarray
     dominant_role: str
     exit_velocity: np.ndarray
+    entry_velocity: np.ndarray | None = None
+    pose: PoseProportions | None = None
 
 
 @dataclass(frozen=True)
@@ -50,12 +53,36 @@ def velocity_continuity_cost(segment_a: Segment, segment_b: Segment) -> float:
     return (1.0 - cosine) / 2.0
 
 
+def _mean_velocity(positions: list[np.ndarray], *, window: int = 5, tail: bool = True) -> np.ndarray:
+    """Short-window mean velocity (per frame) at the tail or head of a run.
+
+    Uses the last/first ``window`` positions rather than the raw last-two-frame
+    difference, so a single noisy foot projection at a segment boundary does not set
+    a wild exit/entry heading (the input to the velocity-continuity stitch cost).
+    """
+
+    if len(positions) < 2:
+        return np.zeros(2)
+    seg = positions[-window:] if tail else positions[:window]
+    if len(seg) < 2:
+        seg = positions[-2:] if tail else positions[:2]
+    diffs = [seg[i + 1] - seg[i] for i in range(len(seg) - 1)]
+    return np.mean(np.asarray(diffs, dtype=float), axis=0)
+
+
 def extract_segments(
     records: Iterable[dict[str, Any]],
     ground_positions: dict[tuple[str, int], np.ndarray],
+    pose_by_id: dict[str, PoseProportions | None] | None = None,
 ) -> list[Segment]:
-    """Extract maximal contiguous confirmed runs using a separate ground-position table."""
+    """Extract maximal contiguous confirmed runs using a separate ground-position table.
 
+    ``pose_by_id`` optionally maps a P4a global id to its accumulated pose-shape
+    descriptor, attached to every segment so stitching can require body-shape
+    agreement before merging two fragments (ghost-verification, ID-2/WS1d).
+    """
+
+    pose_by_id = pose_by_id or {}
     per_identity: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
     for record in records:
         frame_index = int(record["frame_index"])
@@ -78,7 +105,6 @@ def extract_segments(
                 end += 1
             run = usable_frames[start : end + 1]
             positions = [np.asarray(ground_positions[(player_id, frame)], dtype=float) for frame in run]
-            velocity = positions[-1] - positions[-2] if len(positions) >= 2 else np.zeros(2)
             roles = [role for frame in run for role in per_identity[player_id][frame]]
             dominant_role = Counter(roles).most_common(1)[0][0] if roles else "unknown"
             segments.append(
@@ -90,7 +116,9 @@ def extract_segments(
                     first_ground_pos=positions[0].copy(),
                     last_ground_pos=positions[-1].copy(),
                     dominant_role=dominant_role,
-                    exit_velocity=velocity,
+                    exit_velocity=_mean_velocity(positions, tail=True),
+                    entry_velocity=_mean_velocity(positions, tail=False),
+                    pose=pose_by_id.get(player_id),
                 )
             )
             start = end + 1
@@ -100,6 +128,8 @@ def extract_segments(
 def build_link_costs(segments: Iterable[Segment], config: P4Config) -> list[Edge]:
     segments = list(segments)
     edges: list[Edge] = []
+    pose_gate = config.p4b.pose_stitch_max_distance
+    w_pose = config.p4b.w_pose
     for source in segments:
         for target in segments:
             gap = target.start_frame - source.end_frame
@@ -111,11 +141,24 @@ def build_link_costs(segments: Iterable[Segment], config: P4Config) -> list[Edge
             )
             if distance > maximum:
                 continue
+            pose_term = 0.0
+            if pose_gate > 0.0 or w_pose > 0.0:
+                pose_distance = descriptor_distance(
+                    source.pose, target.pose,
+                    min_shared=config.p4b.pose_min_shared_segments,
+                )
+                if pose_distance is not None:
+                    # Hard gate: two fragments of clearly different build are not the
+                    # same person, regardless of how kinematically reachable they are.
+                    if pose_gate > 0.0 and pose_distance > pose_gate:
+                        continue
+                    pose_term = w_pose * pose_distance
             cost = (
                 config.p4b.w_temporal * gap
                 + config.p4b.w_spatial * distance
                 + _role_penalty(source.dominant_role, target.dominant_role, config)
                 + config.p4b.velocity_continuity_weight * velocity_continuity_cost(source, target)
+                + pose_term
             )
             edges.append(Edge(source.seg_id, target.seg_id, cost, gap, distance))
     return edges

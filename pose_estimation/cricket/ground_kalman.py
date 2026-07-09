@@ -134,12 +134,16 @@ class SingerGroundKalman:
         self.role = new_role
 
     def cap_covariance(self, max_pos_var: float = 25.0) -> None:
-        """Prevent covariance blow-up during long Lost windows."""
+        """Prevent covariance blow-up during long Lost windows.
 
-        for i in range(2):
-            if self.P[i, i] > max_pos_var:
-                self.P = self.P * (max_pos_var / self.P[i, i])
-                break
+        Scale by the LARGER of the two position variances so BOTH x and y stay
+        bounded — the previous version broke after the first over-threshold axis and
+        could leave the other axis unbounded when both exceeded the cap.
+        """
+
+        worst = float(max(self.P[0, 0], self.P[1, 1]))
+        if worst > max_pos_var:
+            self.P = self.P * (max_pos_var / worst)
 
     def propagate_state(self, n_frames: int) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(x_pred, P_pred)`` after ``n_frames`` of prediction without mutating state."""

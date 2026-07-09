@@ -112,6 +112,10 @@ def parse_args() -> argparse.Namespace:
                     help="Person crops per batched RTMPose call (default: 64)")
     rt.add_argument("--io-workers", type=int, default=4,
                     help="CPU worker threads for image decode prefetch (default: 4)")
+    rt.add_argument("--cv2-threads", type=int, default=2,
+                    help="OpenCV internal threads per decode call (default: 2). Kept low "
+                         "so N io-workers x cv2 threads does not oversubscribe the CPU and "
+                         "starve the GPU; the GPU does the pose/detect compute.")
     rt.add_argument("--benchmark-only", action="store_true",
                     help="Run inference and timing without writing prediction JSONL or overlays")
     rt.add_argument("--sync-cuda-timing", action="store_true",
@@ -668,6 +672,22 @@ def main() -> int:
         raise SystemExit("--pose-batch-size must be positive")
     if args.io_workers < 0:
         raise SystemExit("--io-workers must be >= 0")
+    if args.cv2_threads < 1:
+        raise SystemExit("--cv2-threads must be >= 1")
+    # Cap CPU-side parallelism so decode threads don't oversubscribe all cores and
+    # thrash (which starves the GPU). OpenCV otherwise defaults to every core, so
+    # io_workers x cores threads fight; keep each decode light and let the GPU carry
+    # the detect/pose compute.
+    try:
+        import cv2
+        cv2.setNumThreads(args.cv2_threads)
+    except Exception:
+        pass
+    try:
+        import torch
+        torch.set_num_threads(max(1, args.cv2_threads))
+    except Exception:
+        pass
     if args.overlay_every <= 0:
         raise SystemExit("--overlay-every must be positive")
     if args.overlay_limit < 0:

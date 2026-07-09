@@ -73,6 +73,29 @@ class P4AConfig:
     pose_descriptor_ema: float = 0.15
     pose_min_updates: int = 5
     pose_min_shared_segments: int = 4
+    # ID-3 teleport control. When > 0, a Stage-2 candidate whose mature pose-shape
+    # descriptor differs from the track's by more than this bone-ratio distance is
+    # VETOED (not merely penalised) inside the chi2 gate — a body of clearly the
+    # wrong build can no longer capture a track. 0 keeps the additive tie-breaker only.
+    pose_gate_veto_distance: float = 0.0
+    # ID-2/ID-3. When > 0, reviving a deleted track from the re-entry pool requires
+    # its pose-shape descriptor to agree with the observation within this distance
+    # (abstains — allows — when either descriptor is immature/unshared, so behaviour
+    # is unchanged where pose is unavailable). Blocks kinematically-plausible but
+    # wrong-person re-entries (a teleport/ID-swap source).
+    reentry_pose_max_distance: float = 0.0
+    # ID-2 fragmentation. Adaptive lost-window: a well-established track (many hits)
+    # is kept alive across occlusion for up to lost_window_max_frames instead of the
+    # flat lost_window_frames, so a briefly-occluded confirmed player is re-acquired
+    # rather than deleted and re-born as a fresh id. False keeps the flat window.
+    adaptive_lost_window: bool = False
+    lost_window_max_frames: int = 90
+    # ID-2 cardinality prior. In a ~12 s cricket delivery every one of the ~13-15
+    # people is present the whole clip, so a global id that survives only a handful
+    # of frames is a fragment/shadow, not a late-entering player. When > 0, any id
+    # whose total emitted frame-span is below this is dropped (its detections become
+    # unlabelled) AFTER stitching has had its chance to absorb it. 0 = disabled.
+    min_emit_frames: int = 0
     # Emit the chi2-gated Kalman POSTERIOR as the ground position instead of the raw
     # per-frame fused observation (ISSUE-5). The posterior cannot jump faster than the
     # gate allows, so a single bad/mis-associated measurement can no longer teleport the
@@ -99,6 +122,14 @@ class P4AConfig:
                      "local_identity_mahalanobis_gate"):
             _positive(name, getattr(self, name))
         _nonnegative("pose_match_weight", self.pose_match_weight)
+        _nonnegative("pose_gate_veto_distance", self.pose_gate_veto_distance)
+        _nonnegative("reentry_pose_max_distance", self.reentry_pose_max_distance)
+        if type(self.adaptive_lost_window) is not bool:
+            raise ValueError("adaptive_lost_window must be a boolean")
+        if type(self.lost_window_max_frames) is not int or self.lost_window_max_frames <= 0:
+            raise ValueError("lost_window_max_frames must be a positive integer")
+        if type(self.min_emit_frames) is not int or self.min_emit_frames < 0:
+            raise ValueError("min_emit_frames must be a non-negative integer")
         for name in ("confidence_high", "confidence_discard", "pose_descriptor_ema"):
             _range(name, getattr(self, name), 0.0, 1.0)
         if self.confidence_discard > self.confidence_high:
@@ -127,6 +158,15 @@ class P4BConfig:
     new_traj_cost_factor: float = 0.5
     velocity_continuity_weight: float = 0.5
     kinematic_slack: float = 1.5
+    # Stitching v2 (ID-2 / ghost-verification). When > 0, a stitch between two
+    # fragments is FORBIDDEN if both carry mature pose-shape descriptors that differ
+    # by more than this bone-ratio distance — so only same-build fragments merge
+    # (abstains when either descriptor is immature/unshared). w_pose adds the pose
+    # distance to the link cost so a better body-shape match is preferred among
+    # admissible stitches. 0 = disabled (byte-identical).
+    pose_stitch_max_distance: float = 0.0
+    w_pose: float = 0.0
+    pose_min_shared_segments: int = 4
     incompatible_role_pairs: list[list[str]] = field(default_factory=_default_incompatible_roles)
 
     def __post_init__(self) -> None:
@@ -139,8 +179,11 @@ class P4BConfig:
             raise ValueError("temporal_gate_frames must be a positive integer")
         for name in ("w_spatial", "new_traj_cost_factor", "kinematic_slack"):
             _positive(name, getattr(self, name))
-        for name in ("w_temporal", "w_role", "velocity_continuity_weight"):
+        for name in ("w_temporal", "w_role", "velocity_continuity_weight",
+                     "pose_stitch_max_distance", "w_pose"):
             _nonnegative(name, getattr(self, name))
+        if type(self.pose_min_shared_segments) is not int or self.pose_min_shared_segments <= 0:
+            raise ValueError("pose_min_shared_segments must be a positive integer")
         if not isinstance(self.incompatible_role_pairs, list):
             raise ValueError("incompatible_role_pairs must be a list")
         for pair in self.incompatible_role_pairs:

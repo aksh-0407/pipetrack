@@ -87,9 +87,17 @@ def load_pitch_points(drive_root: Path, match_id: str) -> np.ndarray:
 
 
 def stable_color(global_id: str):
-    # Deterministic bright colour per id (golden-ratio hue hashing).
-    h = (abs(hash(global_id)) % 997) / 997.0
-    return matplotlib.colors.hsv_to_rgb([h, 0.65, 0.95])
+    """Unified id colour (shared with the mosaic via ``identity_colors``).
+
+    ``color_for_global_id`` returns a BGR 0-255 tuple; convert to matplotlib RGB 0-1
+    so the standalone bird's-eye view and the in-mosaic BEV/tiles colour every id
+    identically instead of the old independent golden-ratio hash.
+    """
+
+    from scripts.visualization.identity_colors import color_for_global_id
+
+    b, g, r = color_for_global_id(str(global_id))
+    return (r / 255.0, g / 255.0, b / 255.0)
 
 
 def compute_extent(tracks: dict, pitch: np.ndarray) -> tuple[float, float, float, float]:
@@ -116,14 +124,18 @@ def draw_frame(ax, frame_idx, players, singles, pitch, extent):
                                             fill=False, edgecolor="white", linewidth=1.5, alpha=0.6))
     if pitch.size:
         ax.scatter(pitch[:, 0], pitch[:, 1], s=3, c="#d9c9a3", alpha=0.7, zorder=2)
+    # ``singles`` (from correspondence ``binding_id``) is a DIFFERENT id namespace
+    # than the ground-track ``global_player_id`` keyed here, so the old hollow-marker
+    # join never matched. Render solid id-coloured dots; the in-mosaic BEV is the tool
+    # that distinguishes single-camera (hollow) using the per-frame camera counts.
+    del singles
     for gid, xy in players:
         col = stable_color(gid)
-        is_single = gid in singles
-        ax.scatter([xy[0]], [xy[1]], s=90, facecolors="none" if is_single else col,
-                   edgecolors=col, linewidths=2.0, zorder=4)
+        ax.scatter([xy[0]], [xy[1]], s=90, facecolors=col,
+                   edgecolors="white", linewidths=1.2, zorder=4)
         ax.annotate(gid, (xy[0], xy[1]), fontsize=7, color="white", zorder=5,
                     xytext=(3, 3), textcoords="offset points")
-    ax.set_title(f"frame {frame_idx}   players={len(players)}   (hollow = single-camera)",
+    ax.set_title(f"frame {frame_idx}   players={len(players)}",
                  color="white", fontsize=9)
     ax.tick_params(colors="0.7", labelsize=7)
 
