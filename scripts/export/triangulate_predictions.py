@@ -21,6 +21,8 @@ from pose_estimation.cricket.contract import validate_group1_frame  # noqa: E402
 from pose_estimation.schemas import CameraCalibration  # noqa: E402
 from pose_estimation.triangulation import (  # noqa: E402
     _COCO17_PARENT,
+    _HALPE26_PARENT,
+    butterworth_smooth,
     confidence_ema_smooth,
     fill_from_skeletal_prior,
     fill_occluded_joints,
@@ -31,15 +33,21 @@ from pose_estimation.triangulation import (  # noqa: E402
 def _most_complete_pose(sequence: np.ndarray) -> np.ndarray:
     """The identity's frame with the most triangulated joints (skeletal-prior reference)."""
     if len(sequence) == 0:
-        return np.full((17, 3), np.nan)
+        return np.full((17, 3), np.nan)  # callers never hit this with frames present
     counts = [int(np.isfinite(sequence[t]).all(axis=1).sum()) for t in range(len(sequence))]
     return sequence[int(np.argmax(counts))]
 
 
-def _median_bone_lengths(sequence: np.ndarray) -> dict[tuple[int, int], float]:
-    """Median length of each COCO-17 bone across the identity's triangulated frames."""
+def _median_bone_lengths(
+    sequence: np.ndarray,
+    parents: dict[int, int] | None = None,
+) -> dict[tuple[int, int], float]:
+    """Median length of each skeleton bone across the identity's triangulated frames."""
     out: dict[tuple[int, int], float] = {}
-    for child, parent in _COCO17_PARENT.items():
+    joint_count = sequence.shape[1] if len(sequence) else 0
+    for child, parent in (parents or _COCO17_PARENT).items():
+        if child >= joint_count or parent >= joint_count:
+            continue
         lengths = []
         for t in range(len(sequence)):
             c, p = sequence[t, child], sequence[t, parent]
@@ -48,7 +56,9 @@ def _median_bone_lengths(sequence: np.ndarray) -> dict[tuple[int, int], float]:
         if lengths:
             out[(child, parent)] = float(np.median(lengths))
     return out
+from scripts.association.cluster_lift import cluster_purity, lift_frame  # noqa: E402
 from scripts.association.jsonl_io import load_synchronized_records  # noqa: E402
+from scripts.global_id.jsonl_io import read_correspondence_rows  # noqa: E402
 from scripts.tracking.calibration import load_projection_matrices_from_drive  # noqa: E402
 from scripts.tracking.runner import discover_prediction_files, infer_match_id  # noqa: E402
 
@@ -68,6 +78,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reprojection-threshold-px", type=float, default=10.0)
     parser.add_argument("--min-views", type=int, default=2)
     parser.add_argument("--ema-alpha", type=float, default=0.65)
+    parser.add_argument("--cheirality", action="store_true",
+                        help="Reject triangulations behind a camera (fix F3; default off = legacy).")
+    parser.add_argument("--smoother", choices=["ema", "butterworth"], default="ema",
+                        help="Temporal smoother: causal EMA (legacy) or zero-phase Butterworth (fix F7).")
+    parser.add_argument("--butter-cutoff-hz", type=float, default=6.0)
+    parser.add_argument("--capture-fps", type=float, default=50.0,
+                        help="Capture frame rate used by the Butterworth smoother.")
+    parser.add_argument("--id-source", choices=["global", "binding"], default="global",
+                        help="Group observations by P4 global_player_id (terminal lift, legacy) "
+                             "or by P3 binding_id (the P3.5 re-sequenced lift, fix F9b).")
+    parser.add_argument("--chimera-torso-residual-px", type=float, default=20.0)
+    parser.add_argument("--chimera-frame-fraction", type=float, default=0.3)
+    parser.add_argument("--airborne-ankle-z-m", type=float, default=0.25)
+    parser.add_argument("--dense-fill", action="store_true",
+                        help="C6: measure occlusion gaps in REAL frame numbers (densify the "
+                             "per-identity timeline with NaN rows) instead of array rows, so a "
+                             "2-row gap spanning 300 real frames is no longer interpolated as "
+                             "adjacent. Default off = legacy row-index behaviour.")
+    parser.add_argument("--native-skeleton", action="store_true",
+                        help="Triangulate all 26 Halpe keypoints from pose_2d_native when every "
+                             "member view carries them (fix F15); pose_3d stays the COCO-17 "
+                             "slice, the full skeleton is emitted as pose_3d_native.")
     return parser.parse_args(argv)
 
 
@@ -102,6 +134,16 @@ def triangulate_canonical_run(
     reprojection_threshold_px: float,
     min_views: int,
     ema_alpha: float,
+    cheirality: bool = False,
+    smoother: str = "ema",
+    butter_cutoff_hz: float = 6.0,
+    capture_fps: float = 50.0,
+    id_source: str = "global",
+    chimera_torso_residual_px: float = 20.0,
+    chimera_frame_fraction: float = 0.3,
+    airborne_ankle_z_m: float = 0.25,
+    native_skeleton: bool = False,
+    dense_fill: bool = False,
 ) -> dict[str, Any]:
     input_run_dir, output_run_dir = Path(input_run_dir), Path(output_run_dir)
     prediction_files = discover_prediction_files(input_run_dir, delivery_id, cameras)
@@ -110,25 +152,93 @@ def triangulate_canonical_run(
     all_projections = load_projection_matrices_from_drive(drive_root, match_id)
 
     observations: dict[tuple[int, str], list[tuple[str, dict]]] = defaultdict(list)
-    for frame_index, camera_records in records_by_frame.items():
-        for camera_id, record in camera_records.items():
-            if camera_id not in all_projections:
-                continue
-            for player in record.get("players", []):
-                player_id = player.get("global_player_id")
-                if player_id and player.get("pose_2d") is not None:
-                    observations[(frame_index, player_id)].append((camera_id, player))
+    if id_source == "binding":
+        # F9b: identity comes from the P3 correspondence stream (binding_id), so the
+        # lift runs BEFORE global ID exists and its purity/descriptor evidence can
+        # feed identity instead of trailing it.
+        correspondence_path = input_run_dir / "diagnostics" / "correspondences.jsonl"
+        if not correspondence_path.exists():
+            raise FileNotFoundError(f"--id-source binding needs {correspondence_path}")
+        for row in read_correspondence_rows(correspondence_path):
+            frame_index = int(row["frame_index"])
+            camera_records = records_by_frame.get(frame_index, {})
+            for cluster in row.get("clusters", []):
+                binding = cluster.get("binding_id")
+                if binding is None:
+                    continue
+                for member in cluster.get("members", []):
+                    camera_id = member.get("cam_id")
+                    record = camera_records.get(camera_id)
+                    if record is None or camera_id not in all_projections:
+                        continue
+                    players = record.get("players", [])
+                    player_index = int(member["player_index"])
+                    if 0 <= player_index < len(players):
+                        player = players[player_index]
+                        if player.get("pose_2d") is not None:
+                            observations[(frame_index, binding)].append((camera_id, player))
+    else:
+        for frame_index, camera_records in records_by_frame.items():
+            for camera_id, record in camera_records.items():
+                if camera_id not in all_projections:
+                    continue
+                for player in record.get("players", []):
+                    player_id = player.get("global_player_id")
+                    if player_id and player.get("pose_2d") is not None:
+                        observations[(frame_index, player_id)].append((camera_id, player))
+
+    def _member_keypoints(views: list[tuple[str, dict]]) -> dict[str, np.ndarray]:
+        """(J, 3) [x, y, conf] per camera; Halpe-26 when requested and available.
+
+        F15: a frame is lifted at 26 joints only when EVERY member view carries a
+        valid native block, so the per-frame view stack stays rectangular; other
+        frames fall back to COCO-17 and are NaN-padded to 26 at sequence time.
+        """
+
+        blocks = {}
+        if native_skeleton and all(
+            (view[1].get("pose_2d_native") or {}).get("keypoints_px") is not None
+            and len(view[1]["pose_2d_native"]["keypoints_px"]) >= 26
+            for view in views
+        ):
+            for camera, player in views:
+                native = player["pose_2d_native"]
+                blocks[camera] = np.column_stack(
+                    (np.asarray(native["keypoints_px"], dtype=float)[:26],
+                     np.asarray(native["confidence"], dtype=float)[:26])
+                )
+        else:
+            for camera, player in views:
+                blocks[camera] = np.column_stack(
+                    (player["pose_2d"]["keypoints_px"], player["pose_2d"]["confidence"])
+                )
+        return blocks
 
     raw: dict[tuple[int, str], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    lifts: dict[tuple[int, str], "object"] = {}  # binding mode: FrameLift per key (F9b)
     for key, views in sorted(observations.items()):
         if len(views) < min_views:
             continue
+        if id_source == "binding":
+            # The lift core also derives per-camera torso residuals (the chimera
+            # signature) and per-joint covariance — the P3.5 feedback payload.
+            member_keypoints = _member_keypoints(views)
+            lift = lift_frame(
+                member_keypoints,
+                all_projections,
+                reprojection_threshold_px=reprojection_threshold_px,
+                min_views=min_views,
+                cheirality=cheirality,
+                compute_cov=True,
+            )
+            if lift is None:
+                continue
+            lifts[key] = lift
+            raw[key] = (lift.points3d, lift.confidences, lift.mean_reprojection_errors)
+            continue
+        member_keypoints = _member_keypoints(views)
         keypoints = np.asarray(
-            [
-                np.column_stack((player["pose_2d"]["keypoints_px"], player["pose_2d"]["confidence"]))
-                for _, player in views
-            ],
-            dtype=float,
+            [member_keypoints[camera] for camera, _ in views], dtype=float
         )
         projections = np.asarray([all_projections[camera] for camera, _ in views], dtype=float)
         raw[key] = triangulate_skeleton_ransac(
@@ -136,6 +246,7 @@ def triangulate_canonical_run(
             projections,
             reprojection_threshold_px=reprojection_threshold_px,
             min_views=min_views,
+            cheirality=cheirality,
         )
 
     # Smooth each identity in temporal order, then stamp the same 3D pose into
@@ -147,22 +258,57 @@ def triangulate_canonical_run(
     smoothed_conf: dict[tuple[int, str], np.ndarray] = {}
     for player_id, frames in per_identity.items():
         frames = sorted(set(frames))
-        sequence = np.asarray([raw[(frame, player_id)][0] for frame in frames], dtype=float)
-        confidences = np.asarray([raw[(frame, player_id)][1] for frame in frames], dtype=float)
+        joint_count = max(raw[(frame, player_id)][0].shape[0] for frame in frames)
+
+        def _pad(arr: np.ndarray, width: int, fill: float) -> np.ndarray:
+            if arr.shape[0] == joint_count:
+                return arr
+            padded = np.full((joint_count, width) if width else (joint_count,), fill)
+            padded[: arr.shape[0]] = arr
+            return padded
+
+        if dense_fill:
+            # C6: rows == real frames, so gap gates and smoothing operate in true
+            # time; unobserved frames are NaN rows that fills may bridge only
+            # within max_gap_frames of REAL frames.
+            timeline = list(range(frames[0], frames[-1] + 1))
+            row_of = {frame: row for row, frame in enumerate(timeline)}
+            sequence = np.full((len(timeline), joint_count, 3), np.nan)
+            confidences = np.zeros((len(timeline), joint_count))
+            for frame in frames:
+                sequence[row_of[frame]] = _pad(raw[(frame, player_id)][0], 3, np.nan)
+                confidences[row_of[frame]] = _pad(raw[(frame, player_id)][1], 0, 0.0)
+        else:
+            timeline = frames
+            row_of = {frame: row for row, frame in enumerate(frames)}
+            sequence = np.asarray(
+                [_pad(raw[(frame, player_id)][0], 3, np.nan) for frame in frames], dtype=float
+            )
+            confidences = np.asarray(
+                [_pad(raw[(frame, player_id)][1], 0, 0.0) for frame in frames], dtype=float
+            )
         # Extrapolate joints missing in scattered frames (occluded / <2 views) from their
         # temporal neighbours, then last-resort skeletal prior, so the emitted 3D pose is
         # complete instead of dropping the whole frame for one NaN joint.
         sequence, confidences = fill_occluded_joints(sequence, confidences)
         reference = _most_complete_pose(sequence)
-        bones = _median_bone_lengths(sequence)
-        for index in range(len(frames)):
+        bones = _median_bone_lengths(
+            sequence, parents=_HALPE26_PARENT if joint_count > 17 else _COCO17_PARENT
+        )
+        for index in range(sequence.shape[0]):
             if not np.isfinite(sequence[index]).all():
                 sequence[index], confidences[index] = fill_from_skeletal_prior(
-                    sequence[index], confidences[index], bones, reference
+                    sequence[index], confidences[index], bones, reference,
+                    parents=_HALPE26_PARENT if joint_count > 17 else _COCO17_PARENT,
                 )
-        filtered = confidence_ema_smooth(sequence, confidences, alpha=ema_alpha)
-        smoothed.update({(frame, player_id): filtered[index] for index, frame in enumerate(frames)})
-        smoothed_conf.update({(frame, player_id): confidences[index] for index, frame in enumerate(frames)})
+        if smoother == "butterworth":
+            filtered = butterworth_smooth(
+                sequence, fps=capture_fps, cutoff_hz=butter_cutoff_hz
+            )
+        else:
+            filtered = confidence_ema_smooth(sequence, confidences, alpha=ema_alpha)
+        smoothed.update({(frame, player_id): filtered[row_of[frame]] for frame in frames})
+        smoothed_conf.update({(frame, player_id): confidences[row_of[frame]] for frame in frames})
 
     successful = 0
     extrapolated_joint_frames = 0
@@ -184,12 +330,23 @@ def triangulate_canonical_run(
             extrapolated_joint_frames += 1
         confidences = np.nan_to_num(confidences, nan=0.0)
         pose_3d = {
-            "keypoints_world_m": points.tolist(),
-            "confidence": np.clip(confidences, 0.0, 1.0).tolist(),
-            "mean_reprojection_error_px": errors.tolist(),
+            "keypoints_world_m": points[:17].tolist(),
+            "confidence": np.clip(confidences[:17], 0.0, 1.0).tolist(),
+            "mean_reprojection_error_px": errors[:17].tolist(),
         }
+        pose_3d_native = None
+        if points.shape[0] > 17:
+            # F15: the full Halpe-26 skeleton (feet included) rides alongside the
+            # contract-pinned COCO-17 block; consumers opt in explicitly.
+            pose_3d_native = {
+                "keypoints_world_m": points.tolist(),
+                "confidence": np.clip(confidences, 0.0, 1.0).tolist(),
+                "mean_reprojection_error_px": errors.tolist(),
+            }
         for _, player in views:
-            player["pose_3d"] = pose_3d
+            player["pose_3d"] = dict(pose_3d)  # per-view copy: no cross-record aliasing
+            if pose_3d_native is not None:
+                player["pose_3d_native"] = dict(pose_3d_native)
         successful += 1
 
     output_prediction_dir = output_run_dir / "predictions"
@@ -202,6 +359,75 @@ def triangulate_canonical_run(
                     continue
                 validate_group1_frame(record, final_handoff=False)
                 handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+
+    purity_by_binding: dict[str, Any] = {}
+    if id_source == "binding":
+        # F9b diagnostics: the per-frame 3D stream keyed on binding_id plus the
+        # whole-delivery purity report — the chimera-split signal and the shape
+        # evidence Waves 3/4 consume.
+        def _nan_to_none(values: np.ndarray) -> list:
+            return [
+                [None if not np.isfinite(v) else float(v) for v in row]
+                if np.ndim(row) else (None if not np.isfinite(row) else float(row))
+                for row in np.asarray(values, dtype=float)
+            ]
+
+        diagnostics_dir = output_run_dir / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        by_frame: dict[int, list[dict]] = defaultdict(list)
+        for (frame_index, binding), lift in sorted(lifts.items()):
+            points = smoothed.get((frame_index, binding), lift.points3d)
+            pelvis = np.asarray(points, dtype=float)[[11, 12]]
+            pelvis_ok = np.isfinite(pelvis).all(axis=1)
+            pelvis_xy = (
+                [float(v) for v in pelvis[pelvis_ok].mean(axis=0)[:2]]
+                if pelvis_ok.any() else None
+            )
+            ankle_z = lift.ankle_z
+            entry = {
+                "binding_id": binding,
+                "keypoints_world_m": _nan_to_none(points),
+                "confidence": [float(v) for v in np.nan_to_num(lift.confidences)],
+                "mean_reprojection_error_px": _nan_to_none(lift.mean_reprojection_errors),
+                "pelvis_ground_xy": pelvis_xy,
+                "airborne": bool(np.isfinite(ankle_z) and ankle_z > airborne_ankle_z_m),
+                "cov_diag_m2": (
+                    _nan_to_none(lift.cov_diag_m2) if lift.cov_diag_m2 is not None else None
+                ),
+                "pelvis_cov_m2": (
+                    [[float(v) for v in row] for row in lift.pelvis_cov_m2]
+                    if lift.pelvis_cov_m2 is not None else None
+                ),
+            }
+            by_frame[frame_index].append(entry)
+        with (diagnostics_dir / "lift3d.jsonl").open("w", encoding="utf-8") as handle:
+            for frame_index in sorted(by_frame):
+                handle.write(json.dumps(
+                    {"frame_index": frame_index, "bindings": by_frame[frame_index]},
+                    sort_keys=True, allow_nan=False,
+                ) + "\n")
+
+        lifts_by_binding: dict[str, list] = defaultdict(list)
+        for (frame_index, binding), lift in sorted(lifts.items()):
+            lifts_by_binding[binding].append(lift)
+        purity_by_binding = {
+            binding: cluster_purity(
+                binding_lifts,
+                chimera_torso_residual_px=chimera_torso_residual_px,
+                chimera_frame_fraction=chimera_frame_fraction,
+            ).to_json()
+            for binding, binding_lifts in sorted(lifts_by_binding.items())
+        }
+        _write_json(diagnostics_dir / "lift_purity.json", {
+            "schema_version": "lift_purity/v1",
+            "delivery_id": delivery_id,
+            "thresholds": {
+                "chimera_torso_residual_px": chimera_torso_residual_px,
+                "chimera_frame_fraction": chimera_frame_fraction,
+                "airborne_ankle_z_m": airborne_ankle_z_m,
+            },
+            "bindings": purity_by_binding,
+        })
 
     created_at = datetime.now(timezone.utc).isoformat()
     all_measured = (
@@ -228,6 +454,15 @@ def triangulate_canonical_run(
             float(np.percentile(all_measured, 95)) if all_measured.size else None
         ),
     }
+    if id_source == "binding":
+        suspects = [
+            binding for binding, report in purity_by_binding.items()
+            if report.get("chimera_suspect")
+        ]
+        metrics["id_source"] = "binding"
+        metrics["bindings_lifted"] = len(purity_by_binding)
+        metrics["chimera_suspect_count"] = len(suspects)
+        metrics["chimera_suspects"] = suspects
     manifest = {
         "schema_version": "triangulation_run/v1",
         "created_at": created_at,
@@ -241,6 +476,13 @@ def triangulate_canonical_run(
             "reprojection_threshold_px": reprojection_threshold_px,
             "min_views": min_views,
             "ema_alpha": ema_alpha,
+            "cheirality": cheirality,
+            "smoother": smoother,
+            "butter_cutoff_hz": butter_cutoff_hz,
+            "capture_fps": capture_fps,
+            "id_source": id_source,
+            "native_skeleton": native_skeleton,
+            "dense_fill": dense_fill,
         },
     }
     _write_json(output_run_dir / "run_manifest.json", manifest)
@@ -297,6 +539,16 @@ def main(argv: list[str] | None = None) -> int:
             reprojection_threshold_px=args.reprojection_threshold_px,
             min_views=args.min_views,
             ema_alpha=args.ema_alpha,
+            cheirality=args.cheirality,
+            smoother=args.smoother,
+            butter_cutoff_hz=args.butter_cutoff_hz,
+            capture_fps=args.capture_fps,
+            id_source=args.id_source,
+            chimera_torso_residual_px=args.chimera_torso_residual_px,
+            chimera_frame_fraction=args.chimera_frame_fraction,
+            airborne_ankle_z_m=args.airborne_ankle_z_m,
+            native_skeleton=args.native_skeleton,
+            dense_fill=args.dense_fill,
         )
         print(f"P6: triangulated {metrics['fully_valid_identity_frames']} identity-frames")
         return 0

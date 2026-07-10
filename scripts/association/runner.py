@@ -178,6 +178,9 @@ def run_association(
     temporal_memory = TemporalLinkMemory(confirm_frames=config.temporal_confirm_frames)
     anchor_switch_frames: list[int] = []
     rows: list[dict] = []
+    # F9c: multi-view member keypoints per binding, sampled every graph_lift_stride
+    # frames, for the post-solve purity lift (read-only diagnostics).
+    lift_samples: dict[str, list[dict]] = {}
     for frame_index in sorted(records_by_frame):
         camera_records = records_by_frame[frame_index]
         detections = detections_by_frame[frame_index]
@@ -194,6 +197,20 @@ def run_association(
             )
         if previous_anchor is not None and anchor.anchor_id != previous_anchor:
             anchor_switch_frames.append(frame_index)
+        if (
+            config.graph_lift_feedback
+            and graph_solution is not None
+            and frame_index % config.graph_lift_stride == 0
+        ):
+            for corr in correspondences:
+                if corr.binding_id is None or len(corr.members) < 2:
+                    continue
+                lift_samples.setdefault(corr.binding_id, []).append({
+                    cam_id: np.column_stack(
+                        (det.keypoints_px, det.keypoint_conf)
+                    )
+                    for cam_id, det in corr.members.items()
+                })
         apply_correspondences(camera_records, correspondences)
         row = correspondence_row(frame_index, correspondences)
         row["anchor_camera_id"] = anchor.anchor_id
@@ -206,6 +223,37 @@ def run_association(
         _write_json(
             output_run_dir / "diagnostics" / "tracklet_graph.json",
             graph_solution.to_json(),
+        )
+    lift_purity_by_binding: dict[str, dict] = {}
+    if config.graph_lift_feedback and lift_samples:
+        from scripts.association.cluster_lift import cluster_purity, lift_frame
+
+        for binding, frames in sorted(lift_samples.items()):
+            lifts = [
+                lift for members in frames
+                if (lift := lift_frame(
+                    members, projections,
+                    reprojection_threshold_px=config.triangulation_reproj_threshold_px,
+                    min_views=config.triangulation_min_views,
+                )) is not None
+            ]
+            lift_purity_by_binding[binding] = cluster_purity(
+                lifts,
+                chimera_torso_residual_px=config.graph_chimera_torso_residual_px,
+                chimera_frame_fraction=config.graph_chimera_frame_fraction,
+            ).to_json()
+        _write_json(
+            output_run_dir / "diagnostics" / "lift_purity.json",
+            {
+                "schema_version": "lift_purity/v1",
+                "delivery_id": delivery_id,
+                "sampled_every_frames": config.graph_lift_stride,
+                "thresholds": {
+                    "chimera_torso_residual_px": config.graph_chimera_torso_residual_px,
+                    "chimera_frame_fraction": config.graph_chimera_frame_fraction,
+                },
+                "bindings": lift_purity_by_binding,
+            },
         )
 
     created_at = datetime.now(timezone.utc).isoformat()
@@ -229,6 +277,14 @@ def run_association(
         for camera in camera_ids
     }
     graph_metrics: dict = {"association_mode": config.association_mode}
+    if lift_purity_by_binding:
+        suspects = [
+            binding for binding, report in lift_purity_by_binding.items()
+            if report.get("chimera_suspect")
+        ]
+        graph_metrics["lift_bindings_evaluated"] = len(lift_purity_by_binding)
+        graph_metrics["lift_chimera_suspect_count"] = len(suspects)
+        graph_metrics["lift_chimera_suspects"] = suspects
     if graph_solution is not None:
         graph_metrics.update({
             "binding_count": len(graph_solution.clusters),

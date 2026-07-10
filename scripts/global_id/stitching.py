@@ -9,7 +9,12 @@ from typing import Any, Iterable
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from pose_estimation.cricket.pose_shape import PoseProportions, descriptor_distance
+from pose_estimation.cricket.pose_shape import (
+    PoseProportions,
+    PostureAggregate,
+    descriptor_distance,
+    posture_distance_z,
+)
 from scripts.global_id.config import P4Config
 
 
@@ -25,6 +30,7 @@ class Segment:
     exit_velocity: np.ndarray
     entry_velocity: np.ndarray | None = None
     pose: PoseProportions | None = None
+    posture: PostureAggregate | None = None
 
 
 @dataclass(frozen=True)
@@ -74,15 +80,19 @@ def extract_segments(
     records: Iterable[dict[str, Any]],
     ground_positions: dict[tuple[str, int], np.ndarray],
     pose_by_id: dict[str, PoseProportions | None] | None = None,
+    posture_by_id: dict[str, PostureAggregate | None] | None = None,
 ) -> list[Segment]:
     """Extract maximal contiguous confirmed runs using a separate ground-position table.
 
     ``pose_by_id`` optionally maps a P4a global id to its accumulated pose-shape
     descriptor, attached to every segment so stitching can require body-shape
     agreement before merging two fragments (ghost-verification, ID-2/WS1d).
+    ``posture_by_id`` is the billboard-posture analogue (F12): it matures on the
+    facing pairs where the triangulated descriptor cannot.
     """
 
     pose_by_id = pose_by_id or {}
+    posture_by_id = posture_by_id or {}
     per_identity: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
     for record in records:
         frame_index = int(record["frame_index"])
@@ -119,22 +129,45 @@ def extract_segments(
                     exit_velocity=_mean_velocity(positions, tail=True),
                     entry_velocity=_mean_velocity(positions, tail=False),
                     pose=pose_by_id.get(player_id),
+                    posture=posture_by_id.get(player_id),
                 )
             )
             start = end + 1
     return segments
 
 
-def build_link_costs(segments: Iterable[Segment], config: P4Config) -> list[Edge]:
+def build_link_costs(
+    segments: Iterable[Segment],
+    config: P4Config,
+    occupancy_by_id: dict[str, set[tuple[str, int]]] | None = None,
+) -> list[Edge]:
+    """Feasible stitch edges between temporally ordered fragments.
+
+    ``occupancy_by_id`` (identity -> set of (camera, frame) cells) enables the F6
+    occupancy-licensed long bridge: a gap beyond ``temporal_gate_frames`` is still
+    admissible up to ``temporal_gate_frames_occupancy`` when the two identities'
+    occupancies are fully disjoint (they can never have been two simultaneous
+    people) — by default additionally requiring mature pose-shape agreement.
+    """
+
     segments = list(segments)
     edges: list[Edge] = []
     pose_gate = config.p4b.pose_stitch_max_distance
     w_pose = config.p4b.w_pose
+    bridge_enabled = config.p4b.occupancy_bridge and occupancy_by_id is not None
     for source in segments:
         for target in segments:
             gap = target.start_frame - source.end_frame
-            if gap <= 0 or gap > config.p4b.temporal_gate_frames:
+            if gap <= 0:
                 continue
+            long_bridge = gap > config.p4b.temporal_gate_frames
+            if long_bridge:
+                if not bridge_enabled or gap > config.p4b.temporal_gate_frames_occupancy:
+                    continue
+                source_cells = occupancy_by_id.get(source.global_player_id, set())
+                target_cells = occupancy_by_id.get(target.global_player_id, set())
+                if source_cells & target_cells:
+                    continue
             distance = float(np.linalg.norm(target.first_ground_pos - source.last_ground_pos))
             maximum = (
                 config.kinematic_v_max_mps * gap / config.frame_rate_fps * config.p4b.kinematic_slack
@@ -142,6 +175,7 @@ def build_link_costs(segments: Iterable[Segment], config: P4Config) -> list[Edge
             if distance > maximum:
                 continue
             pose_term = 0.0
+            pose_distance = None
             if pose_gate > 0.0 or w_pose > 0.0:
                 pose_distance = descriptor_distance(
                     source.pose, target.pose,
@@ -153,12 +187,29 @@ def build_link_costs(segments: Iterable[Segment], config: P4Config) -> list[Edge
                     if pose_gate > 0.0 and pose_distance > pose_gate:
                         continue
                     pose_term = w_pose * pose_distance
+            posture_term = 0.0
+            posture_gate = config.p4b.posture_stitch_max_z
+            if posture_gate > 0.0 or config.p4b.w_posture > 0.0:
+                posture_z = posture_distance_z(source.posture, target.posture)
+                if posture_z is not None:
+                    # F12: a stitch between clearly different builds is forbidden on
+                    # the billboard stature/shape too — this key matures on the
+                    # facing pairs where the triangulated descriptor stays immature.
+                    if posture_gate > 0.0 and posture_z[0] > posture_gate:
+                        continue
+                    posture_term = config.p4b.w_posture * posture_z[0]
+            if long_bridge and config.p4b.occupancy_bridge_require_pose:
+                # A long bridge on kinematics alone is how chimeras happen; demand
+                # positive body-shape evidence (abstaining descriptors don't count).
+                if pose_distance is None or pose_gate <= 0.0 or pose_distance > pose_gate:
+                    continue
             cost = (
                 config.p4b.w_temporal * gap
                 + config.p4b.w_spatial * distance
                 + _role_penalty(source.dominant_role, target.dominant_role, config)
                 + config.p4b.velocity_continuity_weight * velocity_continuity_cost(source, target)
                 + pose_term
+                + posture_term
             )
             edges.append(Edge(source.seg_id, target.seg_id, cost, gap, distance))
     return edges

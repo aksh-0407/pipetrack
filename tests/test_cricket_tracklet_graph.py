@@ -518,3 +518,118 @@ def test_short_fragments_are_demoted_and_trajectory_attach_recovers_them():
     assert attached >= 4  # the shattered cam_01 fragments joined the binding
     stray_chunks = [k for k in solution.binding_of_chunk if k[1] == "cam_01_trk_stray"]
     assert not stray_chunks  # demoted: no binding id for a 20-frame stray
+
+
+# ----------------------------------------------------- F8 cold-start robustness
+
+def _observe_three_players(builder: TrackletGraphBuilder, frames: int = 80,
+                           noise: float = 0.05, seed: int = 11) -> None:
+    # Mutual isolation 2.5 m: fails the strict 3.0 m anchor gate but passes a
+    # relaxed 2.0 m gate -> exactly the crowded cold-start regime F8 targets.
+    rng = np.random.default_rng(seed)
+    pos = {"A": np.array([0.0, 0.0]), "B": np.array([2.5, 0.0]), "C": np.array([5.0, 0.0])}
+    for frame in range(frames):
+        dets: dict[str, list[Detection3]] = {"cam_01": [], "cam_04": []}
+        for index, name in enumerate(("A", "B", "C")):
+            for cam_id in ("cam_01", "cam_04"):
+                noisy = pos[name] + rng.normal(0.0, noise, size=2)
+                dets[cam_id].append(
+                    _detection(cam_id, index, noisy, f"{cam_id}_trk_{name}")
+                )
+        builder.observe_frame(frame, dets)
+
+
+def test_anchor_relaxation_rescues_crowded_calibration():
+    strict = TrackletGraphBuilder(_graph_config(), PROJECTIONS)
+    _observe_three_players(strict)
+    calibration = strict.harvest_calibration()
+    assert strict.diagnostics.get("calibration_fell_back_to_defaults") == 1
+    assert calibration.anchor_pair_count < 3
+
+    relaxed = TrackletGraphBuilder(
+        _graph_config(anchor_relax_enabled=True), PROJECTIONS
+    )
+    _observe_three_players(relaxed)
+    calibration = relaxed.harvest_calibration()
+    assert relaxed.diagnostics.get("calibration_anchor_relaxed") == 1
+    assert relaxed.diagnostics.get("calibration_fell_back_to_defaults") is None
+    assert calibration.anchor_pair_count >= 3
+    assert calibration.distributions["ground_dist_m"].fitted
+
+
+def test_calibration_prior_fallback_when_anchor_starved(tmp_path):
+    prior = fit_cue_calibration(
+        same_samples={"ground_maha": list(np.random.default_rng(0).normal(1, 0.3, 100))},
+        diff_samples={"ground_maha": list(np.random.default_rng(1).normal(5, 1.0, 100))},
+        anchor_pair_count=5, diff_pair_count=5,
+    )
+    path = tmp_path / "prior_calibration.json"
+    prior.save(path)
+
+    builder = TrackletGraphBuilder(
+        _graph_config(calibration_fallback_path=str(path)), PROJECTIONS
+    )
+    _observe_two_players(builder)  # only 2 anchor pairs even when relaxed
+    calibration = builder.harvest_calibration()
+    assert builder.diagnostics.get("calibration_used_prior") == 1
+    assert calibration.distributions["ground_maha"].fitted
+    assert calibration.anchor_pair_count < 3  # honest local anchor count reported
+
+
+# ----------------------------------------------------- F11 shape corroboration
+
+def _skeleton_points(offset=(0.0, 0.0), scale=1.0):
+    """A plausible upright 3D skeleton (COCO-17, metres) at a ground offset."""
+    base = np.array([
+        [0.0, 0.0, 1.72], [0.03, 0.02, 1.75], [-0.03, 0.02, 1.75],
+        [0.07, 0.0, 1.73], [-0.07, 0.0, 1.73],
+        [0.18, 0.0, 1.48], [-0.18, 0.0, 1.48],
+        [0.25, 0.0, 1.20], [-0.25, 0.0, 1.20],
+        [0.28, 0.0, 0.92], [-0.28, 0.0, 0.92],
+        [0.11, 0.0, 0.95], [-0.11, 0.0, 0.95],
+        [0.12, 0.0, 0.52], [-0.12, 0.0, 0.52],
+        [0.13, 0.0, 0.08], [-0.13, 0.0, 0.08],
+    ])
+    pts = base.copy()
+    pts[:, 2] *= scale                       # taller/shorter build
+    pts[:, 0] += offset[0]
+    pts[:, 1] += offset[1]
+    return pts
+
+
+def _project_kp(P, points3d):
+    rows = []
+    for X in points3d:
+        h = P @ np.append(X, 1.0)
+        rows.append([h[0] / h[2], h[1] / h[2], 0.9])
+    return np.asarray(rows)
+
+
+def test_cluster_shape_descriptor_from_sampled_keypoints():
+    config = _graph_config(graph_shape_enabled=True, graph_shape_min_frames=4)
+    builder = TrackletGraphBuilder(config, PROJECTIONS)
+    _observe_two_players(builder)   # creates the chunks
+    truth = _skeleton_points()
+    # Inject sampled keypoints for player A's two chunks (cam_01 + cam_04).
+    for key, chunk in builder._chunks.items():
+        if key[1].endswith("_A"):
+            P = PROJECTIONS[key[0]]
+            for frame in range(0, 40, 5):
+                chunk.kp_samples[frame] = _project_kp(P, truth)
+    a_keys = [key for key in builder._chunks if key[1].endswith("_A")]
+    descriptor, stature, frames = builder._cluster_shape(a_keys)
+    assert frames >= 4
+    assert descriptor is not None and descriptor.is_defined()
+    assert stature is not None and abs(stature - 1.75) < 0.15
+
+
+def test_shape_pass_abstains_when_calibration_starved():
+    config = _graph_config(graph_shape_enabled=True)
+    builder = TrackletGraphBuilder(config, PROJECTIONS)
+    _observe_two_players(builder)
+    solution = builder.solve(CueCalibration())
+    # Two clusters cannot supply 4 same- and 4 diff-population samples: the pass
+    # must abstain (0 merges) rather than merge on an unfitted distribution.
+    assert solution is not None
+    assert builder.diagnostics.get("shape_merges", 0) == 0
+    assert len(solution.clusters) == 2      # nothing merged by shape

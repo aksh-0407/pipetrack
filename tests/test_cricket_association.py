@@ -134,3 +134,69 @@ def test_smooth_emit_feet_median_kills_spike_and_is_identity_safe():
 
     off = smooth_emit_feet(frames, P3AssociationConfig(foot_smooth_window=1))
     assert off[2]["cam_01"][0].emit_foot_px is None  # window=1 is a no-op
+
+
+def test_ground_contact_v3_prefers_halpe_feet():
+    import numpy as np
+    from pose_estimation.cricket.geometry import ground_contact_pixel_ex
+
+    bbox = [100.0, 100.0, 60.0, 200.0]  # bottom at y=300
+    kpts = np.zeros((17, 2))
+    conf = np.zeros(17)
+    # confident ankles a little above the bbox bottom
+    kpts[15] = [120.0, 285.0]; conf[15] = 0.9
+    kpts[16] = [140.0, 287.0]; conf[16] = 0.9
+    native = np.zeros((26, 2))
+    nconf = np.zeros(26)
+    native[:17] = kpts; nconf[:17] = conf
+    # heels/big toes lower than the ankles (true ground contact)
+    native[24] = [118.0, 296.0]; nconf[24] = 0.8   # left heel
+    native[20] = [124.0, 298.0]; nconf[20] = 0.8   # left big toe
+    native[25] = [138.0, 297.0]; nconf[25] = 0.8   # right heel
+    native[21] = [144.0, 299.0]; nconf[21] = 0.8   # right big toe
+
+    pixel, height, source = ground_contact_pixel_ex(
+        bbox, kpts, conf, mode="v3",
+        native_keypoints_px=native, native_confidence=nconf,
+    )
+    assert source == "foot_mid"
+    assert height == 0.02
+    # midpoint of the two per-foot (heel+toe) midpoints
+    left = (native[24] + native[20]) / 2
+    right = (native[25] + native[21]) / 2
+    assert np.allclose(pixel, (left + right) / 2)
+
+    # unconfident feet -> falls back to the v2 ankle stack
+    nconf[[20, 21, 24, 25]] = 0.1
+    pixel2, height2, source2 = ground_contact_pixel_ex(
+        bbox, kpts, conf, mode="v3",
+        native_keypoints_px=native, native_confidence=nconf,
+    )
+    assert source2 in ("ankle_mid", "ankle_planted")
+    assert height2 == 0.10
+
+    # no native block at all (COCO-17-only model) -> also v2 behaviour
+    pixel3, _h3, source3 = ground_contact_pixel_ex(bbox, kpts, conf, mode="v3")
+    assert source3 in ("ankle_mid", "ankle_planted")
+    assert np.allclose(pixel2, pixel3)
+
+
+def test_ground_contact_v3_striding_uses_planted_foot():
+    import numpy as np
+    from pose_estimation.cricket.geometry import ground_contact_pixel_ex
+
+    bbox = [100.0, 100.0, 60.0, 200.0]
+    kpts = np.zeros((17, 2)); conf = np.zeros(17)
+    native = np.zeros((26, 2)); nconf = np.zeros(26)
+    # left foot planted low, right foot lifted high mid-stride
+    native[24] = [118.0, 296.0]; nconf[24] = 0.9
+    native[20] = [124.0, 298.0]; nconf[20] = 0.9
+    native[25] = [138.0, 240.0]; nconf[25] = 0.9
+    native[21] = [144.0, 242.0]; nconf[21] = 0.9
+    pixel, _height, source = ground_contact_pixel_ex(
+        bbox, kpts, conf, mode="v3",
+        native_keypoints_px=native, native_confidence=nconf,
+    )
+    assert source == "foot_planted"
+    left = (native[24] + native[20]) / 2
+    assert np.allclose(pixel, left)

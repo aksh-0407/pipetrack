@@ -36,7 +36,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from pose_estimation.cricket.ground_kalman import RoleParams, SingerGroundKalman
-from pose_estimation.cricket.pose_shape import descriptor_distance
+from pose_estimation.cricket.pose_shape import descriptor_distance, posture_distance_z
 from scripts.association.associator import Correspondence
 from scripts.global_id.config import P4Config
 from scripts.global_id.global_track import CONFIRMED, DELETED, LOST, TENTATIVE, GlobalTrack
@@ -148,6 +148,36 @@ class TrackManager:
         self.tracks.append(track)
         self.diagnostics["local_owner_reentries"] += 1
 
+    def _measurement_R(
+        self, observation: Correspondence, *, for_gating: bool = False
+    ) -> np.ndarray | None:
+        """Per-measurement R from the P3 ground covariance (F10), eigenvalue-clamped.
+
+        None (fall back to the fixed role R) when the feature is off or the
+        observation carries no covariance. The clamp keeps a spuriously tiny GN
+        covariance from making the filter overconfident and a huge single-camera
+        one from being ignored entirely.
+        """
+
+        if not self.config.p4a.use_measurement_covariance:
+            return None
+        if for_gating and not self.config.p4a.use_measurement_covariance_for_gating:
+            return None
+        cov = observation.ground_cov
+        if cov is None:
+            return None
+        cov = np.asarray(cov, dtype=float) * self.config.p4a.r_scale
+        if cov.shape != (2, 2) or not np.isfinite(cov).all():
+            return None
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (cov + cov.T))
+        except np.linalg.LinAlgError:
+            return None
+        floor = self.config.p4a.r_floor_m ** 2
+        ceiling = self.config.p4a.r_ceiling_m ** 2
+        eigenvalues = np.clip(eigenvalues, floor, ceiling)
+        return eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+
     def _apply_match(self, observation: Correspondence, track: GlobalTrack, frame_index: int) -> None:
         """Full Kalman update from a correspondence's ground point."""
 
@@ -160,6 +190,8 @@ class TrackManager:
             single_camera=observation.single_camera,
             local_track_ids_by_cam=local_ids,
             pose_ema_rate=self.config.p4a.pose_descriptor_ema,
+            posture=observation.posture,
+            measurement_R=self._measurement_R(observation),
         )
 
     def _spawn(self, observation: Correspondence, frame_index: int) -> GlobalTrack:
@@ -184,6 +216,8 @@ class TrackManager:
         if observation.pose_descriptor is not None and observation.pose_descriptor.is_defined():
             track.pose_proportions = observation.pose_descriptor
             track.pose_update_count = 1
+        if observation.posture is not None and observation.posture.is_defined():
+            track.posture = observation.posture
         self.tracks.append(track)
         self._claim_local_ids(track, self._local_ids(observation), frame_index)
         self.diagnostics["tracks_spawned"] += 1
@@ -202,8 +236,9 @@ class TrackManager:
         for oi, observation in enumerate(observations):
             if not np.isfinite(observation.ground_xy).all():
                 continue
+            observation_R = self._measurement_R(observation, for_gating=True)
             for ti, track in enumerate(tracks):
-                mahalanobis = track.kalman.mahalanobis_sq(observation.ground_xy)
+                mahalanobis = track.kalman.mahalanobis_sq(observation.ground_xy, R=observation_R)
                 if mahalanobis <= self.config.p4a.chi2_gate_2dof:
                     # Pose is added INSIDE the gate only: it re-ranks candidates that
                     # geometry already admits, and contributes nothing (None distance)
@@ -224,6 +259,15 @@ class TrackManager:
                                 self.diagnostics["pose_gate_vetoes"] += 1
                                 continue
                             pose_penalty = self.config.p4a.pose_match_weight * distance
+                    posture_veto = self.config.p4a.posture_gate_veto_z
+                    if posture_veto > 0.0:
+                        # F6b: the billboard posture works on the facing pairs where
+                        # the triangulated descriptor cannot mature, so this veto
+                        # bites exactly on the clips where pose_gate_veto rarely fires.
+                        posture_z = posture_distance_z(track.posture, observation.posture)
+                        if posture_z is not None and posture_z[0] > posture_veto:
+                            self.diagnostics["posture_gate_vetoes"] += 1
+                            continue
                     cost[oi, ti] = mahalanobis + pose_penalty
         rows, columns = linear_sum_assignment(cost)
         matches: list[tuple[int, int]] = []
@@ -253,7 +297,9 @@ class TrackManager:
             covered = cams_hit.get(id(track))
             if not covered or covered & observation_cams:
                 continue  # not updated this frame, or would double-book a camera
-            mahalanobis = track.kalman.mahalanobis_sq(observation.ground_xy)
+            mahalanobis = track.kalman.mahalanobis_sq(
+                observation.ground_xy, R=self._measurement_R(observation, for_gating=True)
+            )
             if mahalanobis <= self.config.p4a.chi2_gate_2dof and mahalanobis < best_distance:
                 best, best_distance = track, mahalanobis
         return best
@@ -279,7 +325,8 @@ class TrackManager:
             propagation_steps = max(0, frame_index - track.prediction_frame)
             x_pred, P_pred = track.kalman.propagate_state(propagation_steps)
             innovation = np.asarray(ground_xy, dtype=float) - x_pred[:2]
-            S = H @ P_pred @ H.T + track.kalman.R
+            reentry_R = self._measurement_R(observation, for_gating=True)
+            S = H @ P_pred @ H.T + (track.kalman.R if reentry_R is None else reentry_R)
             try:
                 mahalanobis = float(innovation @ np.linalg.solve(S, innovation))
             except np.linalg.LinAlgError:
@@ -305,6 +352,12 @@ class TrackManager:
                 )
                 if pose_distance is not None and pose_distance > pose_veto:
                     self.diagnostics["reentry_pose_rejects"] += 1
+                    continue
+            posture_veto = self.config.p4a.reentry_posture_max_z
+            if posture_veto > 0.0:
+                posture_z = posture_distance_z(track.posture, observation.posture)
+                if posture_z is not None and posture_z[0] > posture_veto:
+                    self.diagnostics["reentry_posture_rejects"] += 1
                     continue
             candidates.append((mahalanobis, track.global_player_id or "", track, x_pred, P_pred))
         if not candidates:
@@ -377,7 +430,10 @@ class TrackManager:
                 local_ids = self._local_ids(observation)
                 if (
                     has_ground
-                    and track.kalman.mahalanobis_sq(observation.ground_xy)
+                    and track.kalman.mahalanobis_sq(
+                        observation.ground_xy,
+                        R=self._measurement_R(observation, for_gating=True),
+                    )
                     <= self.config.p4a.local_identity_mahalanobis_gate
                 ):
                     self._apply_match(observation, track, frame_index)
@@ -407,7 +463,10 @@ class TrackManager:
             if track is None:
                 continue
             self._revive_owned_track(track, frame_index)  # no-op if already active
-            mahalanobis = track.kalman.mahalanobis_sq(observation.ground_xy)
+            mahalanobis = track.kalman.mahalanobis_sq(
+                observation.ground_xy,
+                R=self._measurement_R(observation, for_gating=True),
+            )
             if mahalanobis <= self.config.p4a.local_identity_mahalanobis_gate:
                 self._apply_match(observation, track, frame_index)
             else:

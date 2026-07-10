@@ -82,7 +82,14 @@ class CameraTracker:
                     within = (maha_ok or dist <= floor) and dist <= self.config.gate_max_distance_px
                     if not within:
                         continue
-                iou_cost = 1.0 - iou
+                    # C1: the gate used to be dead code — iou_cost stayed 1.0, which
+                    # no acceptance path can pass, so a fast mover that outruns his
+                    # own bbox (the sprinting bowler) always fragmented. A passed
+                    # gate now yields a normalized motion cost (< 1 so IoU-only
+                    # paths can accept it; scaled by distance so nearer is better).
+                    iou_cost = min(dist / max(floor, 1e-6), 1.0) * 0.9
+                else:
+                    iou_cost = 1.0 - iou
                 if use_pose:
                     repr_vec = t.gallery_repr()
                     pose_cost = (

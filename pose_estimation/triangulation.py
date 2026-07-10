@@ -87,14 +87,54 @@ def reprojection_errors_for_point(
     return errors
 
 
+def depth_signs(point_xyz: np.ndarray, projection_matrices: np.ndarray) -> np.ndarray:
+    """Sign of the projective depth of one 3D point in each view (+1 in front, -1 behind).
+
+    Primary test: sign agreement of the homogeneous scale ``w`` with that of the
+    world origin (the pitch centre — in front of every camera on this rig), which is
+    invariant to ANY projection-matrix convention (scale sign, world handedness).
+    Falls back to the Hartley-Zisserman ``sign(det M) * sign(w)`` formula when a
+    camera sits on the origin (synthetic rigs), which assumes a proper rotation.
+    """
+
+    point_xyz = np.asarray(point_xyz, dtype=float)
+    projections = np.asarray(projection_matrices, dtype=float)
+    signs = np.zeros(projections.shape[0], dtype=float)
+    if not np.isfinite(point_xyz).all():
+        return signs
+    homogeneous = np.append(point_xyz, 1.0)
+    # Reference-point form: a point is in front of a camera iff its homogeneous
+    # scale w shares the sign of a KNOWN in-front point's w — the convention
+    # factor (matrix scale, world handedness) cancels. The world origin is the
+    # pitch centre on this rig, in front of every camera; when a camera sits ON
+    # the reference (w_ref ~ 0, synthetic rigs), fall back to the det(M) formula,
+    # which assumes a proper (right-handed) rotation.
+    reference = np.array([0.0, 0.0, 0.0, 1.0])
+    for index, projection in enumerate(projections):
+        w = float(projection[2] @ homogeneous)
+        w_ref = float(projection[2] @ reference)
+        if abs(w_ref) > 1e-9:
+            signs[index] = np.sign(w) * np.sign(w_ref)
+        else:
+            det_m = float(np.linalg.det(projection[:, :3]))
+            signs[index] = np.sign(det_m) * np.sign(w)
+    return signs
+
+
 def ransac_triangulate_point(
     points_xy: np.ndarray,
     projection_matrices: np.ndarray,
     confidences: np.ndarray | None = None,
     reprojection_threshold_px: float = 10.0,
     min_views: int = 2,
+    cheirality: bool = False,
 ) -> TriangulationResult:
-    """Triangulate with pairwise RANSAC and re-fit on inlier views."""
+    """Triangulate with pairwise RANSAC and re-fit on inlier views.
+
+    ``cheirality=True`` additionally requires the point to lie in front of a view for
+    that view to count as an inlier, and discards candidate solutions behind either
+    seed camera (flag-gated: off reproduces the legacy behaviour byte-for-byte).
+    """
 
     points_xy = np.asarray(points_xy, dtype=float)
     projection_matrices = np.asarray(projection_matrices, dtype=float)
@@ -127,8 +167,13 @@ def ransac_triangulate_point(
             confidences[[left, right]],
             min_views=2,
         )
+        if cheirality and np.isfinite(candidate_point).all():
+            if np.any(depth_signs(candidate_point, projection_matrices[[left, right]]) <= 0):
+                continue  # reconstruction behind a seed camera is geometrically invalid
         errors = reprojection_errors_for_point(candidate_point, points_xy, projection_matrices)
         inliers = np.isfinite(errors) & (errors <= reprojection_threshold_px) & (confidences > 0)
+        if cheirality:
+            inliers &= depth_signs(candidate_point, projection_matrices) > 0
         if int(inliers.sum()) < min_views:
             continue
         mean_error = float(np.nanmean(errors[inliers]))
@@ -150,6 +195,8 @@ def ransac_triangulate_point(
         best_point = triangulate_point_dlt(points_xy, projection_matrices, confidences, min_views=min_views)
         errors = reprojection_errors_for_point(best_point, points_xy, projection_matrices)
         best_inliers = np.isfinite(errors) & (errors <= reprojection_threshold_px) & (confidences > 0)
+        if cheirality:
+            best_inliers &= depth_signs(best_point, projection_matrices) > 0
 
     errors = reprojection_errors_for_point(best_point, points_xy, projection_matrices)
     if int(best_inliers.sum()) == 0:
@@ -159,11 +206,72 @@ def ransac_triangulate_point(
     return TriangulationResult(best_point, confidence, errors, best_inliers)
 
 
+def point_covariance_3d(
+    point_xyz: np.ndarray,
+    points_xy: np.ndarray,
+    projection_matrices: np.ndarray,
+    confidences: np.ndarray | None = None,
+    inlier_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """3x3 covariance of a triangulated point, linearized at the solution (F9b).
+
+    ``cov = sigma^2 (J^T W J)^{-1}`` with J the stacked 2x3 reprojection Jacobians of
+    the inlier views and ``sigma^2`` the weighted residual variance — the standard
+    first-order uncertainty of a multi-view triangulation. Elongated along the ray
+    direction on low-parallax (facing-pair) view sets, which is exactly the signal a
+    downstream consumer needs to distrust depth there. None when under-determined.
+    """
+
+    point_xyz = np.asarray(point_xyz, dtype=float)
+    points_xy = np.asarray(points_xy, dtype=float)
+    projections = np.asarray(projection_matrices, dtype=float)
+    if not np.isfinite(point_xyz).all():
+        return None
+    n = points_xy.shape[0]
+    if confidences is None:
+        confidences = np.ones(n, dtype=float)
+    confidences = np.asarray(confidences, dtype=float)
+    if inlier_mask is None:
+        inlier_mask = np.isfinite(points_xy).all(axis=1)
+    homogeneous_point = np.append(point_xyz, 1.0)
+
+    JTJ = np.zeros((3, 3), dtype=float)
+    weighted_ssr = 0.0
+    views = 0
+    for i in range(n):
+        if not inlier_mask[i] or not np.isfinite(points_xy[i]).all():
+            continue
+        P = projections[i]
+        h = P @ homogeneous_point
+        if abs(h[2]) < 1e-9:
+            continue
+        projected = h[:2] / h[2]
+        residual = projected - points_xy[i]
+        jac = np.zeros((2, 3), dtype=float)
+        for axis in range(3):
+            column = P[:, axis]
+            jac[:, axis] = (column[:2] * h[2] - h[:2] * column[2]) / (h[2] ** 2)
+        weight = float(max(confidences[i], 1e-3))
+        JTJ += weight * jac.T @ jac
+        weighted_ssr += weight * float(residual @ residual)
+        views += 1
+    if views < 2:
+        return None
+    dof = max(2 * views - 3, 1)
+    sigma_sq = max(weighted_ssr / dof, 1e-6)
+    try:
+        cov = sigma_sq * np.linalg.inv(JTJ + 1e-9 * np.eye(3))
+    except np.linalg.LinAlgError:
+        return None
+    return cov if np.isfinite(cov).all() else None
+
+
 def triangulate_skeleton_ransac(
     keypoints_by_view: np.ndarray,
     projection_matrices: np.ndarray,
     reprojection_threshold_px: float = 10.0,
     min_views: int = 2,
+    cheirality: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Triangulate a skeleton from shape (V, J, 3) keypoints."""
 
@@ -186,6 +294,7 @@ def triangulate_skeleton_ransac(
             keypoints_by_view[:, joint_index, 2],
             reprojection_threshold_px=reprojection_threshold_px,
             min_views=min_views,
+            cheirality=cheirality,
         )
         points3d[joint_index] = result.point_xyz
         confidences[joint_index] = result.confidence
@@ -202,6 +311,15 @@ _COCO17_PARENT = {
     9: 7, 10: 8,                      # wrists <- elbows
     11: 12, 13: 11, 14: 12,           # hips/knees
     15: 13, 16: 14,                   # ankles <- knees
+}
+
+# Halpe-26 = COCO-17 + head/neck/hip + big toes/small toes/heels (F15: the feet are
+# true ground-contact landmarks, so triangulating them tightens the 3D ground story).
+_HALPE26_PARENT = {
+    **_COCO17_PARENT,
+    17: 0, 18: 0, 19: 11,             # head <- nose, neck <- nose, hip-mid <- l_hip
+    20: 15, 22: 15, 24: 15,           # left big/small toe + heel <- left ankle
+    21: 16, 23: 16, 25: 16,           # right big/small toe + heel <- right ankle
 }
 
 
@@ -263,6 +381,7 @@ def fill_from_skeletal_prior(
     reference_pose: np.ndarray,
     *,
     fill_confidence: float = 0.15,
+    parents: dict[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Place a still-missing joint using its parent + a bone vector from a reference pose.
 
@@ -276,7 +395,10 @@ def fill_from_skeletal_prior(
     points = np.asarray(points_xyz, dtype=float).copy()
     conf = np.asarray(confidences, dtype=float).copy()
     reference = np.asarray(reference_pose, dtype=float)
-    for child, parent in _COCO17_PARENT.items():
+    joint_count = points.shape[0]
+    for child, parent in (parents or _COCO17_PARENT).items():
+        if child >= joint_count or parent >= joint_count:
+            continue
         if np.isfinite(points[child]).all():
             continue
         if not np.isfinite(points[parent]).all():
@@ -291,6 +413,50 @@ def fill_from_skeletal_prior(
         points[child] = points[parent] + bone
         conf[child] = fill_confidence
     return points, conf
+
+
+def butterworth_smooth(
+    sequence_xyz: np.ndarray,
+    *,
+    fps: float = 50.0,
+    cutoff_hz: float = 6.0,
+    order: int = 4,
+) -> np.ndarray:
+    """Zero-phase low-pass (Butterworth + filtfilt) over a T x J x 3 sequence.
+
+    The offline / export-quality alternative to the causal EMA: no phase lag, so a
+    whole-delivery trajectory keeps its timing while frame-to-frame noise above
+    ``cutoff_hz`` is removed (the sports-capture standard, cf. Pose2Sim). Applied per
+    joint per axis over each contiguous finite segment; segments too short for the
+    filter's padding are left untouched. NaN gaps are preserved, never bridged.
+    """
+
+    from scipy.signal import butter, filtfilt
+
+    sequence_xyz = np.asarray(sequence_xyz, dtype=float)
+    if sequence_xyz.ndim != 3 or sequence_xyz.shape[2] != 3:
+        raise ValueError("sequence_xyz must have shape (T, J, 3)")
+    nyquist = 0.5 * fps
+    if not 0.0 < cutoff_hz < nyquist:
+        raise ValueError(f"cutoff_hz must be in (0, {nyquist})")
+    b, a = butter(order, cutoff_hz / nyquist, btype="low")
+    pad = 3 * max(len(a), len(b))  # filtfilt's default padlen
+
+    smoothed = sequence_xyz.copy()
+    frames, joints, _ = sequence_xyz.shape
+    for joint in range(joints):
+        finite = np.isfinite(sequence_xyz[:, joint]).all(axis=1)
+        start = None
+        for t in range(frames + 1):
+            inside = t < frames and finite[t]
+            if inside and start is None:
+                start = t
+            elif not inside and start is not None:
+                if t - start > pad:
+                    segment = sequence_xyz[start:t, joint]
+                    smoothed[start:t, joint] = filtfilt(b, a, segment, axis=0)
+                start = None
+    return smoothed
 
 
 def confidence_ema_smooth(

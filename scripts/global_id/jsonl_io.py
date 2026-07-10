@@ -9,7 +9,7 @@ from typing import Iterable
 import numpy as np
 
 from pose_estimation.cricket.contract import validate_group1_frame
-from pose_estimation.cricket.pose_shape import PoseProportions
+from pose_estimation.cricket.pose_shape import PoseProportions, PostureAggregate
 from scripts.association.associator import Correspondence, Detection3
 from scripts.association.jsonl_io import RecordsByFrame
 from scripts.tracking.runner import PredictionFile
@@ -86,6 +86,11 @@ def row_to_correspondences(row: dict, camera_records: dict[str, dict]) -> list[C
                 ),
                 pose_descriptor=PoseProportions.from_json(cluster.get("pose_descriptor")),
                 binding_id=cluster.get("binding_id"),
+                posture=PostureAggregate.from_json(cluster.get("posture")),
+                ground_cov=(
+                    np.asarray(cluster["ground_cov"], dtype=float)
+                    if cluster.get("ground_cov") is not None else None
+                ),
             )
         )
     return correspondences

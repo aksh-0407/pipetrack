@@ -212,6 +212,36 @@ panel read jointly.
   umpire-recall probe on 1–2 hard deliveries first. Any accepted P1 swap triggers a full
   rebaseline (v6.4); v6.0-vs-v5 panel diff also feeds `wip/model_comparison.md` (X-vs-L study).
 
+### Wave 6 — role-focused output shaping (user directive; LAST wave)
+
+The production output prioritizes **bowler, striker, non-striker, wicketkeeper**. When
+low-confidence poses / low-confidence tracking of peripheral identities (part-visible
+umpires, distant fielders — today often extrapolated from priors) measurably hinder the
+final output (identity churn, chimera fuel, render noise), suppress rather than guess:
+
+- Per-identity output confidence score (pose confidence x track stability x view count);
+  below a floor, drop the identity from the emitted streams/render (config-gated tiers:
+  core roles always kept, fielders/umpires droppable).
+- Skeletal-prior extrapolation (T-2) disabled for droppable identities — no fabricated limbs
+  on peripheral players.
+- Role source: P5 roles (fixed H2 sign + fused-track caution) + F5 online proxy.
+- Includes the deferred H1 (P5 direction inference from fused tracks) since roles become
+  load-bearing here.
+
+### FR — external review fixes (landed mid-campaign)
+
+See [review-triage.md](review-triage.md): C1/C2 (P2 fragmentation producers), C3/C4 (Singer
+role-switch), C5 (single-cam emit), C6 (frame-aware fills), H2/H3/H5/H6/H7 + minor. C1-C3,
+H2/H3/H5/H6 are unflagged BUG FIXES — flags-off byte-identity vs v6.0 is intentionally
+retired from the FR batch onward; the grand-analysis best stack re-baselines.
+
+### Final deliverable ordering (user directive)
+
+After Waves 0-4 + FR: the grand cross-wave analysis composes the best stack, A/Bs it as one
+run, cuts `configs/v7/` + driver defaults so the NEW logical order (P1 -> P1.5 -> P2 -> P3 ->
+P3.5 -> P4 -> P5 -> 3D -> render) is the followed default, and updates `phases.md` to mark
+it current. Only then Wave 5 probes (tiled detection) and Wave 6.
+
 ### Parked (logged in fixes-log with rationale)
 Detector fine-tune (needs labels+training), self-supervised association (research-scale),
 SmoothNet (marginal after P1.5), GT labeling → MOTA/IDF1/HOTA (needs human labeling — flagged

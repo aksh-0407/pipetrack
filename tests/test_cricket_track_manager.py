@@ -301,3 +301,75 @@ def test_ownership_claim_expires_and_transfers():
     )
     assert accepted == {"cam_01": "cam_01_trk_0001"}
     assert manager.diagnostics["local_track_ownership_transfers"] == 1
+
+
+def _posture(head_top: float, torso: float):
+    from pose_estimation.cricket.pose_shape import PostureAggregate
+    return PostureAggregate(
+        median={"head_top_m": head_top, "torso_len_m": torso},
+        se={"head_top_m": 0.01, "torso_len_m": 0.01},
+        count={"head_top_m": 50, "torso_len_m": 50},
+    )
+
+
+def test_posture_gate_vetoes_wrong_build_candidate():
+    # Track built from a TALL posture; a nearby observation with a clearly SHORT
+    # posture and a different local id must not capture the track when the
+    # billboard-posture veto is armed (F6b).
+    tall, short = _posture(1.85, 0.55), _posture(1.55, 0.42)
+
+    def scenario(veto_z: float) -> str:
+        manager = TrackManager(_config(confirm_hits=2, posture_gate_veto_z=veto_z))
+        for frame in range(2):
+            obs = replace(_correspondence(frame), posture=tall)
+            manager.update([obs], frame)
+        assert manager.tracks[0].global_player_id == "P001"
+        intruder_det = Detection3(
+            "cam_02", 0, [100.0, 100.0, 40.0, 100.0], np.zeros((17, 2)),
+            np.ones(17), 0.8, "cam_02_trk_0009",
+        )
+        intruder = Correspondence(
+            2, {"cam_02": intruder_det}, np.asarray([0.3, 0.0]), 0.8, False,
+            posture=short,
+        )
+        manager.update([intruder], 2)
+        matched = [t for t in manager.tracks if t.global_player_id == "P001"]
+        return "captured" if matched and matched[0].last_frame == 2 else "spawned"
+
+    assert scenario(0.0) == "captured"        # veto off: geometry admits the intruder
+    assert scenario(3.0) == "spawned"          # veto on: wrong build cannot capture
+
+
+def test_posture_abstains_when_missing():
+    manager = TrackManager(_config(confirm_hits=2, posture_gate_veto_z=3.0))
+    for frame in range(2):
+        manager.update([_correspondence(frame)], frame)   # no posture anywhere
+    obs = _correspondence(2, xy=(0.05, 0.0))
+    manager.update([obs], 2)
+    # No posture -> the veto must abstain and normal matching proceed.
+    assert manager.tracks[0].last_frame == 2
+    assert manager.diagnostics.get("posture_gate_vetoes", 0) == 0
+
+
+def test_measurement_R_clamps_and_gates(tmp_path):
+    import numpy as np
+
+    manager = TrackManager(_config(
+        confirm_hits=2, use_measurement_covariance=True,
+        r_floor_m=0.15, r_ceiling_m=2.0,
+    ))
+    # tiny GN covariance -> floored; huge single-cam covariance -> ceilinged
+    tiny = replace(_correspondence(0), ground_cov=np.eye(2) * 1e-6)
+    huge = replace(_correspondence(0), ground_cov=np.eye(2) * 100.0)
+    R_tiny = manager._measurement_R(tiny)
+    R_huge = manager._measurement_R(huge)
+    assert np.allclose(R_tiny, np.eye(2) * 0.15 ** 2)
+    assert np.allclose(R_huge, np.eye(2) * 2.0 ** 2)
+    # anisotropy survives the clamp (eigenvectors preserved)
+    aniso = replace(_correspondence(0), ground_cov=np.array([[1.0, 0.0], [0.0, 0.09]]))
+    R_aniso = manager._measurement_R(aniso)
+    assert R_aniso[0, 0] > R_aniso[1, 1] > 0
+    # missing covariance or flag off -> None (legacy role R)
+    assert manager._measurement_R(_correspondence(0)) is None
+    off = TrackManager(_config(confirm_hits=2))
+    assert off._measurement_R(huge) is None

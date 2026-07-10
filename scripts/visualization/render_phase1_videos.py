@@ -84,6 +84,7 @@ class VideoSettings:
     use_ffmpeg: bool
     ball_trail_frames: int
     show: str
+    letterbox_tiles: bool = False
 
 
 import functools
@@ -217,6 +218,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=["all", "per-camera", "mosaic", "ground"], default="all")
     parser.add_argument("--show", choices=["p2", "p3", "p4"], default=None)
+    parser.add_argument("--letterbox-tiles", action="store_true",
+                        help="Aspect-correct wide tiles (C07) by bottom-padding instead of stretching (F2/R-1).")
     parser.add_argument("--crf", type=int, default=22)
     parser.add_argument("--preset", default="veryfast")
     parser.add_argument("--no-ffmpeg", dest="use_ffmpeg", action="store_false")
@@ -661,9 +664,21 @@ def render_feed_frame(
     show: str = "p4",
     mirror: bool = False,
     ghosts: list[Ghost] | None = None,
+    letterbox: bool = False,
 ) -> np.ndarray:
     output_width, output_height = output_size
     source_height, source_width = image.shape[:2]
+    if letterbox:
+        # F2/R-1: a heterogeneous camera (C07 is ~3775x960) stretched into a 16:9
+        # tile distorts the picture. Pad the BOTTOM of the source to the tile
+        # aspect before the resize — coordinates are untouched (padding is below
+        # every player), the resize becomes aspect-preserving, and overlays stay
+        # aligned with the (now undistorted) picture.
+        target_height = int(round(source_width * output_height / output_width))
+        if target_height > source_height:
+            pad = np.zeros((target_height - source_height, source_width, 3), dtype=image.dtype)
+            image = np.concatenate([image, pad], axis=0)
+            source_height = target_height
     frame = cv2.resize(image, (output_width, output_height), interpolation=cv2.INTER_AREA)
     if mirror:
         # Flip the PICTURE first, then draw every overlay on mirrored
@@ -1378,6 +1393,7 @@ def render_mosaic_video(
                         show=settings.show,
                         mirror=camera_id in layout.mirrored,
                         ghosts=ghosts,
+                        letterbox=settings.letterbox_tiles,
                     )
                     total_players += len(record.get("players", []))
                     for player in record.get("players", []):
@@ -1640,6 +1656,7 @@ def main() -> int:
         use_ffmpeg=args.use_ffmpeg,
         ball_trail_frames=max(0, args.ball_trail_frames),
         show=show,
+        letterbox_tiles=args.letterbox_tiles,
     )
 
     selected_cameras = args.cameras or sorted(prediction_paths_by_camera)

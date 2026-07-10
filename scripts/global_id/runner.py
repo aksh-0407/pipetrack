@@ -34,7 +34,10 @@ from scripts.global_id.stitching import (
     solve_flow,
 )
 from pose_estimation.cricket.geometry import upper_body_ground_estimate
+from scripts.global_id.role_proxy import OnlineRoleProxy
 from scripts.global_id.track_manager import TrackManager
+from scripts.tracking.calibration import current_calibration_dir
+from scripts.visualization.mosaic_layout import load_pitch_axis
 from scripts.tracking.calibration import (
     build_ground_calibrators,
     load_image_sizes_from_drive,
@@ -84,6 +87,21 @@ def run_global_id(
         raise ValueError(f"P3 correspondences are missing {len(missing_rows)} prediction frames")
 
     manager = TrackManager(config)
+    role_proxy: OnlineRoleProxy | None = None
+    if config.p4a.online_role_proxy:
+        # F5: role-aware Singer dynamics during tracking (bowler agile, umpire
+        # near-static) instead of every player running the generic model.
+        pitch_axis = load_pitch_axis(
+            current_calibration_dir(drive_root, infer_match_id(delivery_id))
+            / "pitch_calibration_config.json"
+        )
+        role_proxy = OnlineRoleProxy(
+            pitch_axis,
+            frame_rate_fps=config.frame_rate_fps,
+            min_track_frames=config.p4a.proxy_min_track_frames,
+            bowler_min_speed_mps=config.p4a.proxy_bowler_min_speed_mps,
+            static_speed_max_mps=config.p4a.proxy_static_speed_max_mps,
+        )
     # Keep object references outside contract records for final ID backfill.
     player_track_references: list[tuple[dict, GlobalTrack]] = []
     ground_observations: list[tuple[GlobalTrack, int, np.ndarray]] = []
@@ -91,6 +109,8 @@ def run_global_id(
         camera_records = records_by_frame[frame_index]
         correspondences = row_to_correspondences(correspondence_by_frame[frame_index], camera_records)
         assignments = manager.update(correspondences, frame_index)
+        if role_proxy is not None:
+            role_proxy.observe(manager, frame_index)
         touched: set[tuple[str, int]] = set()
         for correspondence in correspondences:
             track = assignments.get(correspondence.cluster_id)
@@ -245,15 +265,30 @@ def run_global_id(
     # Accumulated pose-shape descriptor per P4a id, so stitching can require
     # body-shape agreement before merging two fragments (ID-2 / ghost-verification).
     pose_by_id: dict[str, object] = {}
+    posture_by_id: dict[str, object] = {}
     for track in list(manager.tracks) + list(manager.deleted_pool):
+        if track.global_player_id is None:
+            continue
         if (
-            track.global_player_id is not None
-            and track.pose_proportions is not None
+            track.pose_proportions is not None
             and track.pose_update_count >= config.p4a.pose_min_updates
         ):
             pose_by_id[track.global_player_id] = track.pose_proportions
-    segments = extract_segments(records, ground_positions, pose_by_id)
-    edges = build_link_costs(segments, config) if config.p4b.enabled else []
+        if track.posture is not None:
+            posture_by_id[track.global_player_id] = track.posture
+    segments = extract_segments(records, ground_positions, pose_by_id, posture_by_id)
+    # (camera, frame) occupancy per identity for the F6 occupancy-licensed bridge
+    # (same cells remap_ids uses for its merge veto).
+    occupancy_by_id: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    if config.p4b.occupancy_bridge:
+        for record in records:
+            frame_index = int(record["frame_index"])
+            camera_id = str(record.get("camera_id", "unknown"))
+            for player in record.get("players", []):
+                player_id = player.get("global_player_id")
+                if player_id:
+                    occupancy_by_id[player_id].add((camera_id, frame_index))
+    edges = build_link_costs(segments, config, occupancy_by_id) if config.p4b.enabled else []
     links = solve_flow(segments, edges, config) if config.p4b.enabled else {}
     switch_report = remap_ids(records, segments, links) if config.p4b.enabled else []
 

@@ -133,7 +133,10 @@ def stabilize_camera_file(input_path: Path, output_path: Path, camera_id: str,
     with output_path.open("w", encoding="utf-8") as out:
         for rec in records:
             validate_group1_frame(rec)
-            out.write(json.dumps(rec, sort_keys=True) + "\n")
+            # Preserve the parsed key order (no sort_keys): with the stage disabled
+            # the output is byte-identical to ANY input regardless of how P1 ordered
+            # its keys, and with it enabled the diff shows only the smoothed values.
+            out.write(json.dumps(rec) + "\n")
 
     w = jitter_acc["weight"] or 1.0
     return {

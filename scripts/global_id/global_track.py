@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from pose_estimation.cricket.ground_kalman import SingerGroundKalman
-from pose_estimation.cricket.pose_shape import PoseProportions, merge_descriptor
+from pose_estimation.cricket.pose_shape import PoseProportions, PostureAggregate, merge_descriptor
 
 TENTATIVE = "tentative"
 CONFIRMED = "confirmed"
@@ -33,6 +33,9 @@ class GlobalTrack:
     last_bbox_xywh_px: list[float] | None = None
     pose_proportions: PoseProportions | None = None
     pose_update_count: int = 0
+    # Binding-level billboard posture (F6b): whole-delivery pooled aggregate from
+    # P3, so the latest observation's aggregate simply replaces the stored one.
+    posture: PostureAggregate | None = None
     single_camera: bool = False
     local_track_ids_by_cam: dict[str, str] = field(default_factory=dict)
     local_track_id_history: set[tuple[str, str]] = field(default_factory=set, repr=False)
@@ -77,8 +80,10 @@ class GlobalTrack:
         single_camera: bool,
         local_track_ids_by_cam: dict[str, str],
         pose_ema_rate: float = 0.15,
+        posture: PostureAggregate | None = None,
+        measurement_R: np.ndarray | None = None,
     ) -> None:
-        self.kalman.update(np.asarray(ground_xy, dtype=float))
+        self.kalman.update(np.asarray(ground_xy, dtype=float), R=measurement_R)
         self.last_ground_pos = np.asarray(ground_xy, dtype=float).copy()
         self.last_frame = frame_index
         self.prediction_frame = frame_index
@@ -90,6 +95,8 @@ class GlobalTrack:
                 self.pose_proportions, pose_descriptor, rate=pose_ema_rate
             )
             self.pose_update_count += 1
+        if posture is not None and posture.is_defined():
+            self.posture = posture
         self.single_camera = single_camera
         self._register_local_ids(local_track_ids_by_cam)
         if self.state in {LOST, DELETED}:

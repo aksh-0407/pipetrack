@@ -453,7 +453,10 @@ class PostureAccumulator:
         for name, value in sample.values.items():
             if not np.isfinite(value):
                 continue
-            if name in _UPRIGHT_ONLY and not sample.upright:
+            # H3: drop upright-only quantities only when the sample was MEASURED
+            # as not standing. "Could not determine" (feet cut off — exactly the
+            # height-plane population) must still accumulate stature evidence.
+            if name in _UPRIGHT_ONLY and sample.upright_known and not sample.upright:
                 continue
             self.samples.setdefault(name, []).append(float(value))
 

@@ -57,7 +57,7 @@ from scripts.pipetrack.run_id_pipeline import (  # noqa: E402
     _run_stage,
 )
 
-STAGE_ORDER = ["p1b", "p2", "p3", "p4", "p5", "p6_3d", "render"]
+STAGE_ORDER = ["p1b", "p2", "p3", "p3_5", "p4", "p5", "p6_3d", "render"]
 
 # Columns are read jointly — no single one is optimized in isolation.
 # (name, metrics file relative to deliveries/<D>/, dotted key, format)
@@ -65,10 +65,15 @@ PANEL_COLUMNS = [
     ("agreement", "p4/global_id_metrics.json", "cross_camera_agreement_rate", "{:.3f}"),
     ("ids", "p4/global_id_metrics.json", "distinct_global_id_count", "{:d}"),
     ("teleports", "p4/global_id_metrics.json", "teleport_event_count", "{:d}"),
+    ("id_persist", "p4/global_id_metrics.json",
+     "completeness.confirmed_frame_completeness.mean", "{:.3f}"),
+    ("frags", "p4/global_id_metrics.json", "excess_id_fragment_count_proxy", "{:d}"),
     ("collisions", "p4/global_id_metrics.json", "same_camera_identity_collision_frames", "{:d}"),
+    ("p2_tracks", "p2/tracking_metrics.json", "@sum_confirmed_tracks", "{:d}"),
     ("single_cam", "p3/association_metrics.json", "single_camera_rate", "{:.3f}"),
     ("churn", "p3/association_metrics.json", "pair_link_churn_rate", "{:.3f}"),
     ("cycle_cons", "p3/association_metrics.json", "cycle_consistency_rate", "{:.3f}"),
+    ("chimera", "p3_5/triangulation_metrics.json", "chimera_suspect_count", "{:d}"),
     ("d_app", "p3/association_metrics.json", "cue_d_prime.appearance", "{:.2f}"),
     ("jitter_px", "p1b/stabilization_metrics.json", "mean_jitter_px_after", "{:.2f}"),
     ("tri_reproj", "p6_3d/triangulation_metrics.json", "mean_reprojection_error_px", "{:.1f}"),
@@ -167,6 +172,23 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                    "--expected-frames", str(args.expected_frames)],
                 args.python, log,
             )
+        elif stage == "p3_5":
+            if not args.enable_lift:
+                continue
+            rc = _run_stage(
+                "scripts.export.triangulate_predictions",
+                common(plan.stage_dir("p3"), out_dir)
+                + ["--id-source", "binding",
+                   "--reprojection-threshold-px", str(args.tri_reproj_px),
+                   "--min-views", str(args.tri_min_views),
+                   "--ema-alpha", str(args.tri_ema_alpha),
+                   "--smoother", args.tri_smoother,
+                   "--butter-cutoff-hz", str(args.tri_butter_cutoff_hz)]
+                + (["--cheirality"] if args.tri_cheirality else [])
+                + (["--native-skeleton"] if args.tri_native_skeleton else [])
+                + (["--dense-fill"] if args.tri_dense_fill else []),
+                args.python, log,
+            )
         elif stage == "p4":
             rc = _run_stage(
                 "scripts.global_id.run_global_id",
@@ -187,7 +209,12 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                 common(plan.stage_dir("p4"), out_dir)
                 + ["--reprojection-threshold-px", str(args.tri_reproj_px),
                    "--min-views", str(args.tri_min_views),
-                   "--ema-alpha", str(args.tri_ema_alpha)],
+                   "--ema-alpha", str(args.tri_ema_alpha),
+                   "--smoother", args.tri_smoother,
+                   "--butter-cutoff-hz", str(args.tri_butter_cutoff_hz)]
+                + (["--cheirality"] if args.tri_cheirality else [])
+                + (["--native-skeleton"] if args.tri_native_skeleton else [])
+                + (["--dense-fill"] if args.tri_dense_fill else []),
                 args.python, log,
             )
         else:  # pragma: no cover - registry and loop must stay in sync
@@ -196,6 +223,12 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
         # P3/P4 exit 1 for a warn/fail *verdict* but produced full output; every
         # other stage's nonzero rc means the stage itself failed -> stop the chain.
         if rc not in (0, 1) or (rc == 1 and stage not in ("p3", "p4")):
+            result["failed_stage"] = stage
+            return result
+        # H7: a crashed P3/P4 ALSO exits 1 (uncaught exception) — distinguish a
+        # warn-verdict from a crash by requiring the stage's metrics artifact.
+        metrics_name = {"p3": "association_metrics.json", "p4": "global_id_metrics.json"}.get(stage)
+        if rc == 1 and metrics_name and not (out_dir / metrics_name).exists():
             result["failed_stage"] = stage
             return result
     return result
@@ -226,6 +259,7 @@ def write_pipeline_manifest(args: argparse.Namespace, stages: list[str], deliver
         "stages_run": stages,
         "deliveries": deliveries,
         "enable_stabilization": args.enable_stabilization,
+        "enable_lift": args.enable_lift,
         "configs": {
             stage: {"path": path, "sha256": _sha256(ROOT / path)}
             for stage, path in configs.items()
@@ -234,11 +268,32 @@ def write_pipeline_manifest(args: argparse.Namespace, stages: list[str], deliver
             "reprojection_threshold_px": args.tri_reproj_px,
             "min_views": args.tri_min_views,
             "ema_alpha": args.tri_ema_alpha,
+            "cheirality": args.tri_cheirality,
+            "smoother": args.tri_smoother,
+            "butter_cutoff_hz": args.tri_butter_cutoff_hz,
+            "native_skeleton": args.tri_native_skeleton,
+            "dense_fill": args.tri_dense_fill,
         },
     }
     out = Path(args.output_tree).resolve() / "pipeline_manifest.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _sum_confirmed_tracks(metrics: dict):
+    """Total confirmed per-camera tracks — the P2 fragmentation proxy (~13-15 people
+    per camera view is ideal; excess = per-camera track fragments P4 must stitch)."""
+    per_camera = metrics.get("per_camera")
+    if not isinstance(per_camera, dict):
+        return None
+    values = [
+        _dig(camera, "summary.confirmed_tracks") for camera in per_camera.values()
+    ]
+    values = [value for value in values if isinstance(value, (int, float))]
+    return int(sum(values)) if values else None
+
+
+_COMPUTED_COLUMNS = {"@sum_confirmed_tracks": _sum_confirmed_tracks}
 
 
 def read_panel_row(tree: Path, delivery: str) -> dict:
@@ -248,7 +303,10 @@ def read_panel_row(tree: Path, delivery: str) -> dict:
         if rel not in cache:
             path = tree / "deliveries" / delivery / rel
             cache[rel] = json.loads(path.read_text()) if path.exists() else {}
-        row[name] = _dig(cache[rel], key)
+        if key.startswith("@"):
+            row[name] = _COMPUTED_COLUMNS[key](cache[rel])
+        else:
+            row[name] = _dig(cache[rel], key)
     return row
 
 
@@ -291,6 +349,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Shorthand for --until-stage p6_3d.")
     parser.add_argument("--enable-stabilization", action="store_true",
                         help="Run P1.5 before P2 (fix F1; baseline keeps it off).")
+    parser.add_argument("--enable-lift", action="store_true",
+                        help="Run the P3.5 binding-keyed 3D lift after P3 (fix F9b; default off).")
     parser.add_argument("--p1b-config", default="configs/v6/p1b_stabilization.yaml")
     parser.add_argument("--p2-config", default="configs/v6/p2_tracking.yaml")
     parser.add_argument("--p3-config", default="configs/v6/p3_association.yaml")
@@ -298,6 +358,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tri-reproj-px", type=float, default=10.0)
     parser.add_argument("--tri-min-views", type=int, default=2)
     parser.add_argument("--tri-ema-alpha", type=float, default=0.65)
+    parser.add_argument("--tri-cheirality", action="store_true",
+                        help="Fix F3: cheirality gate in the 3D lift (default off = baseline).")
+    parser.add_argument("--tri-smoother", choices=["ema", "butterworth"], default="ema",
+                        help="Fix F7: zero-phase Butterworth instead of causal EMA (default ema).")
+    parser.add_argument("--tri-butter-cutoff-hz", type=float, default=6.0)
+    parser.add_argument("--tri-native-skeleton", action="store_true",
+                        help="Fix F15: triangulate all 26 Halpe keypoints (default off = COCO-17).")
+    parser.add_argument("--tri-dense-fill", action="store_true",
+                        help="Fix C6: gap-gate temporal fills on real frame numbers (default off).")
     parser.add_argument("--artifacts-root", default=None,
                         help="Mosaics land in <artifacts-root>/mosaics/<D>/ (required to render).")
     parser.add_argument("--drive-root", default="drive")
@@ -325,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     stages = _stage_window(args.from_stage, args.until_stage)
     do_render = "render" in stages
-    if do_render and not args.artifacts_root:
+    if do_render and not args.artifacts_root and not args.panel_only:
         raise SystemExit("--artifacts-root is required when the render stage is in the window")
 
     output_tree = (ROOT / args.output_tree).resolve()

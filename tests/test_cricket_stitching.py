@@ -88,3 +88,93 @@ def test_remap_ids_rejects_same_camera_frame_identity_collision():
     }]
     assert remap_ids(records, segments, {0: 1}) == []
     assert [player["global_player_id"] for player in records[0]["players"]] == ["P001", "P002"]
+
+
+def test_occupancy_bridge_extends_temporal_gate_for_disjoint_fragments():
+    # 200-frame gap: beyond the 120 default gate, inside the 300 occupancy gate.
+    segments = [
+        _segment(0, "P001", 0, 100, (0, 0), (0, 0)),
+        _segment(1, "P002", 300, 400, (0.5, 0), (1, 0)),
+    ]
+    disjoint = {"P001": {("cam_01", 50)}, "P002": {("cam_01", 350)}}
+
+    baseline = P4Config()
+    assert build_link_costs(segments, baseline, disjoint) == []  # flag off: no edge
+
+    bridged = P4Config(p4b=replace(
+        P4BConfig(), occupancy_bridge=True, occupancy_bridge_require_pose=False,
+        new_traj_cost_factor=30.0,
+    ))
+    edges = build_link_costs(segments, bridged, disjoint)
+    assert [(e.source_seg_id, e.target_seg_id) for e in edges] == [(0, 1)]
+    assert solve_flow(segments, edges, bridged) == {0: 1}
+
+    # Same-cell overlap revokes the license.
+    overlapping = {"P001": {("cam_01", 50)}, "P002": {("cam_01", 50)}}
+    assert build_link_costs(segments, bridged, overlapping) == []
+
+    # Beyond the occupancy gate the bridge is still refused.
+    far = [
+        _segment(0, "P001", 0, 100, (0, 0), (0, 0)),
+        _segment(1, "P002", 500, 600, (0.5, 0), (1, 0)),
+    ]
+    assert build_link_costs(far, bridged, disjoint) == []
+
+
+def test_occupancy_bridge_pose_requirement_blocks_shapeless_long_links():
+    segments = [
+        _segment(0, "P001", 0, 100, (0, 0), (0, 0)),
+        _segment(1, "P002", 300, 400, (0.5, 0), (1, 0)),
+    ]
+    disjoint = {"P001": {("cam_01", 50)}, "P002": {("cam_02", 350)}}
+    strict = P4Config(p4b=replace(
+        P4BConfig(), occupancy_bridge=True,  # require_pose defaults True
+        pose_stitch_max_distance=0.3, w_pose=2.0,
+    ))
+    # Neither fragment carries a mature descriptor -> the long bridge must abstain.
+    assert build_link_costs(segments, strict, disjoint) == []
+    # The normal short-gap path is unaffected by the requirement.
+    short = [
+        _segment(0, "P001", 0, 100, (0, 0), (0, 0)),
+        _segment(1, "P002", 150, 250, (0.5, 0), (1, 0)),
+    ]
+    assert len(build_link_costs(short, strict, disjoint)) == 1
+
+
+def test_posture_stitch_gate_blocks_different_builds():
+    from pose_estimation.cricket.pose_shape import PostureAggregate
+
+    def posture(head_top):
+        return PostureAggregate(
+            median={"head_top_m": head_top, "torso_len_m": 0.55},
+            se={"head_top_m": 0.01, "torso_len_m": 0.01},
+            count={"head_top_m": 40, "torso_len_m": 40},
+        )
+
+    tall, short = posture(1.85), posture(1.55)
+    seg_a = replace(_segment(0, "P001", 0, 10, (0, 0), (0, 0)), posture=tall)
+    near_twin = replace(_segment(1, "P002", 12, 20, (0.1, 0), (1, 0)), posture=posture(1.84))
+    wrong_build = replace(_segment(1, "P002", 12, 20, (0.1, 0), (1, 0)), posture=short)
+
+    gated = P4Config(p4b=replace(P4BConfig(), posture_stitch_max_z=3.0, w_posture=0.5))
+    assert len(build_link_costs([seg_a, near_twin], gated)) == 1     # same build passes
+    assert build_link_costs([seg_a, wrong_build], gated) == []       # wrong build blocked
+    # missing posture abstains (edge still allowed)
+    bare = _segment(1, "P002", 12, 20, (0.1, 0), (1, 0))
+    assert len(build_link_costs([seg_a, bare], gated)) == 1
+    # flag off: byte-identical behaviour (edge allowed regardless)
+    off = P4Config()
+    assert len(build_link_costs([seg_a, wrong_build], off)) == 1
+
+
+def test_bowler_detection_is_direction_signed():
+    # H2: a sprint AGAINST the bowling direction must not win the bowler crown.
+    import numpy as np
+    from scripts.roles.assigner import _windowed_axis_speed
+
+    axis = np.array([0.0, 1.0])
+    toward = [(f, np.array([0.0, -20.0 + 0.1 * f])) for f in range(100)]
+    against = [(f, np.array([0.0, 20.0 - 0.1 * f])) for f in range(100)]
+    kw = dict(window_frames=50, frame_rate_fps=50.0, early_cutoff=100)
+    assert _windowed_axis_speed(toward, axis, **kw) > 3.5
+    assert _windowed_axis_speed(against, axis, **kw) <= 0.0

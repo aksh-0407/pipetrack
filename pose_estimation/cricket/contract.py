@@ -32,7 +32,11 @@ CAMERA_RE = re.compile(r"^cam_\d{2}$")
 
 
 def is_finite_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and math.isfinite(float(value))
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)  # bool is an int subtype; True must not validate
+        and math.isfinite(float(value))
+    )
 
 
 def validate_numeric_vector(

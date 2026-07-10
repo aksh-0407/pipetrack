@@ -153,6 +153,10 @@ class _ChunkState:
     ground_by_frame: dict[int, np.ndarray] = field(default_factory=dict)
     cov_by_frame: dict[int, np.ndarray] = field(default_factory=dict)
     posture: PostureAccumulator = field(default_factory=PostureAccumulator)
+    # F11: sampled (17, 3) [x, y, conf] keypoints per frame for the cluster-level
+    # shape lift; populated only when graph_shape_enabled (every graph_lift_stride
+    # frames), so memory stays bounded.
+    kp_samples: dict[int, np.ndarray] = field(default_factory=dict)
     posture_samples: int = 0
     upright_samples: int = 0
     approx_frames: int = 0
@@ -276,6 +280,8 @@ class TrackletGraphBuilder:
         self._pairs: dict[tuple[ChunkKey, ChunkKey], _PairSamples] = defaultdict(_PairSamples)
         self._velocity_cache: dict[ChunkKey, dict[int, np.ndarray | None]] = {}
         self._azimuth_cache: dict[ChunkKey, np.ndarray | None] = {}
+        # Per-binding pooled posture, computed once per solve for emit (F6b).
+        self._emit_posture_cache: dict[str, PostureAggregate] | None = None
         # Synthetic tracklets: persistent untracked detections (e.g. umpires whose
         # cut-off dark figures P2 never tracked) chained by ground continuity so
         # the graph can bind them like any P2 tracklet.
@@ -368,6 +374,13 @@ class TrackletGraphBuilder:
                     if sample is not None and sample.upright_known:
                         chunk.posture_samples += 1
                         chunk.upright_samples += int(sample.upright)
+                if (
+                    (self.config.graph_shape_enabled or self.config.graph_split_enabled)
+                    and frame_index % self.config.graph_lift_stride == 0
+                ):
+                    chunk.kp_samples[frame_index] = np.column_stack(
+                        (det.keypoints_px, det.keypoint_conf)
+                    )
                 self._det_chunk[(frame_index, cam_id, tid)] = key
                 placed.append((key, det, ground, cov))
 
@@ -444,10 +457,18 @@ class TrackletGraphBuilder:
 
     # -------------------------------------------------------- calibration
 
-    def harvest_calibration(self) -> CueCalibration:
-        """Bootstrap same/different populations from geometry and fit cue LLRs."""
+    def _collect_calibration_pairs(
+        self,
+        postures: dict,
+        anchor_dist_m: float,
+        anchor_isolation_m: float,
+    ) -> tuple[dict, dict, dict, dict, dict, list, list]:
+        """One anchor-selection sweep at the given same-player gates.
 
-        postures = self._chunk_postures()
+        Diff pairs always use ``diff_pair_min_dist_m``; only the same-player
+        gates vary between the strict pass and the F8 relaxation pass.
+        """
+
         same_samples: dict[str, list[float]] = defaultdict(list)
         diff_samples: dict[str, list[float]] = defaultdict(list)
         pair_app_same: dict[str, list[float]] = defaultdict(list)
@@ -469,10 +490,7 @@ class TrackletGraphBuilder:
             if not np.isfinite(med_dist):
                 continue
             camera_pair = CueCalibration.camera_pair_key(key_a[0], key_b[0])
-            if (
-                med_dist <= self.config.anchor_pair_dist_m
-                and med_iso >= self.config.anchor_pair_isolation_m
-            ):
+            if med_dist <= anchor_dist_m and med_iso >= anchor_isolation_m:
                 same_pairs.append((key_a, key_b))
                 same_samples["ground_dist_m"].extend(samples.dist_m)
                 same_samples["ground_maha"].extend(samples.maha)
@@ -491,14 +509,44 @@ class TrackletGraphBuilder:
                 diff_samples["appearance"].extend(samples.appearance)
                 pair_app_diff[camera_pair].extend(samples.appearance)
 
+        return (same_samples, diff_samples, pair_app_same, pair_app_diff,
+                posture_same_deltas, same_pairs, diff_pairs)
+
+    def harvest_calibration(self) -> CueCalibration:
+        """Bootstrap same/different populations from geometry and fit cue LLRs."""
+
+        postures = self._chunk_postures()
+        (same_samples, diff_samples, pair_app_same, pair_app_diff,
+         posture_same_deltas, same_pairs, diff_pairs) = self._collect_calibration_pairs(
+            postures, self.config.anchor_pair_dist_m, self.config.anchor_pair_isolation_m
+        )
+
+        if len(same_pairs) < 3 and self.config.anchor_relax_enabled:
+            # F8: a crowded delivery may hold no player isolated by 3 m for long
+            # enough; retry once with looser same-player gates before losing every
+            # delivery-fitted cue. Adopted only when it actually finds more anchors.
+            relaxed = self._collect_calibration_pairs(
+                postures, self.config.anchor_relax_dist_m, self.config.anchor_relax_isolation_m
+            )
+            if len(relaxed[5]) > len(same_pairs):
+                (same_samples, diff_samples, pair_app_same, pair_app_diff,
+                 posture_same_deltas, same_pairs, diff_pairs) = relaxed
+                self.diagnostics["calibration_anchor_relaxed"] = 1
+
         if len(same_pairs) < 3:
             # Per-frame samples within one pair are correlated; fewer than three
             # independent anchor pairs cannot support a trustworthy same-player
-            # distribution. Keep the conservative physical defaults.
-            calibration = CueCalibration()
+            # distribution. Prefer a cross-delivery prior calibration fitted on a
+            # clean clip of the same match (F8) when configured; else keep the
+            # conservative physical defaults.
+            if self.config.calibration_fallback_path:
+                calibration = CueCalibration.load(self.config.calibration_fallback_path)
+                self.diagnostics["calibration_used_prior"] = 1
+            else:
+                calibration = CueCalibration()
+                self.diagnostics["calibration_fell_back_to_defaults"] = 1
             calibration.anchor_pair_count = len(same_pairs)
             calibration.diff_pair_count = len(diff_pairs)
-            self.diagnostics["calibration_fell_back_to_defaults"] = 1
             return calibration
 
         calibration = fit_cue_calibration(
@@ -579,6 +627,29 @@ class TrackletGraphBuilder:
             key: chunk.posture.aggregate(min_samples=self.config.posture_min_samples)
             for key, chunk in self._chunks.items()
         }
+
+    def binding_postures(self, solution: "GraphSolution") -> dict[str, PostureAggregate]:
+        """Pooled billboard posture per binding, from every member chunk's samples (F6b).
+
+        Pooling the raw samples (rather than merging per-chunk aggregates) keeps the
+        robust median/SE semantics of :class:`PostureAccumulator` for the combined
+        population. This is the facing-pair-capable body-shape key P4 uses for its
+        teleport veto and re-entry gate.
+        """
+
+        merged: dict[str, PostureAggregate] = {}
+        for binding, keys in solution.clusters.items():
+            pooled = PostureAccumulator()
+            for key in keys:
+                chunk = self._chunks.get(key)
+                if chunk is None:
+                    continue
+                for name, values in chunk.posture.samples.items():
+                    pooled.samples.setdefault(name, []).extend(values)
+            aggregate = pooled.aggregate(min_samples=self.config.posture_min_samples)
+            if aggregate is not None and aggregate.is_defined():
+                merged[binding] = aggregate
+        return merged
 
     # -------------------------------------------------------------- solve
 
@@ -775,6 +846,11 @@ class TrackletGraphBuilder:
                 edges, parent, members, find, llr_lookup
             )
 
+        if self.config.graph_shape_enabled:
+            self.diagnostics["shape_merges"] = self._shape_corroboration_pass(
+                parent, members, find, llr_lookup
+            )
+
         cluster_members: dict[int, list[ChunkKey]] = {
             index: sorted(keys)
             for index, keys in enumerate(sorted(members.values(), key=lambda keys: keys[0]))
@@ -782,6 +858,10 @@ class TrackletGraphBuilder:
         cluster_of: dict[ChunkKey, int] = {
             key: cid for cid, keys in cluster_members.items() for key in keys
         }
+        if self.config.graph_split_enabled:
+            self.diagnostics["chimera_evictions"] = self._chimera_veto_pass(
+                cluster_members, cluster_of, llr_lookup
+            )
         moves = self._refine(cluster_members, cluster_of, llr_lookup)
         self.diagnostics["refine_moves"] = moves
         self._rescue_singletons(cluster_members, cluster_of, edges, llr_lookup)
@@ -887,6 +967,257 @@ class TrackletGraphBuilder:
             del members[root_b]
             merged += 1
         return merged
+
+    def _cluster_shape(
+        self, keys: list[ChunkKey]
+    ) -> tuple["PoseProportions | None", float | None, int]:
+        """Lifted bone-ratio descriptor + stature for one cluster (F11).
+
+        Builds per-frame multi-view keypoint sets from the member chunks'
+        sampled keypoints and pools the per-frame descriptors. Returns
+        ``(descriptor, stature_m, frames_lifted)``; descriptor is None when the
+        cluster never has two sampled views of the same frame.
+        """
+
+        from scripts.association.cluster_lift import cluster_purity, lift_frame
+
+        lifts = self._cluster_lifts(keys)
+        if len(lifts) < self.config.graph_shape_min_frames:
+            return None, None, len(lifts)
+        purity = cluster_purity(lifts)
+        return purity.descriptor, purity.stature_m, len(lifts)
+
+    def _cluster_lifts(self, keys: list[ChunkKey]) -> list:
+        """Per-frame multi-view lifts for one cluster from the sampled keypoints."""
+
+        from scripts.association.cluster_lift import lift_frame
+
+        per_frame: dict[int, dict[str, np.ndarray]] = {}
+        for key in keys:
+            chunk = self._chunks.get(key)
+            if chunk is None:
+                continue
+            cam_id = key[0]
+            for frame_index, kp in chunk.kp_samples.items():
+                per_frame.setdefault(frame_index, {}).setdefault(cam_id, kp)
+        lifts = []
+        for frame_index in sorted(per_frame):
+            members = per_frame[frame_index]
+            if len(members) < 2:
+                continue
+            lift = lift_frame(
+                members, self.projections,
+                reprojection_threshold_px=self.config.triangulation_reproj_threshold_px,
+                min_views=self.config.triangulation_min_views,
+            )
+            if lift is not None:
+                lifts.append(lift)
+        return lifts
+
+    def _shape_corroboration_pass(self, parent, members, find, llr_lookup) -> int:
+        """F11: merge compatible cluster pairs on cluster-level body-shape agreement.
+
+        The pairwise round caps every cue's positive evidence, so on the facing
+        pairs (colour dead, motion static, posture sometimes crouched) a genuine
+        same-player pair can never reach the merge threshold. This round compares
+        whole clusters instead: a lifted bone-ratio descriptor + metric stature,
+        self-calibrated on this delivery (same = temporal halves of one cluster;
+        diff = simultaneously co-visible distinct clusters). Merges only when
+        geometry does not disagree, shape actively agrees, stature is consistent,
+        and the pair is the mutual best — and abstains entirely when the shape
+        distributions cannot be fitted.
+        """
+
+        from pose_estimation.cricket.pose_shape import descriptor_distance
+
+        shapes: dict[ChunkKey, tuple] = {}
+        for root, keys in members.items():
+            if len({key[0] for key in keys}) < 1:
+                continue
+            descriptor, stature, frames = self._cluster_shape(keys)
+            if descriptor is not None and descriptor.is_defined():
+                shapes[root] = (descriptor, stature)
+        if len(shapes) < 2:
+            return 0
+
+        def shape_distance(root_a: ChunkKey, root_b: ChunkKey) -> float | None:
+            return descriptor_distance(
+                shapes[root_a][0], shapes[root_b][0],
+                min_shared=self.config.graph_shape_min_segments,
+            )
+
+        # --- self-calibration ------------------------------------------------
+        same_samples: list[float] = []
+        for root in shapes:
+            keys = members[root]
+            frames_sorted = sorted(
+                frame for key in keys for frame in self._chunks[key].kp_samples
+            )
+            if len(frames_sorted) < 2 * self.config.graph_shape_min_frames:
+                continue
+            midpoint = frames_sorted[len(frames_sorted) // 2]
+            # Build two half-window descriptors by masking kp_samples temporally.
+            halves = []
+            for lo, hi in ((min(frames_sorted), midpoint), (midpoint, max(frames_sorted) + 1)):
+                saved = {key: self._chunks[key].kp_samples for key in keys}
+                try:
+                    for key in keys:
+                        self._chunks[key].kp_samples = {
+                            f: kp for f, kp in saved[key].items() if lo <= f < hi
+                        }
+                    half_desc, _stature, _n = self._cluster_shape(keys)
+                finally:
+                    for key in keys:
+                        self._chunks[key].kp_samples = saved[key]
+                halves.append(half_desc)
+            if halves[0] is not None and halves[1] is not None:
+                value = descriptor_distance(
+                    halves[0], halves[1], min_shared=self.config.graph_shape_min_segments
+                )
+                if value is not None:
+                    same_samples.append(float(value))
+
+        def cluster_median_ground(keys: list[ChunkKey]) -> np.ndarray:
+            points = [
+                ground for key in keys
+                for ground in self._chunks[key].ground_by_frame.values()
+            ]
+            return np.median(np.asarray(points, dtype=float), axis=0)
+
+        roots = sorted(shapes, key=lambda r: r)
+        medians = {root: cluster_median_ground(members[root]) for root in roots}
+        diff_samples: list[float] = []
+        for i, root_a in enumerate(roots):
+            for root_b in roots[i + 1:]:
+                if float(np.linalg.norm(medians[root_a] - medians[root_b]))                         >= self.config.diff_pair_min_dist_m:
+                    value = shape_distance(root_a, root_b)
+                    if value is not None:
+                        diff_samples.append(float(value))
+        if len(same_samples) < 4 or len(diff_samples) < 4:
+            self.diagnostics["shape_calibration_starved"] = 1
+            return 0
+        shape_calibration = fit_cue_calibration(
+            same_samples={"shape_dist": same_samples},
+            diff_samples={"shape_dist": diff_samples},
+        )
+        if shape_calibration.d_prime("shape_dist") < 0.5:
+            self.diagnostics["shape_cue_abstained"] = 1
+            return 0  # body shape cannot separate players on this footage
+
+        # --- mutual-best conservative merges ---------------------------------
+        merges = 0
+        while True:
+            candidates: dict[ChunkKey, tuple[float, ChunkKey]] = {}
+            live_roots = [root for root in roots if root in members and root in shapes]
+            for i, root_a in enumerate(live_roots):
+                for root_b in live_roots[i + 1:]:
+                    if not self._cluster_compatible(
+                        members[root_a], members[root_b], llr_lookup
+                    ):
+                        continue
+                    cross = [
+                        llr_lookup[_pair_key(a, b)]
+                        for a in members[root_a] for b in members[root_b]
+                        if _pair_key(a, b) in llr_lookup
+                    ]
+                    if not cross or max(cross) <= 0:
+                        continue  # never co-visible, or geometry disagrees
+                    stature_a, stature_b = shapes[root_a][1], shapes[root_b][1]
+                    if (
+                        stature_a is not None and stature_b is not None
+                        and abs(stature_a - stature_b) > self.config.graph_shape_stature_max_m
+                    ):
+                        continue
+                    value = shape_distance(root_a, root_b)
+                    llr_shape = shape_calibration.llr(
+                        "shape_dist", value,
+                        clip_pos=self.config.graph_llr_positive_cap,
+                    )
+                    if llr_shape <= 0:
+                        continue
+                    total = max(cross) + llr_shape
+                    if total < self.config.graph_llr_merge_threshold:
+                        continue
+                    for source, target in ((root_a, root_b), (root_b, root_a)):
+                        best = candidates.get(source)
+                        if best is None or total > best[0]:
+                            candidates[source] = (total, target)
+            merged_this_round = False
+            for root_a in sorted(candidates):
+                total, root_b = candidates[root_a]
+                partner = candidates.get(root_b)
+                if partner is None or partner[1] != root_a:
+                    continue  # not mutual best
+                if root_a not in members or root_b not in members:
+                    continue
+                keep, absorb = sorted((root_a, root_b))
+                parent[absorb] = keep
+                members[keep] = sorted(members[keep] + members[absorb])
+                del members[absorb]
+                descriptor, stature, _frames = self._cluster_shape(members[keep])
+                shapes.pop(absorb, None)
+                if descriptor is not None and descriptor.is_defined():
+                    shapes[keep] = (descriptor, stature)
+                else:
+                    shapes.pop(keep, None)
+                merges += 1
+                merged_this_round = True
+            if not merged_this_round:
+                break
+        return merges
+
+    def _chimera_veto_pass(
+        self,
+        cluster_members: dict[int, list[ChunkKey]],
+        cluster_of: dict[ChunkKey, int],
+        llr_lookup: dict[tuple[ChunkKey, ChunkKey], float],
+    ) -> int:
+        """F13: surgically split chimera clusters on the lifted purity signature.
+
+        A cluster whose lifted torso residuals carry the chimera signature has an
+        intruder; the per-camera residual bias names the intruding camera. That
+        camera's chunks are EVICTED into fresh singleton clusters directly (a
+        deterministic split — leaving it to refinement would let the innocent
+        chunks scatter first, since the intruder poisons their within-cluster
+        scores too), and the offending pair LLRs are vetoed down to
+        ``graph_chimera_veto_llr`` so no later pass (refine / rescue / attach /
+        shape round) can weld the pieces back together.
+        """
+
+        from scripts.association.cluster_lift import cluster_purity
+
+        evictions = 0
+        next_cluster_id = max(cluster_members, default=-1) + 1
+        for cluster_id in sorted(cluster_members):
+            keys = cluster_members[cluster_id]
+            if len({key[0] for key in keys}) < 2:
+                continue
+            lifts = self._cluster_lifts(keys)
+            if len(lifts) < self.config.graph_shape_min_frames:
+                continue
+            purity = cluster_purity(
+                lifts,
+                chimera_torso_residual_px=self.config.graph_chimera_torso_residual_px,
+                chimera_frame_fraction=self.config.graph_chimera_frame_fraction,
+            )
+            if not purity.chimera_suspect or purity.worst_camera is None:
+                continue
+            intruders = [key for key in keys if key[0] == purity.worst_camera]
+            others = [key for key in keys if key[0] != purity.worst_camera]
+            if not intruders or not others:
+                continue
+            for intruder in intruders:
+                for other in others:
+                    pair = _pair_key(intruder, other)
+                    llr_lookup[pair] = min(
+                        llr_lookup.get(pair, 0.0), self.config.graph_chimera_veto_llr
+                    )
+                cluster_members[next_cluster_id] = [intruder]
+                cluster_of[intruder] = next_cluster_id
+                next_cluster_id += 1
+                evictions += 1
+            cluster_members[cluster_id] = sorted(others)
+        return evictions
 
     def _refine(
         self,
@@ -1095,7 +1426,9 @@ class TrackletGraphBuilder:
                     continue
                 candidates.sort()
                 best_distance, best_target = candidates[0]
-                if len(candidates) > 1 and candidates[1][0] < best_distance * 1.5:
+                if len(candidates) > 1 and candidates[1][0] < max(
+                    best_distance * 1.5, best_distance + 0.5
+                ):  # H6: multiplicative-only margin degenerates at ~0 distance
                     self.diagnostics["fragment_attach_ambiguous"] += 1
                     continue
                 cluster_members[best_target] = sorted(cluster_members[best_target] + keys)
@@ -1152,6 +1485,12 @@ class TrackletGraphBuilder:
             cam_id: {det.player_index: i for i, det in enumerate(dets)}
             for cam_id, dets in dets_per_cam.items()
         }
+        binding_posture: dict[str, PostureAggregate] = {}
+        if self.config.emit_posture:
+            if self._emit_posture_cache is None:
+                self._emit_posture_cache = self.binding_postures(solution)
+            binding_posture = self._emit_posture_cache
+
         correspondences: list[Correspondence] = []
         cluster_id = 0
         for binding in sorted(groups):
@@ -1163,7 +1502,9 @@ class TrackletGraphBuilder:
                 cluster_id, member_map, dets_per_cam, proj_matrices, self.config,
                 camera_centers or {},
             )
-            correspondences.append(replace(corr, binding_id=binding))
+            correspondences.append(replace(
+                corr, binding_id=binding, posture=binding_posture.get(binding),
+            ))
             cluster_id += 1
         for cam_id, player_index in sorted(leftovers):
             member_map = {cam_id: index_of[cam_id][player_index]}

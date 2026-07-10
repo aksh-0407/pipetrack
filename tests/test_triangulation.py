@@ -66,3 +66,86 @@ def test_fill_occluded_joints_interpolates_temporal_gap():
     assert oc[2, 0] < 0.9 and oc[2, 0] > 0                   # reduced fill confidence
     assert np.isfinite(out[:, 1]).all()                     # joint 1 held to all frames
     assert np.allclose(out[0, 1], [1.0, 1.0, 1.0])
+
+
+def test_cheirality_rejects_point_behind_cameras():
+    from pose_estimation.triangulation import ransac_triangulate_point
+
+    p1 = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], dtype=float)
+    p2 = np.array([[1, 0, 0, -1], [0, 1, 0, 0], [0, 0, 1, 0]], dtype=float)
+    # Observations of a point BEHIND both cameras (z = -5): projecting
+    # [0, 0, -5] and [1, 0, -5] through p1/p2 gives these pixels.
+    behind = np.array([[0.0, 0.0], [0.2, 0.0]])
+    legacy = ransac_triangulate_point(behind, np.stack([p1, p2]), np.ones(2))
+    gated = ransac_triangulate_point(
+        behind, np.stack([p1, p2]), np.ones(2), cheirality=True
+    )
+    assert legacy.point_xyz[2] < 0          # legacy happily returns the behind point
+    assert not gated.inlier_mask.any()      # cheirality refuses every view
+
+
+def test_cheirality_accepts_front_point_with_negative_scaled_projection():
+    from pose_estimation.triangulation import ransac_triangulate_point
+
+    p1 = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], dtype=float)
+    p2 = np.array([[1, 0, 0, -1], [0, 1, 0, 0], [0, 0, 1, 0]], dtype=float)
+    observations = np.array([[0.0, 0.0], [-0.2, 0.0]])  # point [0,0,5], in front
+    result = ransac_triangulate_point(
+        observations, np.stack([p1, -p2]), np.ones(2), cheirality=True
+    )
+    np.testing.assert_allclose(result.point_xyz, [0.0, 0.0, 5.0], atol=1e-7)
+    assert result.inlier_mask.all()         # negative overall scale must not flip the test
+
+
+def test_butterworth_smooth_reduces_jitter_zero_phase():
+    from pose_estimation.triangulation import butterworth_smooth
+
+    rng = np.random.default_rng(7)
+    t = np.arange(200)
+    clean = np.stack([0.01 * t, np.sin(t / 40.0), np.zeros_like(t, dtype=float)], axis=1)
+    noisy = clean + rng.normal(0.0, 0.05, clean.shape)
+    seq = noisy[:, None, :]  # (T, 1, 3)
+    out = butterworth_smooth(seq, fps=50.0, cutoff_hz=4.0)
+    jitter_in = np.abs(np.diff(seq[:, 0], axis=0)).mean()
+    jitter_out = np.abs(np.diff(out[:, 0], axis=0)).mean()
+    assert jitter_out < 0.5 * jitter_in                     # noise removed
+    assert np.abs(out[:, 0] - clean).mean() < np.abs(seq[:, 0] - clean).mean()
+    # zero phase: the low-frequency component is not delayed
+    lag = np.argmax(np.correlate(out[20:-20, 0, 1], clean[20:-20, 1], "full")) - (len(t) - 41)
+    assert abs(lag) <= 1
+
+
+def test_butterworth_smooth_preserves_nan_gaps_and_short_segments():
+    from pose_estimation.triangulation import butterworth_smooth
+
+    seq = np.zeros((60, 1, 3))
+    seq[:25, 0, 0] = np.linspace(0, 1, 25)
+    seq[25:32] = np.nan                     # gap must stay NaN
+    seq[32:40, 0, 0] = 5.0                  # 8 frames < filtfilt pad -> untouched
+    seq[40:] = np.nan
+    out = butterworth_smooth(seq, fps=50.0, cutoff_hz=6.0)
+    assert np.isnan(out[25:32]).all() and np.isnan(out[40:]).all()
+    np.testing.assert_allclose(out[32:40, 0, 0], 5.0)       # short segment untouched
+    assert np.isfinite(out[:25]).all()
+
+
+def test_dense_fill_does_not_bridge_long_real_gaps():
+    # C6 (component form): with rows == real frames, a 300-frame real gap must NOT
+    # be interpolated by a 25-frame gate even if only 2 observed rows surround it.
+    from pose_estimation.triangulation import fill_occluded_joints
+
+    frames = [0, 1, 2, 300, 301]
+    timeline = list(range(frames[0], frames[-1] + 1))
+    seq = np.full((len(timeline), 1, 3), np.nan)
+    conf = np.zeros((len(timeline), 1))
+    for f in frames:
+        seq[f, 0] = [float(f), 0.0, 0.0]
+        conf[f, 0] = 0.9
+    out, _ = fill_occluded_joints(seq, conf, max_gap_frames=25)
+    assert np.isnan(out[150, 0]).all()      # mid-gap stays empty
+    assert np.isfinite(out[301, 0]).all()
+    # legacy row-index behaviour (the bug): 5 rows adjacent -> would interpolate
+    legacy = np.asarray([seq[f] for f in frames])
+    legacy_conf = np.asarray([conf[f] for f in frames])
+    bridged, _ = fill_occluded_joints(legacy, legacy_conf, max_gap_frames=25)
+    assert np.isfinite(bridged).all()       # documents why dense_fill exists

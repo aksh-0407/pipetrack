@@ -28,6 +28,8 @@ from pose_estimation.cricket.geometry import (
     ground_contact_pixel_ex,
     ground_covariance,
     ground_from_reprojection,
+    ground_from_reprojection_ex,
+    pixel_to_plane_xy,
     parallax_angle_deg,
     parallax_weight,
     pixel_to_ground_xy,
@@ -43,6 +45,7 @@ from pose_estimation.triangulation import (
 )
 from pose_estimation.cricket.pose_shape import (
     PoseProportions,
+    PostureAggregate,
     limb_proportion_descriptor,
     torso_anthropometric_ok,
 )
@@ -73,6 +76,11 @@ class Detection3:
     # a per-(camera, tracklet) smoothing pre-pass; None => use the per-frame foot. Never
     # feeds the clustering gate, so identity stays invariant.
     emit_foot_px: np.ndarray | None = None
+    # Native-skeleton keypoints (Halpe-26 when the P1 model provides them). Carries the
+    # heel/toe ground-contact landmarks for foot_contact_mode v3; None on COCO-17-only
+    # runs. Emit-path only — never feeds the clustering gate.
+    native_keypoints_px: np.ndarray | None = None
+    native_keypoint_conf: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,16 @@ class Correspondence:
     # Same physical player => same binding_id for the whole delivery, across all
     # cameras. None in per-frame mode and for unbound leftovers.
     binding_id: str | None = None
+    # Billboard (ground-anchored monocular) posture aggregate of the binding — the
+    # facing-pair-capable body-shape cue, unlike pose_descriptor which needs
+    # triangulation parallax. Emitted only when P3 ``emit_posture`` is on (F6b);
+    # consumed by the P4a teleport veto and re-entry gate.
+    posture: "PostureAggregate | None" = None
+    # 2x2 world-frame covariance of ground_xy (F9a): Gauss-Newton posterior for
+    # multi-view z0_reproj clusters, inflated homography-Jacobian model for
+    # single-camera ones. Emitted only when P3 ``emit_ground_cov`` is on; the
+    # measurement-noise input for P4's uncertainty-aware Kalman R (F10).
+    ground_cov: np.ndarray | None = None
 
 
 @dataclass
@@ -205,6 +223,10 @@ def _emit_foot_and_height(det: Detection3, config: P3AssociationConfig) -> tuple
         ankle_height_m=config.ankle_height_m,
         horizontal_margin_frac=config.foot_horizontal_margin_frac,
         level_frac=config.foot_level_frac,
+        native_keypoints_px=det.native_keypoints_px,
+        native_confidence=det.native_keypoint_conf,
+        foot_kp_conf_min=config.foot_kp_conf_min,
+        foot_height_m=config.foot_height_m,
     )
     smoothed = getattr(det, "emit_foot_px", None)
     if smoothed is not None:
@@ -527,7 +549,7 @@ def _constrained_cluster(edges, dets_per_cam, proj_matrices, config):
         if set(ma) & set(mb):  # one detection per camera per cluster
             continue
         merged = {**ma, **mb}
-        merged_point, max_ground_residual = _ground_consensus_members(
+        merged_point, max_ground_residual, _merged_cov = _ground_consensus_members(
             merged, dets_per_cam, proj_matrices, config
         )
         if merged_point is None or max_ground_residual > config.ground_cluster_gate_m:
@@ -584,7 +606,7 @@ def _ground_consensus_members(members, dets_per_cam, proj_matrices, config):
         projection = proj_matrices[camera_id]
         point = _detection_ground_xy(detection, projection, config)
         if not np.isfinite(point).all():
-            return None, float("inf")
+            return None, float("inf"), None
         points.append(point)
         if config.ground_fusion_mode == "robust_cov":
             covs.append(
@@ -596,7 +618,7 @@ def _ground_consensus_members(members, dets_per_cam, proj_matrices, config):
                 )
             )
     if not points:
-        return None, float("inf")
+        return None, float("inf"), None
     values = np.asarray(points, dtype=float)
     # The merge GATE is always the max pairwise spread across members -- unchanged, so
     # which clusters form is byte-identical regardless of fusion mode.
@@ -616,30 +638,36 @@ def _ground_consensus_members(members, dets_per_cam, proj_matrices, config):
             [max(getattr(dets_per_cam[cam][idx], "confidence", 1.0), 1e-3) for cam, idx in members.items()],
             dtype=float,
         )
-        solved = ground_from_reprojection(
+        solved, solved_cov = ground_from_reprojection_ex(
             feet,
             projections,
             confidences,
             plane_heights=heights,
             huber_delta_px=float(config.ground_reproj_huber_px),
         )
-        centre = solved if np.isfinite(solved).all() else np.median(values, axis=0)
+        if np.isfinite(solved).all():
+            centre, centre_cov = solved, solved_cov
+        else:
+            centre, centre_cov = np.median(values, axis=0), None
     elif config.ground_fusion_mode == "robust_cov" and len(values) >= 2:
-        fused_xy, _fused_cov, _w = robust_fuse_ground(
+        fused_xy, fused_cov, _w = robust_fuse_ground(
             values,
             np.asarray(covs, dtype=float),
             huber_delta=float(config.ground_fusion_huber_delta),
         )
-        centre = fused_xy if np.isfinite(fused_xy).all() else np.median(values, axis=0)
+        if np.isfinite(fused_xy).all():
+            centre, centre_cov = fused_xy, fused_cov
+        else:
+            centre, centre_cov = np.median(values, axis=0), None
     else:
-        centre = np.median(values, axis=0)
-    return centre, max_spread
+        centre, centre_cov = np.median(values, axis=0), None
+    return centre, max_spread, centre_cov
 
 
 def _triangulate_members(members, dets_per_cam, proj_matrices, config):
     """Estimate a z=0 foot point and report its maximum reprojection error."""
 
-    ground, _spread = _ground_consensus_members(members, dets_per_cam, proj_matrices, config)
+    ground, _spread, _cov = _ground_consensus_members(members, dets_per_cam, proj_matrices, config)
     if ground is None:
         return None, float("inf")
     point = np.array([ground[0], ground[1], 0.0], dtype=float)
@@ -744,6 +772,41 @@ def _pose_descriptor_for_members(members, dets_per_cam, proj_matrices, camera_ce
     return descriptor, torso_ok
 
 
+def _airborne_2d_proxy(detection: Detection3, config) -> bool:
+    """Cheap causal airborne flag (F9a): both confident ankles well above the bbox
+    bottom means the feet are off the ground and the z=0 projection lands long —
+    inflate the emitted covariance rather than trusting the grazing-angle point.
+    (Replaced by the 3D-lift ankle-height flag once P3.5 runs.)"""
+
+    bbox = detection.bbox_xywh_px
+    if not bbox or bbox[3] <= 0:
+        return False
+    conf = detection.keypoint_conf
+    pts = detection.keypoints_px
+    bottom = float(bbox[1]) + float(bbox[3])
+    lift = float(config.airborne_ankle_bbox_frac) * float(bbox[3])
+    flags = []
+    for i in (15, 16):
+        if not (np.isfinite(pts[i]).all() and np.isfinite(conf[i]) and conf[i] >= 0.5):
+            return False  # can't tell -> not airborne
+        flags.append(float(pts[i][1]) < bottom - lift)
+    return all(flags)
+
+
+def _finalize_ground_cov(cov, members_detections, config) -> np.ndarray | None:
+    """Gate + airborne-inflate the emitted ground covariance (F9a)."""
+
+    if not config.emit_ground_cov or cov is None:
+        return None
+    cov = np.asarray(cov, dtype=float)
+    if cov.shape != (2, 2) or not np.isfinite(cov).all():
+        return None
+    airborne = [_airborne_2d_proxy(det, config) for det in members_detections]
+    if airborne and sum(airborne) * 2 > len(airborne):  # majority of views airborne
+        cov = cov * float(config.airborne_cov_scale)
+    return cov
+
+
 def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, config, camera_centers=None):
     detections = {cam_id: dets_per_cam[cam_id][idx] for cam_id, idx in members.items()}
     if len(members) == 1:
@@ -752,6 +815,26 @@ def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, conf
         ground_xy = _detection_ground_xy(
             detection, proj_matrices[camera_id], config
         )
+        if config.single_cam_height_emit:
+            # C5: back-project the emit foot onto its landmark-height plane — the
+            # single lone-camera case where z=0 projection overshoots by ~0.94 m
+            # mean / 1.3 m p95 at grazing angles (methods-log M5). Emit-only.
+            pixel, height = _emit_foot_and_height(detection, config)
+            if height > 1e-9:
+                corrected = pixel_to_plane_xy(pixel, proj_matrices[camera_id], height)
+                if np.isfinite(corrected).all():
+                    ground_xy = corrected
+        single_cov = None
+        if config.emit_ground_cov and np.isfinite(ground_xy).all():
+            # Homography-Jacobian model along the lone camera's ray, inflated: a
+            # single grazing view is the least-trustworthy ground estimate (F9a).
+            single_cov = ground_covariance(
+                _foot_pixel(detection, config),
+                proj_matrices[camera_id],
+                sigma_px=_member_ground_sigma_px(detection, config),
+                var_floor_m=float(config.ground_var_floor_m),
+            ) * float(config.single_cam_cov_inflation)
+            single_cov = _finalize_ground_cov(single_cov, [detection], config)
         return Correspondence(
             cluster_id=cluster_id,
             members=detections,
@@ -765,8 +848,9 @@ def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, conf
             mean_reprojection_error_px=None,
             cycle_consistent=True,
             ground_spread_m=0.0,
+            ground_cov=single_cov,
         )
-    ground_xy, max_ground_residual = _ground_consensus_members(
+    ground_xy, max_ground_residual, ground_cov = _ground_consensus_members(
         members, dets_per_cam, proj_matrices, config
     )
     if ground_xy is None:
@@ -807,6 +891,7 @@ def _build_correspondence(cluster_id, members, dets_per_cam, proj_matrices, conf
         ),
         ground_spread_m=(max_ground_residual if np.isfinite(max_ground_residual) else None),
         pose_descriptor=pose_descriptor,
+        ground_cov=_finalize_ground_cov(ground_cov, list(detections.values()), config),
     )
 
 

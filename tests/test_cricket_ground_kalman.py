@@ -81,3 +81,58 @@ def test_striker_role_has_reasonable_Q():
 def test_all_roles_defined():
     for role in ("bowler", "striker", "non_striker", "wicketkeeper", "umpire", "fielder", "unknown"):
         assert role in ROLE_PARAMS
+
+
+def test_per_measurement_R_overrides_role_noise():
+    import numpy as np
+    from pose_estimation.cricket.ground_kalman import SingerGroundKalman
+
+    # Two identical filters; one gets a HUGE per-measurement R for an outlier
+    # observation — its state must move far less than the trusting filter's.
+    a = SingerGroundKalman(np.array([0.0, 0.0]), "unknown", dt=0.02)
+    b = SingerGroundKalman(np.array([0.0, 0.0]), "unknown", dt=0.02)
+    for f in (a, b):
+        f.predict()
+    z = np.array([2.0, 0.0])
+    a.update(z)                                   # fixed role R (~0.4 m)
+    b.update(z, R=np.eye(2) * 25.0)               # 5 m sigma: barely trusted
+    assert a.pos_world_xy[0] > 5 * b.pos_world_xy[0]
+    # gating sees the same R: the same far point is inside a loose-R gate
+    c = SingerGroundKalman(np.array([0.0, 0.0]), "unknown", dt=0.02)
+    c.predict()
+    tight = c.mahalanobis_sq(z)
+    loose = c.mahalanobis_sq(z, R=np.eye(2) * 25.0)
+    assert loose < tight
+    # None reproduces the legacy path exactly
+    d = SingerGroundKalman(np.array([0.0, 0.0]), "unknown", dt=0.02)
+    e = SingerGroundKalman(np.array([0.0, 0.0]), "unknown", dt=0.02)
+    d.predict(); e.predict()
+    d.update(z); e.update(z, R=None)
+    np.testing.assert_array_equal(d.x, e.x)
+    np.testing.assert_array_equal(d.P, e.P)
+
+
+def test_switch_role_inflates_stable_blocks_role_dependently():
+    import numpy as np
+    from pose_estimation.cricket.ground_kalman import SingerGroundKalman
+
+    # C3: the Lyapunov branch could never execute; the explicit inflation must be
+    # finite, role-dependent, and larger for more agile roles.
+    a = SingerGroundKalman(np.zeros(2), "umpire", dt=0.02)
+    b = SingerGroundKalman(np.zeros(2), "umpire", dt=0.02)
+    va, vb = a.P[2, 2], b.P[2, 2]
+    a.switch_role("bowler")
+    b.switch_role("wicketkeeper")
+    assert np.isfinite(a.P).all() and np.isfinite(b.P).all()
+    assert a.P[2, 2] > va and b.P[2, 2] > vb
+    assert a.P[4, 4] > b.P[4, 4]           # bowler >> keeper acceleration uncertainty
+    assert a.role == "bowler"
+
+
+def test_unknown_role_falls_back_instead_of_raising():
+    import numpy as np
+    from pose_estimation.cricket.ground_kalman import SingerGroundKalman
+
+    f = SingerGroundKalman(np.zeros(2), "twelfth_man", dt=0.02)  # C4: no KeyError
+    f.switch_role("mystery_role")
+    assert f.role == "mystery_role"        # label kept; dynamics = unknown params

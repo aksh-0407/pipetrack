@@ -105,6 +105,20 @@ def record_to_detections(
             extract_appearance_descriptor(image_bgr, player)
             if image_bgr is not None else None
         )
+        native_kpts = native_conf = None
+        native = player.get("pose_2d_native")
+        if native is not None:
+            candidate_kpts = np.asarray(native.get("keypoints_px"), dtype=float)
+            candidate_conf = np.asarray(native.get("confidence"), dtype=float)
+            if (
+                candidate_kpts.ndim == 2
+                and candidate_kpts.shape[0] >= 26
+                and candidate_kpts.shape[1] == 2
+                and candidate_conf.shape[0] == candidate_kpts.shape[0]
+                and np.isfinite(candidate_kpts).all()
+                and np.isfinite(candidate_conf).all()
+            ):
+                native_kpts, native_conf = candidate_kpts, candidate_conf
         detections.append(
             Detection3(
                 cam_id=camera_id,
@@ -116,6 +130,8 @@ def record_to_detections(
                 local_track_id=player.get("local_track_id"),
                 ground_xy=ground_xy,
                 appearance=appearance,
+                native_keypoints_px=native_kpts,
+                native_keypoint_conf=native_conf,
             )
         )
     return detections
@@ -182,6 +198,15 @@ def correspondence_row(frame_index: int, correspondences: Iterable[Correspondenc
                 "binding_id": corr.binding_id,
             }
         )
+        if corr.posture is not None:
+            # Key present only when P3 emit_posture is on, so baseline rows stay
+            # byte-identical with the flag off (F6b).
+            clusters[-1]["posture"] = corr.posture.to_json()
+        if corr.ground_cov is not None:
+            # Same contract for F9a: key present only when emit_ground_cov is on.
+            clusters[-1]["ground_cov"] = [
+                [float(v) for v in row] for row in np.asarray(corr.ground_cov)
+            ]
     return {"frame_index": int(frame_index), "clusters": clusters}
 
 

@@ -167,3 +167,22 @@ def test_runner_disabled_is_passthrough(tmp_path: Path):
     run_stabilization(tmp_path / "p1", out_dir, "CCPL080626M1_1_14_1", cfg)
     out = json.loads((out_dir / "predictions" / "bt_01__CCPL080626M1_1_14_1__cam_01.jsonl").read_text())
     assert out["players"][0]["pose_2d"]["keypoints_px"] == rec["players"][0]["pose_2d"]["keypoints_px"]
+
+
+def test_runner_disabled_is_byte_identical_for_any_key_order(tmp_path: Path):
+    # Regression (Wave 0): the writer must not re-order keys — a P1 producer that
+    # writes insertion-ordered JSON (e.g. the rtmpose-x run) must round-trip
+    # byte-for-byte through the disabled stage, or every flags-off A/B breaks.
+    pred_dir = tmp_path / "p1" / "predictions"
+    pred_dir.mkdir(parents=True)
+    rec = _p1_record(1000, 500.0, 700.0, 5.0)
+    scrambled = dict(reversed(list(rec.items())))          # deliberately unsorted
+    raw = json.dumps(scrambled) + "\n"
+    src = pred_dir / "bt_01__CCPL080626M1_1_14_1__cam_01.jsonl"
+    src.write_text(raw)
+
+    out_dir = tmp_path / "p1b"
+    run_stabilization(tmp_path / "p1", out_dir, "CCPL080626M1_1_14_1",
+                      StabilizationConfig(enabled=False))
+    out = (out_dir / "predictions" / src.name).read_text()
+    assert out == raw

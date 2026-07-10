@@ -153,10 +153,21 @@ class P3AssociationConfig:
     # cross-camera-consistent reference when both feet are down (F4/F6), tighter vertical
     # + new horizontal plausibility (F3), and the ankle height reported so the z0_reproj
     # solver back-projects onto z=ankle_height instead of z=0 (removes the ~10 cm bias, F2).
-    foot_contact_mode: str = "legacy"         # or "v2"
+    # "v3" (campaign fix F4) = prefer the Halpe-26 heel/toe keypoints from
+    # pose_2d_native — true ground-contact landmarks (~2 cm above ground vs the
+    # ankle's ~10 cm) — falling back to the v2 ankle stack when unavailable.
+    foot_contact_mode: str = "legacy"         # or "v2" / "v3"
     ankle_height_m: float = 0.10
     foot_horizontal_margin_frac: float = 0.15
     foot_level_frac: float = 0.15
+    foot_kp_conf_min: float = 0.5             # v3: min confidence for a heel/toe landmark
+    foot_height_m: float = 0.02               # v3: heel/toe landmark height above ground
+    # C5: the documented single-camera ankle-height emit (~0.94 m grazing-angle bias
+    # fix, methods-log M5) was never wired to the production emit path — single-member
+    # clusters emitted the legacy z=0 back-projection. When enabled, the EMITTED
+    # position back-projects the emit-path foot pixel onto its landmark height plane;
+    # the clustering gate keeps the legacy foot (identity invariant). Off = legacy.
+    single_cam_height_emit: bool = False
     # Temporal smoothing of the EMITTED foot pixel per (camera, tracklet), F7. Odd
     # window for a centred median (robust to single-frame ankle spikes); 1 = disabled.
     # Emit-only, so identity is unchanged.
@@ -185,6 +196,45 @@ class P3AssociationConfig:
     # Ground-anchored (billboard) posture cue -- the pose-shape identity layer
     posture_enabled: bool = True
     posture_min_samples: int = 8
+    # F6b: emit each binding's pooled posture aggregate in correspondences.jsonl so
+    # P4a can veto teleports / gate re-entries on the facing-pair-capable body-shape
+    # cue. Off = rows are byte-identical to the baseline.
+    emit_posture: bool = False
+    # F9a: emit the 2x2 ground covariance per cluster (GN posterior for multi-view
+    # z0_reproj, inflated per-view Jacobian model for single-camera). Feeds the P4
+    # uncertainty-aware Kalman R (F10). Off = rows byte-identical to the baseline.
+    emit_ground_cov: bool = False
+    single_cam_cov_inflation: float = 4.0
+    airborne_cov_scale: float = 4.0
+    airborne_ankle_bbox_frac: float = 0.25
+    # F9c: after the graph solve, lift each binding's multi-view frames to 3D and
+    # log the per-binding purity report (torso-residual chimera signature, pooled
+    # bone-ratio descriptor, stature) into diagnostics + metrics. Read-only —
+    # nothing feeds back into clustering yet (that is Wave 3/4). Off = no extra
+    # compute, byte-identical outputs.
+    graph_lift_feedback: bool = False
+    graph_lift_stride: int = 5                # lift every Nth frame (cost control)
+    graph_chimera_torso_residual_px: float = 20.0
+    graph_chimera_frame_fraction: float = 0.3
+    # F11: pose-shape as a PRIMARY cluster-level cue. After the pairwise merge
+    # rounds, each multi-camera cluster is lifted to 3D and its bone-ratio
+    # descriptor + metric stature become a second corroboration round: two
+    # compatible clusters with agreeing geometry AND agreeing body shape merge
+    # even where the per-cue positive cap holds the pairwise round below the
+    # threshold (the facing-pair under-merge, ID-1). The shape LLR is
+    # self-calibrated per delivery (same = temporal halves of one cluster,
+    # diff = co-visible distinct clusters) and abstains when starved.
+    graph_shape_enabled: bool = False
+    graph_shape_min_frames: int = 8           # min lifted frames for a descriptor
+    graph_shape_min_segments: int = 4         # min shared bone segments to compare
+    graph_shape_stature_max_m: float = 0.15   # hard stature disagreement gate
+    # F13 splittable clustering: before refinement, lift each multi-camera cluster
+    # and, where the torso-residual chimera signature fires, veto the intruding
+    # (worst) camera's within-cluster pair LLRs down to graph_chimera_veto_llr —
+    # the existing refine move/split machinery then evicts the intruder. This is
+    # the merge-only clustering's missing UNDO (ID-5 permanent chimeras).
+    graph_split_enabled: bool = False
+    graph_chimera_veto_llr: float = -6.0
     # Cue calibration: auto = bootstrap same/diff populations from this delivery,
     # file = load cue_calibration_path, defaults = conservative built-ins.
     calibration_mode: str = "auto"
@@ -193,6 +243,14 @@ class P3AssociationConfig:
     anchor_pair_dist_m: float = 1.5
     anchor_pair_isolation_m: float = 3.0
     diff_pair_min_dist_m: float = 3.0
+    # F8 cold-start robustness: when the strict gates find < 3 anchor pairs, retry
+    # once with these relaxed same-player gates; if still starved, load a prior
+    # calibration fitted on a clean delivery of the same match instead of silently
+    # reverting to the default Gaussians. All off by default (byte-identical).
+    anchor_relax_enabled: bool = False
+    anchor_relax_dist_m: float = 2.0
+    anchor_relax_isolation_m: float = 2.0
+    calibration_fallback_path: str = ""
     # Confidence / gating
     chi2_gate_2dof: float = 5.991
     confidence_high: float = 0.7
@@ -253,6 +311,28 @@ class P3AssociationConfig:
             raise ValueError("graph_facing_gate_scale must be >= 1.0")
         if self.anchor_pair_dist_m >= self.diff_pair_min_dist_m:
             raise ValueError("anchor_pair_dist_m must be < diff_pair_min_dist_m")
+        if self.anchor_relax_dist_m >= self.diff_pair_min_dist_m:
+            raise ValueError("anchor_relax_dist_m must be < diff_pair_min_dist_m")
+        if not isinstance(self.calibration_fallback_path, str):
+            raise ValueError("calibration_fallback_path must be a string (may be empty)")
+        for name in ("single_cam_cov_inflation", "airborne_cov_scale",
+                     "airborne_ankle_bbox_frac", "graph_chimera_torso_residual_px",
+                     "graph_chimera_frame_fraction"):
+            _require_positive(name, getattr(self, name))
+        if type(self.graph_lift_feedback) is not bool:
+            raise ValueError("graph_lift_feedback must be a boolean")
+        if type(self.graph_lift_stride) is not int or self.graph_lift_stride <= 0:
+            raise ValueError("graph_lift_stride must be a positive integer")
+        if type(self.graph_shape_enabled) is not bool:
+            raise ValueError("graph_shape_enabled must be a boolean")
+        if type(self.graph_split_enabled) is not bool:
+            raise ValueError("graph_split_enabled must be a boolean")
+        if self.graph_chimera_veto_llr >= 0:
+            raise ValueError("graph_chimera_veto_llr must be negative")
+        for name in ("graph_shape_min_frames", "graph_shape_min_segments"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        _require_positive("graph_shape_stature_max_m", self.graph_shape_stature_max_m)
         for name in ("baseline_angle_degen_deg", "parallax_full_deg", "mu_fine_score",
                      "sigma_fine_score", "dummy_cost_scale", "cycle_xy_tol_m",
                      "cycle_reproj_tol_px", "triangulation_reproj_threshold_px",
