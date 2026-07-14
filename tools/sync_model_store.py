@@ -3,17 +3,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[1]
 
-from pose_estimation.results_io import file_sha256
+
+def file_sha256(path: str | Path) -> str:
+    """Streaming SHA-256 of a file (was pose_estimation.results_io.file_sha256)."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main() -> int:

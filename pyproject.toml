@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cricket-pose-identity"
+version = "8.1.0"
+description = "Group-1 cricket multi-camera 3D pose & identity pipeline"
+requires-python = ">=3.10"
+
+# src-layout: importable packages live under src/ (core.*, identity.*), plus the
+# top-level orchestrator module main.py and the ops package tools.*.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+norecursedirs = ["external", "checkpoints", "runs", ".model_env_stamps", "data", "drive", "models", "benchmarks", "artifacts"]
