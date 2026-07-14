@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from core.datasets import calibration_root_for
+
 
 @dataclass(frozen=True)
 class GroundPlaneCalibrator:
@@ -38,8 +40,14 @@ class GroundPlaneCalibrator:
         return self.image_to_ground_xy(np.array([x + w / 2.0, y + h], dtype=float))
 
 
-def current_calibration_dir(drive_root: str | Path, match_id: str) -> Path:
-    return Path(drive_root) / "dataset" / "calibration-data" / match_id / "calibration_data"
+def current_calibration_dir(dataset_root: str | Path, match_id: str) -> Path:
+    """Calibration dir for the dataset whose raw/footage root is ``dataset_root``.
+
+    Reroutes through the borrow-aware sibling (``calibration_source`` in
+    ``configs/datasets.yaml``), so a borrowing dataset (40_full) transparently
+    reads the owner's (8_init) ``calibration-data/`` without a second root.
+    """
+    return calibration_root_for(dataset_root) / "calibration-data" / match_id / "calibration_data"
 
 
 def load_projection_matrices_from_drive(drive_root: str | Path, match_id: str) -> dict[str, np.ndarray]:

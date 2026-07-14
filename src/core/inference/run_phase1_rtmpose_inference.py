@@ -45,6 +45,7 @@ from core.contract import (
     validate_group1_frame,
 )
 from core.dataset import FRAME_RE, camera_label, parse_frame_id, repo_relative
+from core.datasets import derived_root, raw_root
 
 # Detailed per-frame failure records are only for the manifest dump (the real
 # counts live in cam_failed). Cap the retained list so a pathological run cannot
@@ -68,7 +69,15 @@ def parse_args() -> argparse.Namespace:
 
     # Dataset selection / filtering
     sel = parser.add_argument_group("dataset selection")
-    sel.add_argument("--drive-root", default="drive", help="Root containing dataset/ (default: drive)")
+    sel.add_argument("--data-root", default=None,
+                     help="Base dir for raw/derived/viz (default: $PIPETRACK_DATA or 'data'; L40S: ~/bits-pose-data)")
+    sel.add_argument("--dataset", default=None,
+                     help="Dataset from configs/datasets.yaml (e.g. 8_init, 40_full); derives --drive-root + --run-dir")
+    sel.add_argument("--version", default=None,
+                     help="Run version -> pipetrack_v<version> (with --dataset, P1 writes <derived>/p1)")
+    sel.add_argument("--drive-root", default=None,
+                     help="Dataset raw/footage root (contains bt_0X/, calibration-data/, events-data/). "
+                          "Default with --dataset: <DATA_ROOT>/raw/<dataset>.")
     sel.add_argument("--groups", nargs="+", default=None,
                      help="Capture groups to include, e.g. bt_01 bt_02 (default: all found)")
     sel.add_argument("--deliveries", nargs="+", default=None,
@@ -379,7 +388,7 @@ def normalize_camera_filters(values: list[str] | None) -> set[str] | None:
 
 def discover_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Return one record per selected camera: paths + filtered frame list."""
-    dataset_root = abspath(args.drive_root) / "dataset"
+    dataset_root = abspath(args.drive_root)
     if not dataset_root.exists():
         raise SystemExit(f"dataset root not found: {dataset_root}")
 
@@ -723,6 +732,17 @@ def should_render_overlay(args: argparse.Namespace, entry: dict[str, Any], overl
 # --------------------------------------------------------------------------- #
 def main() -> int:
     args = parse_args()
+    # Dataset abstraction: --dataset (+ --version) derive the footage root and the
+    # P1 output dir (<derived>/pipetrack_v<version>/p1); explicit flags win.
+    if args.dataset:
+        if not args.version:
+            raise SystemExit("--dataset requires --version (-> pipetrack_v<version>)")
+        if args.drive_root is None:
+            args.drive_root = str(raw_root(args.data_root, args.dataset))
+        if args.run_dir is None:
+            args.run_dir = str(derived_root(args.data_root, args.dataset, args.version) / "p1")
+    if args.drive_root is None:
+        args.drive_root = "drive"
     if not args.show_torch_warnings:
         warnings.filterwarnings(
             "ignore",
@@ -786,7 +806,7 @@ def main() -> int:
     if args.smoke_overlay and not args.benchmark_only and "smoke" in run_id.lower() and not args.overlay:
         args.overlay = True
         print("Smoke run detected; enabling visualizations.", flush=True)
-    run_dir = abspath(args.run_dir) if args.run_dir else (ROOT / "benchmarks" / "runs" / run_id)
+    run_dir = abspath(args.run_dir) if args.run_dir else (ROOT / "data" / "derived" / "runs" / run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     pred_dir = run_dir / "predictions"
     delivery_metrics_dir = run_dir / "delivery_metrics"

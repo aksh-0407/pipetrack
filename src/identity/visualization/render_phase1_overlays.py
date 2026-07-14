@@ -319,7 +319,7 @@ def main() -> int:
         if parts is None:
             continue
         group, delivery_id, camera_id = parts
-        image_dir = drive_root / "dataset" / group / delivery_id / camera_folder(camera_id)
+        image_dir = drive_root / group / delivery_id / camera_folder(camera_id)
         camera_output_dir = artifact_dir / group / delivery_id / camera_id
         camera_output_dir.mkdir(parents=True, exist_ok=True)
         count = 0

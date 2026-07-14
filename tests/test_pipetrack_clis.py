@@ -69,7 +69,7 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
     prediction_dir.mkdir(parents=True)
     centers = {"cam_01": np.array([8.0, 0.0, 4.0]), "cam_02": np.array([0.0, 8.0, 4.0])}
     projections = {camera: _projection(center) for camera, center in centers.items()}
-    calibration_dir = drive_root / "dataset" / "calibration-data" / "MATCH" / "calibration_data"
+    calibration_dir = drive_root / "calibration-data" / "MATCH" / "calibration_data"
     calibration_dir.mkdir(parents=True)
     (calibration_dir / "Bundle_Adjusted_extrinsics.json").write_text(json.dumps({
         "projection_matrices": {"C01": projections["cam_01"].tolist(), "C02": projections["cam_02"].tolist()}

@@ -28,6 +28,7 @@ from core.dataset import (
     repo_relative,
     resolve_delivery_camera_dirs,
 )
+from core.datasets import calibration_root_for
 from identity.common.geometry import (
     ground_point_visible_in,
     project_ground_to_pixel,
@@ -1816,7 +1817,7 @@ def main() -> int:
 
     selected_cameras = args.cameras or sorted(prediction_paths_by_camera)
     camera_dirs = resolve_delivery_camera_dirs(drive_root, delivery_id)
-    ball_positions = load_ball_positions(drive_root / "dataset" / "events-data", delivery_id)
+    ball_positions = load_ball_positions(drive_root / "events-data", delivery_id)
     records_by_camera: dict[str, list[dict[str, Any]]] = {}
     cluster_badges = load_cluster_badges(run_dir / "diagnostics" / "correspondences.jsonl")
     for camera_id in selected_cameras:
@@ -1941,8 +1942,7 @@ def main() -> int:
                 output_path=artifact_dir / f"{delivery_id}__ground_tracks.mp4",
                 settings=settings,
                 pitch_extents=load_pitch_extents(
-                    drive_root
-                    / "dataset"
+                    calibration_root_for(drive_root)
                     / "calibration-data"
                     / manifest.get("match_id", "CCPL080626")
                     / "calibration_data"

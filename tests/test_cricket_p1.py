@@ -46,7 +46,6 @@ def make_tiny_delivery(root: Path, delivery_id: str = "DELIVERY_001", frame_coun
             for frame_id in range(1, frame_count + 1):
                 write_image(
                     root
-                    / "dataset"
                     / group
                     / delivery_id
                     / f"camera{camera}"

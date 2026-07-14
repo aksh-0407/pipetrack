@@ -107,15 +107,18 @@ def _camera_record(
 
 
 def discover_dataset(
-    drive_root: str | Path,
+    dataset_root: str | Path,
     *,
     expected_frame_count: int = 600,
     inspect_dimensions: bool = True,
 ) -> dict[str, Any]:
-    """Discover deliveries, camera folders, frame counts, and sync mismatches."""
+    """Discover deliveries, camera folders, frame counts, and sync mismatches.
 
-    drive_root = Path(drive_root)
-    dataset_root = drive_root / "dataset"
+    ``dataset_root`` is a dataset's raw root (``<DATA_ROOT>/raw/<dataset>``) that
+    directly contains the ``bt_0X/`` capture groups.
+    """
+
+    dataset_root = Path(dataset_root)
     errors: list[str] = []
     warnings: list[str] = []
     delivery_map: dict[str, dict[str, Any]] = {}
@@ -257,13 +260,15 @@ def discover_dataset(
 
 
 def resolve_delivery_camera_dirs(
-    drive_root: str | Path,
+    dataset_root: str | Path,
     delivery_id: str,
 ) -> dict[str, Path]:
-    """Return full-frame camera folders for one delivery keyed by cam_XX."""
+    """Return full-frame camera folders for one delivery keyed by cam_XX.
 
-    drive_root = Path(drive_root)
-    dataset_root = drive_root / "dataset"
+    ``dataset_root`` is a dataset's raw root (``<DATA_ROOT>/raw/<dataset>``).
+    """
+
+    dataset_root = Path(dataset_root)
     camera_dirs: dict[str, Path] = {}
     for capture_group, camera_numbers in EXPECTED_CAMERA_GROUPS.items():
         delivery_root = dataset_root / capture_group / delivery_id

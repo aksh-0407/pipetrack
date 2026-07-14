@@ -51,6 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from core.datasets import derived_root, raw_root, viz_root  # noqa: E402
 from identity.id_pipeline import (  # noqa: E402
     ALL_DELIVERIES,
     _dig,
@@ -250,7 +251,7 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
 
 def run_render(plan: DeliveryPlan) -> int:
     args, delivery = plan.args, plan.delivery
-    artifact_dir = Path(args.artifacts_root).resolve() / "mosaics" / delivery
+    artifact_dir = Path(args.artifacts_root).resolve() / delivery
     return _run_stage(
         "identity.visualization.render_videos",
         ["--run-dir", str(plan.stage_dir("05_global_id")), "--drive-root", args.drive_root,
@@ -352,10 +353,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deliveries", default=None,
                         help="Comma-separated delivery ids; 'all' discovers every delivery "
                              "in the input tree's predictions/ (default: the 8 benchmark ids).")
-    parser.add_argument("--input-tree", default="data/derived/runs/rtmpose-x-tiled-w5-full",
-                        help="P1 predictions run dir (flat predictions/*.jsonl).")
-    parser.add_argument("--output-tree", required=True,
-                        help="Tree to write stage outputs into (deliveries/<D>/...).")
+    parser.add_argument("--data-root", default=None,
+                        help="Base dir for raw/derived/viz (default: $PIPETRACK_DATA or 'data'; "
+                             "on the L40S box point it at ~/bits-pose-data).")
+    parser.add_argument("--dataset", default=None,
+                        help="Dataset from configs/datasets.yaml (e.g. 8_init, 40_full). With "
+                             "--version, derives --drive-root/--input-tree/--output-tree/--artifacts-root.")
+    parser.add_argument("--version", default=None,
+                        help="Run version token -> pipetrack_v<version> (requires --dataset).")
+    parser.add_argument("--input-tree", default=None,
+                        help="P1 predictions run dir (flat predictions/*.jsonl). "
+                             "Default with --dataset: <derived>/pipetrack_v<version>/p1.")
+    parser.add_argument("--output-tree", default=None,
+                        help="Tree to write stage outputs into (deliveries/<D>/...). "
+                             "Default with --dataset: <derived>/pipetrack_v<version>.")
     parser.add_argument("--base-tree", default=None,
                         help="Frozen tree to reuse stages before --from-stage from (read in place).")
     parser.add_argument("--from-stage", default="01_stabilization", choices=STAGE_ORDER)
@@ -387,8 +398,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tri-dense-fill", action=argparse.BooleanOptionalAction, default=True,
                         help="Fix C6: gap-gate temporal fills on real frame numbers (default off).")
     parser.add_argument("--artifacts-root", default=None,
-                        help="Mosaics land in <artifacts-root>/mosaics/<D>/ (required to render).")
-    parser.add_argument("--drive-root", default="drive")
+                        help="Mosaics land in <artifacts-root>/<D>/ (required to render). "
+                             "Default with --dataset: <DATA_ROOT>/viz/<dataset>/pipetrack_v<version>.")
+    parser.add_argument("--drive-root", default=None,
+                        help="Dataset raw/footage root. Default with --dataset: <DATA_ROOT>/raw/<dataset>.")
     parser.add_argument("--expected-frames", type=int, default=600)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--jobs", type=int, default=4, help="Parallel delivery compute chains.")
@@ -405,6 +418,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    # Dataset abstraction: one layout under DATA_ROOT, identical on every machine.
+    # --dataset + --version derive the footage/derived/viz trees; explicit flags win.
+    if args.dataset:
+        if not args.version:
+            raise SystemExit("--dataset requires --version (-> pipetrack_v<version>)")
+        derived = str(derived_root(args.data_root, args.dataset, args.version))
+        if args.drive_root is None:
+            args.drive_root = str(raw_root(args.data_root, args.dataset))
+        if args.output_tree is None:
+            args.output_tree = derived
+        if args.input_tree is None:
+            args.input_tree = str(Path(derived) / "p1")
+        if args.artifacts_root is None:
+            args.artifacts_root = str(viz_root(args.data_root, args.dataset, args.version))
+    if args.drive_root is None:
+        args.drive_root = "drive"
+    if args.input_tree is None:
+        args.input_tree = "data/derived/runs/rtmpose-x-tiled-w5-full"
+    if args.output_tree is None:
+        raise SystemExit("provide --output-tree (or --dataset with --version)")
     if args.skip_render and args.until_stage == "08_render":
         args.until_stage = "07_lift3d"
     if args.deliveries == "all":

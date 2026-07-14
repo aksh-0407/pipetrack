@@ -172,7 +172,6 @@ def load_crop_windows(path: Path | None) -> dict[str, list[list[int]]]:
 def default_crop_config_path(drive_root: Path) -> Path:
     return (
         drive_root
-        / "dataset"
         / "calibration-data"
         / "CCPL080626"
         / "calibration_data"

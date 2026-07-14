@@ -73,7 +73,7 @@ class Candidate:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-root", default=None, help="L40S layout root containing bt1/bt2/bt3")
-    ap.add_argument("--drive-root", default="drive", help="Local layout root containing dataset/bt_0X")
+    ap.add_argument("--drive-root", default="data/raw/8_init", help="Dataset raw root containing bt_0X/ (e.g. data/raw/8_init)")
     ap.add_argument("--deliveries", nargs="+", required=True)
     ap.add_argument("--cameras", nargs="+", default=None, help="camera01 / cam_01 / 1 (default all)")
     ap.add_argument("--stride", type=int, default=5)
@@ -98,7 +98,7 @@ def discover_frames(args: argparse.Namespace) -> dict[tuple[str, str], list[Path
     if args.data_root:
         base = Path(args.data_root).expanduser()
         roots += sorted(base.glob("bt[0-9]"))
-    drive = Path(args.drive_root).expanduser() / "dataset"
+    drive = Path(args.drive_root).expanduser()
     if drive.is_dir():
         roots += sorted(drive.glob("bt_0[0-9]"))
     wanted_cams = {_norm_cam(c) for c in args.cameras} if args.cameras else None

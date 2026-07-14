@@ -1,0 +1,25 @@
+# Dataset registry — maps a logical dataset name to its on-disk layout.
+#
+# All data lives under a single DATA_ROOT, chosen per machine:
+#   * laptop : "data"            (repo-relative; the default)
+#   * L40S   : ~/bits-pose-data  (pass --data-root or set PIPETRACK_DATA)
+# Select it with --data-root / env PIPETRACK_DATA. The tree under it is IDENTICAL
+# on every machine — only the base differs:
+#
+#   <DATA_ROOT>/raw/<dataset>/{<capture_group>/<delivery>/cameraNN/*.jpg,
+#                              calibration-data/, events-data/}
+#   <DATA_ROOT>/derived/<dataset>/pipetrack_v<version>/{p1/, deliveries/<D>/<stage>/}
+#   <DATA_ROOT>/viz/<dataset>/pipetrack_v<version>/<D>/<D>__all_cameras.mp4
+#
+# calibration_source lets a dataset borrow another dataset's calibration-data/
+# (both matches were shot in one calibrated session, match_id CCPL080626, so
+# 40_full reuses 8_init's calibration). "self" (or the dataset's own name) means
+# it owns its calibration.
+
+datasets:
+  8_init:            # the originally-shared 8-delivery set (M1 over 14 ×7 + M2_1_12_1)
+    calibration_source: self
+    events_subdir: events-data
+  40_full:           # the full 40-delivery campaign (L40S only)
+    calibration_source: 8_init
+    events_subdir: events-data

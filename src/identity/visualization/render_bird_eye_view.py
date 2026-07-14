@@ -73,7 +73,7 @@ def load_single_camera_ids(p4_dir: Path) -> dict[int, set[str]]:
 
 
 def load_pitch_points(drive_root: Path, match_id: str) -> np.ndarray:
-    path = drive_root / "dataset" / "calibration-data" / match_id / "calibration_data" / "pitch_calibration_config.json"
+    path = drive_root / "calibration-data" / match_id / "calibration_data" / "pitch_calibration_config.json"
     pts = []
     if path.exists():
         data = json.load(path.open("r", encoding="utf-8"))

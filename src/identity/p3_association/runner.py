@@ -132,7 +132,7 @@ def run_association(
         for camera_id, record in sorted(records_by_frame[frame_index].items()):
             camera_number = int(camera_id.rsplit("_", 1)[1])
             image_path = (
-                drive_root / "dataset" / record["capture_group"] / delivery_id
+                drive_root / record["capture_group"] / delivery_id
                 / f"camera{camera_number:02d}" / record["frame_name"]
             )
             images[camera_id] = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
