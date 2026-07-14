@@ -1,38 +1,39 @@
-"""Full-pipeline batch driver: P1.5 -> P2 -> P3 -> P4 -> P5 -> 3D lift -> mosaic render.
+"""Full-pipeline batch driver: stabilization -> tracking -> association -> lift ->
+global_id -> roles -> (terminal 3D lift) -> mosaic render.
 
-Extends the P3->P4 inner-loop driver (``run_id_pipeline``) to the whole delivery
-chain starting from a P1 predictions run (e.g. ``benchmarks/runs/rtmpose-x``).
+Extends the identity inner-loop driver (``identity.id_pipeline``) to the whole delivery
+chain starting from a P1 predictions run (e.g. ``data/derived/runs/rtmpose-x``).
 Each stage writes the canonical run-dir layout under
-``<output-tree>/deliveries/<DELIVERY>/{p1b,p2,p3,p4,p5,p6_3d,logs}`` and the
-mosaics land in ``<artifacts-root>/mosaics/<DELIVERY>/``.
+``<output-tree>/deliveries/<DELIVERY>/{01_stabilization,02_tracking,03_association,
+04_lift,05_global_id,06_roles,07_lift3d,logs}`` and the mosaics land in
+``<artifacts-root>/mosaics/<DELIVERY>/`` (point --artifacts-root at data/derived/mosaics/<run>).
 
-Designed as the A/B workhorse for the fix campaign (docs/critical-analysis/to-do.md):
+Note the logical order: the binding-keyed 3D lift (04_lift) runs BEFORE global_id, so
+identity can build on 3D positions (Associate -> Triangulate -> Track).
 
-- ``--base-tree`` + ``--from-stage`` reuse upstream stage dirs from a frozen run
-  so a P3-only experiment never re-runs P2 (no copies, dirs are read in place).
+Designed as the A/B workhorse (docs/critical-analysis/, docs/changes_tbd.md):
+
+- ``--from-stage``/``--until-stage`` (or ``--only``/``--skip`` if wired) select the stage
+  window; ``--base-tree`` reuses upstream stage dirs from a frozen run (read in place).
 - Every stage's config path and sha256 are recorded in ``pipeline_manifest.json``.
 - ``--panel-only`` re-prints the joint metric panel; ``--baseline`` diffs it
   against a frozen snapshot tree (same layout, metrics files only).
 
-Example (v6.0 ground baseline)::
+Example (full chain on the reference delivery, run under the ``pose-lab`` env)::
 
     python -m main \
-        --input-tree benchmarks/runs/rtmpose-x \
-        --output-tree benchmarks/runs/pipetrack_v6.0 \
-        --artifacts-root artifacts/pipetrack_v6.0 \
-        --p2-config configs/v6/p2_tracking.yaml \
-        --p3-config configs/v6/p3_association.yaml \
-        --p4-config configs/v6/p4_global_id.yaml \
+        --input-tree data/derived/runs/rtmpose-x \
+        --output-tree data/derived/runs/smoke \
+        --artifacts-root data/derived/mosaics/smoke \
+        --deliveries CCPL080626M1_1_14_1 \
         --jobs 8 --p2-max-workers 2 --render-jobs 2
 
-Example (P3+ experiment reusing the frozen baseline's P2)::
+Example (association+ experiment reusing a frozen tree's tracking)::
 
     python -m main \
-        --from-stage p3 --base-tree benchmarks/runs/pipetrack_v6.0 \
-        --output-tree benchmarks/runs/pipetrack_v6.1-f02 \
-        --p3-config configs/experiments/v6_f02_c07__p3.yaml \
-        --p4-config configs/v6/p4_global_id.yaml \
-        --baseline benchmarks/runs/pipetrack_v6.0/_baseline_snapshot \
+        --from-stage 03_association --base-tree data/derived/runs/pipetrack_v8 \
+        --output-tree data/derived/runs/expt \
+        --p3-config configs/03_association.yaml \
         --skip-render --jobs 8
 """
 
@@ -57,29 +58,29 @@ from identity.id_pipeline import (  # noqa: E402
     _run_stage,
 )
 
-STAGE_ORDER = ["p1b", "p2", "p3", "p3_5", "p4", "p5", "p6_3d", "render"]
+STAGE_ORDER = ["01_stabilization", "02_tracking", "03_association", "04_lift", "05_global_id", "06_roles", "07_lift3d", "08_render"]
 
 # Columns are read jointly — no single one is optimized in isolation.
 # (name, metrics file relative to deliveries/<D>/, dotted key, format)
 PANEL_COLUMNS = [
-    ("agreement", "p4/global_id_metrics.json", "cross_camera_agreement_rate", "{:.3f}"),
-    ("ids", "p4/global_id_metrics.json", "distinct_global_id_count", "{:d}"),
-    ("teleports", "p4/global_id_metrics.json", "teleport_event_count", "{:d}"),
-    ("id_persist", "p4/global_id_metrics.json",
+    ("agreement", "05_global_id/global_id_metrics.json", "cross_camera_agreement_rate", "{:.3f}"),
+    ("ids", "05_global_id/global_id_metrics.json", "distinct_global_id_count", "{:d}"),
+    ("teleports", "05_global_id/global_id_metrics.json", "teleport_event_count", "{:d}"),
+    ("id_persist", "05_global_id/global_id_metrics.json",
      "completeness.confirmed_frame_completeness.mean", "{:.3f}"),
-    ("frags", "p4/global_id_metrics.json", "excess_id_fragment_count_proxy", "{:d}"),
-    ("collisions", "p4/global_id_metrics.json", "same_camera_identity_collision_frames", "{:d}"),
-    ("coloc", "p4/global_id_metrics.json", "colocated_disjoint_pair_count", "{:d}"),
-    ("p2_tracks", "p2/tracking_metrics.json", "@sum_confirmed_tracks", "{:d}"),
-    ("single_cam", "p3/association_metrics.json", "single_camera_rate", "{:.3f}"),
-    ("churn", "p3/association_metrics.json", "pair_link_churn_rate", "{:.3f}"),
-    ("cycle_cons", "p3/association_metrics.json", "cycle_consistency_rate", "{:.3f}"),
-    ("chimera", "p3_5/triangulation_metrics.json", "chimera_suspect_count", "{:d}"),
-    ("d_app", "p3/association_metrics.json", "cue_d_prime.appearance", "{:.2f}"),
-    ("jitter_px", "p1b/stabilization_metrics.json", "mean_jitter_px_after", "{:.2f}"),
-    ("tri_reproj", "p6_3d/triangulation_metrics.json", "mean_reprojection_error_px", "{:.1f}"),
-    ("tri_cov", "p6_3d/triangulation_metrics.json", "triangulation_coverage", "{:.3f}"),
-    ("verdict", "p4/global_id_metrics.json", "quality_verdict.verdict", "{}"),
+    ("frags", "05_global_id/global_id_metrics.json", "excess_id_fragment_count_proxy", "{:d}"),
+    ("collisions", "05_global_id/global_id_metrics.json", "same_camera_identity_collision_frames", "{:d}"),
+    ("coloc", "05_global_id/global_id_metrics.json", "colocated_disjoint_pair_count", "{:d}"),
+    ("p2_tracks", "02_tracking/tracking_metrics.json", "@sum_confirmed_tracks", "{:d}"),
+    ("single_cam", "03_association/association_metrics.json", "single_camera_rate", "{:.3f}"),
+    ("churn", "03_association/association_metrics.json", "pair_link_churn_rate", "{:.3f}"),
+    ("cycle_cons", "03_association/association_metrics.json", "cycle_consistency_rate", "{:.3f}"),
+    ("chimera", "04_lift/triangulation_metrics.json", "chimera_suspect_count", "{:d}"),
+    ("d_app", "03_association/association_metrics.json", "cue_d_prime.appearance", "{:.2f}"),
+    ("jitter_px", "01_stabilization/stabilization_metrics.json", "mean_jitter_px_after", "{:.2f}"),
+    ("tri_reproj", "07_lift3d/triangulation_metrics.json", "mean_reprojection_error_px", "{:.1f}"),
+    ("tri_cov", "07_lift3d/triangulation_metrics.json", "triangulation_coverage", "{:.3f}"),
+    ("verdict", "05_global_id/global_id_metrics.json", "quality_verdict.verdict", "{}"),
 ]
 
 
@@ -127,7 +128,7 @@ class DeliveryPlan:
     def p2_input(self) -> Path:
         """P2 reads stabilized predictions when P1.5 is enabled, else the raw P1 run."""
         if self.args.enable_stabilization:
-            return self.stage_dir("p1b")
+            return self.stage_dir("01_stabilization")
         return Path(self.args.input_tree).resolve()
 
 
@@ -147,7 +148,7 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
             continue
         out_dir = plan.output_root / stage
         log = plan.logs / f"{stage}.log"
-        if stage == "p1b":
+        if stage == "01_stabilization":
             if not args.enable_stabilization:
                 continue
             rc = _run_stage(
@@ -156,7 +157,7 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                 + ["--config", args.p1b_config],
                 args.python, log,
             )
-        elif stage == "p2":
+        elif stage == "02_tracking":
             rc = _run_stage(
                 "identity.p2_tracking.run_per_camera_tracking",
                 common(plan.p2_input(), out_dir)
@@ -165,20 +166,20 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                    "--max-workers", str(args.p2_max_workers)],
                 args.python, log,
             )
-        elif stage == "p3":
+        elif stage == "03_association":
             rc = _run_stage(
                 "identity.p3_association.run_cross_camera_association",
-                common(plan.stage_dir("p2"), out_dir)
+                common(plan.stage_dir("02_tracking"), out_dir)
                 + ["--config", args.p3_config,
                    "--expected-frames", str(args.expected_frames)],
                 args.python, log,
             )
-        elif stage == "p3_5":
+        elif stage == "04_lift":
             if not args.enable_lift:
                 continue
             rc = _run_stage(
                 "identity.p4_lift.run_triangulation",
-                common(plan.stage_dir("p3"), out_dir)
+                common(plan.stage_dir("03_association"), out_dir)
                 + ["--id-source", "binding",
                    "--reprojection-threshold-px", str(args.tri_reproj_px),
                    "--min-views", str(args.tri_min_views),
@@ -190,18 +191,18 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                 + (["--dense-fill"] if args.tri_dense_fill else []),
                 args.python, log,
             )
-        elif stage == "p4":
+        elif stage == "05_global_id":
             rc = _run_stage(
                 "identity.p5_global_id.run_global_id",
-                common(plan.stage_dir("p3"), out_dir)
+                common(plan.stage_dir("03_association"), out_dir)
                 + ["--config", args.p4_config,
                    "--expected-frames", str(args.expected_frames)],
                 args.python, log,
             )
-        elif stage == "p5":
+        elif stage == "06_roles":
             rc = _run_stage(
                 "identity.p6_roles.run_role_assignment",
-                common(plan.stage_dir("p4"), out_dir)
+                common(plan.stage_dir("05_global_id"), out_dir)
                 + (["--config", args.p5_config] if args.p5_config else []),
                 args.python, log,
             )
@@ -210,16 +211,16 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                 # reused base-tree p4 never makes the probe read the wrong p5 dir.
                 rc = _run_stage(
                     "identity.p6_roles.suppress_peripherals",
-                    ["--input-run-dir", str(plan.stage_dir("p4")),
+                    ["--input-run-dir", str(plan.stage_dir("05_global_id")),
                      "--roles-path", str(out_dir / "roles.json"),
                      "--output-path", str(out_dir / "suppression.json")]
                     + (["--config", args.p5_config] if args.p5_config else []),
                     args.python, log,
                 )
-        elif stage == "p6_3d":
+        elif stage == "07_lift3d":
             rc = _run_stage(
                 "identity.p4_lift.run_triangulation",
-                common(plan.stage_dir("p4"), out_dir)
+                common(plan.stage_dir("05_global_id"), out_dir)
                 + ["--reprojection-threshold-px", str(args.tri_reproj_px),
                    "--min-views", str(args.tri_min_views),
                    "--ema-alpha", str(args.tri_ema_alpha),
@@ -235,12 +236,12 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
         result[f"{stage}_rc"] = rc
         # P3/P4 exit 1 for a warn/fail *verdict* but produced full output; every
         # other stage's nonzero rc means the stage itself failed -> stop the chain.
-        if rc not in (0, 1) or (rc == 1 and stage not in ("p3", "p4")):
+        if rc not in (0, 1) or (rc == 1 and stage not in ("03_association", "05_global_id")):
             result["failed_stage"] = stage
             return result
         # H7: a crashed P3/P4 ALSO exits 1 (uncaught exception) — distinguish a
         # warn-verdict from a crash by requiring the stage's metrics artifact.
-        metrics_name = {"p3": "association_metrics.json", "p4": "global_id_metrics.json"}.get(stage)
+        metrics_name = {"03_association": "association_metrics.json", "05_global_id": "global_id_metrics.json"}.get(stage)
         if rc == 1 and metrics_name and not (out_dir / metrics_name).exists():
             result["failed_stage"] = stage
             return result
@@ -252,7 +253,7 @@ def run_render(plan: DeliveryPlan) -> int:
     artifact_dir = Path(args.artifacts_root).resolve() / "mosaics" / delivery
     return _run_stage(
         "identity.visualization.render_videos",
-        ["--run-dir", str(plan.stage_dir("p4")), "--drive-root", args.drive_root,
+        ["--run-dir", str(plan.stage_dir("05_global_id")), "--drive-root", args.drive_root,
          "--delivery-id", delivery, "--artifact-dir", str(artifact_dir),
          "--mode", "mosaic", "--show", "p4"],
         args.python, plan.logs / "render.log",
@@ -261,8 +262,8 @@ def run_render(plan: DeliveryPlan) -> int:
 
 def write_pipeline_manifest(args: argparse.Namespace, stages: list[str], deliveries: list[str]) -> None:
     configs = {
-        "p1b": args.p1b_config, "p2": args.p2_config,
-        "p3": args.p3_config, "p4": args.p4_config, "p5": args.p5_config or None,
+        "01_stabilization": args.p1b_config, "02_tracking": args.p2_config,
+        "03_association": args.p3_config, "05_global_id": args.p4_config, "06_roles": args.p5_config or None,
     }
     manifest = {
         "schema_version": "pipeline_manifest/v1",
@@ -351,14 +352,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deliveries", default=None,
                         help="Comma-separated delivery ids; 'all' discovers every delivery "
                              "in the input tree's predictions/ (default: the 8 benchmark ids).")
-    parser.add_argument("--input-tree", default="benchmarks/runs/rtmpose-x-tiled-w5-full",
+    parser.add_argument("--input-tree", default="data/derived/runs/rtmpose-x-tiled-w5-full",
                         help="P1 predictions run dir (flat predictions/*.jsonl).")
     parser.add_argument("--output-tree", required=True,
                         help="Tree to write stage outputs into (deliveries/<D>/...).")
     parser.add_argument("--base-tree", default=None,
                         help="Frozen tree to reuse stages before --from-stage from (read in place).")
-    parser.add_argument("--from-stage", default="p1b", choices=STAGE_ORDER)
-    parser.add_argument("--until-stage", default="render", choices=STAGE_ORDER)
+    parser.add_argument("--from-stage", default="01_stabilization", choices=STAGE_ORDER)
+    parser.add_argument("--until-stage", default="08_render", choices=STAGE_ORDER)
     parser.add_argument("--skip-render", action="store_true",
                         help="Shorthand for --until-stage p6_3d.")
     parser.add_argument("--enable-stabilization", action=argparse.BooleanOptionalAction,
@@ -367,11 +368,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-lift", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Run the P3.5 binding-keyed 3D lift after P3 (v7 default ON).")
-    parser.add_argument("--p1b-config", default="configs/v8/p1b_stabilization.yaml")
-    parser.add_argument("--p2-config", default="configs/v8/p2_tracking.yaml")
-    parser.add_argument("--p3-config", default="configs/v8/p3_association.yaml")
-    parser.add_argument("--p4-config", default="configs/v8/p4_global_id.yaml")
-    parser.add_argument("--p5-config", default="configs/v8/p5_roles.yaml",
+    parser.add_argument("--p1b-config", default="configs/01_stabilization.yaml")
+    parser.add_argument("--p2-config", default="configs/02_tracking.yaml")
+    parser.add_argument("--p3-config", default="configs/03_association.yaml")
+    parser.add_argument("--p4-config", default="configs/05_global_id.yaml")
+    parser.add_argument("--p5-config", default="configs/06_roles.yaml",
                         help="P5 roles YAML (v1.1 epoch solver); pass '' for legacy v0.")
     parser.add_argument("--tri-reproj-px", type=float, default=10.0)
     parser.add_argument("--tri-min-views", type=int, default=2)
@@ -404,8 +405,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    if args.skip_render and args.until_stage == "render":
-        args.until_stage = "p6_3d"
+    if args.skip_render and args.until_stage == "08_render":
+        args.until_stage = "07_lift3d"
     if args.deliveries == "all":
         # Discover every delivery present in the input tree's P1 predictions
         # (filenames are <capture_group>__<delivery>__cam_NN.jsonl).
@@ -423,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.deliveries else list(ALL_DELIVERIES)
         )
     stages = _stage_window(args.from_stage, args.until_stage)
-    do_render = "render" in stages
+    do_render = "08_render" in stages
     if do_render and not args.artifacts_root and not args.panel_only:
         raise SystemExit("--artifacts-root is required when the render stage is in the window")
 

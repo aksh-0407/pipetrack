@@ -6,12 +6,12 @@ deliveries, reusing the on-disk P2 tracklets, then prints a joint metric panel a
 per stage so eight deliveries can fan out across cores without oversubscription
 (the lesson logged in ``wip/3d_location_methods_log.md``).
 
-Example (all 8, v3 P2 -> v5 P3/P4, diff against the frozen baseline)::
+Example (all 8, reuse a tree's tracking -> association/global_id, diff a baseline)::
 
     python -m identity.id_pipeline \
-        --input-tree benchmarks/runs/pipetrack_v3 \
-        --output-tree benchmarks/runs/pipetrack_v5 \
-        --baseline benchmarks/runs/pipetrack_v3/_baseline_snapshot \
+        --input-tree data/derived/runs/pipetrack_v8 \
+        --output-tree data/derived/runs/pipetrack_v8-id \
+        --baseline data/derived/runs/pipetrack_v8/_baseline_snapshot \
         --jobs 8
 
 ``--panel-only`` skips running and just reads whatever metrics already exist under
@@ -58,7 +58,7 @@ def _blas_capped_env() -> dict[str, str]:
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         env[var] = "1"
-    env["PYTHONPATH"] = str(ROOT)
+    env["PYTHONPATH"] = str(ROOT / "src")
     return env
 
 
@@ -85,9 +85,9 @@ def run_delivery(
     python: str,
     skip_p3: bool,
 ) -> dict:
-    p2_dir = input_tree / "deliveries" / delivery / "p2"
-    p3_dir = output_tree / "deliveries" / delivery / "p3"
-    p4_dir = output_tree / "deliveries" / delivery / "p4"
+    p2_dir = input_tree / "deliveries" / delivery / "02_tracking"
+    p3_dir = output_tree / "deliveries" / delivery / "03_association"
+    p4_dir = output_tree / "deliveries" / delivery / "05_global_id"
     logs = output_tree / "deliveries" / delivery / "logs"
     result = {"delivery": delivery, "p3_rc": None, "p4_rc": None}
 
@@ -122,8 +122,8 @@ def _dig(payload: dict, dotted: str):
 
 def read_panel_row(tree: Path, delivery: str) -> dict:
     row: dict = {"delivery": delivery}
-    p3 = tree / "deliveries" / delivery / "p3" / "association_metrics.json"
-    p4 = tree / "deliveries" / delivery / "p4" / "global_id_metrics.json"
+    p3 = tree / "deliveries" / delivery / "03_association" / "association_metrics.json"
+    p4 = tree / "deliveries" / delivery / "05_global_id" / "global_id_metrics.json"
     p3_metrics = json.loads(p3.read_text()) if p3.exists() else {}
     p4_metrics = json.loads(p4.read_text()) if p4.exists() else {}
     for name, key, _fmt in PANEL_COLUMNS:
@@ -171,16 +171,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--deliveries", default=None,
                         help="Comma-separated delivery ids (default: all 8).")
-    parser.add_argument("--input-tree", default="benchmarks/runs/pipetrack_v3",
-                        help="Tree holding the P2 inputs (deliveries/<D>/p2).")
-    parser.add_argument("--output-tree", default="benchmarks/runs/pipetrack_v5",
-                        help="Tree to write P3/P4 into.")
+    parser.add_argument("--input-tree", default="data/derived/runs/pipetrack_v8",
+                        help="Tree holding the P2 inputs (deliveries/<D>/02_tracking).")
+    parser.add_argument("--output-tree", default="data/derived/runs/pipetrack_v8-id",
+                        help="Tree to write association/global_id into.")
     parser.add_argument("--drive-root", default="drive")
-    parser.add_argument("--p3-config", default="configs/p3_association.yaml")
-    parser.add_argument("--p4-config", default="configs/p4_global_id.yaml")
+    parser.add_argument("--p3-config", default="configs/03_association.yaml")
+    parser.add_argument("--p4-config", default="configs/05_global_id.yaml")
     parser.add_argument("--expected-frames", type=int, default=600)
     parser.add_argument("--python", default=sys.executable,
-                        help="Interpreter for the pipeline stages (use the cricket-rtmpose-l env).")
+                        help="Interpreter for the pipeline stages (use the pose-lab env).")
     parser.add_argument("--jobs", type=int, default=4, help="Parallel deliveries.")
     parser.add_argument("--skip-p3", action="store_true",
                         help="Reuse existing P3 output; only re-run P4.")
