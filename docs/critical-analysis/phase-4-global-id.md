@@ -1,5 +1,7 @@
 # P4 — global identity + tracklet stitching
 
+> **Stage 05** (was P4) — code `src/identity/p5_global_id/`, config `configs/05_global_id.yaml`.
+
 ## Role & intuition
 
 P4 turns per-frame cross-camera correspondences into **persistent global identities** (`P001…`)

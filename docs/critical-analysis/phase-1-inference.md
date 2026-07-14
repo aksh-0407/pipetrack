@@ -1,5 +1,7 @@
 # P1 — 2D pose inference
 
+> **Stage P1 (foundation)** — 2D pose inference. Code: `src/core/inference/`. Upstream producer, not a numbered identity stage.
+
 ## Role & intuition
 
 P1 is the foundation: for every camera frame it finds the people and estimates each person's

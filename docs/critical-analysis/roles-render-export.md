@@ -1,5 +1,7 @@
 # P5 roles, UE export, and the mosaic render
 
+> **Stage 06** roles (was P5) + terminal export/render. Code: `src/identity/p6_roles/`, `src/identity/export/`, `src/identity/visualization/`.
+
 Three consumer stages that turn identified 3D poses into deliverables: **roles** (P5), the
 **Unreal Engine** pose packets (a parallel production branch), and the **mosaic / bird's-eye
 render** (the diagnostic video that is the visible end product).

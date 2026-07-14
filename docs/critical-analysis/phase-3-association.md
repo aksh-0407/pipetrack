@@ -1,5 +1,7 @@
 # P3 — cross-camera association (the identity core)
 
+> **Stage 03** (was P3) — code `src/identity/p3_association/`, config `configs/03_association.yaml`.
+
 ## Role & intuition
 
 P3 answers **"which detection in camera A is the same physical player as which in camera B?"**
@@ -20,7 +22,7 @@ triangulation is unstable — exactly where association is hardest. P3 therefore
 |---|---|
 | **Input** | P2 run; calibration; `configs/03_association.yaml` (+ `_v5`) |
 | **Output** | `predictions/*` + `diagnostics/correspondences.jsonl` (per-frame cross-camera cluster membership) + `association_metrics.json` |
-| **Core modules** | `src/identity/p3_association/{tracklet_graph,associator,geometry_cache,cue_calibration,appearance}.py`; `pose_estimation/cricket/{geometry,pose_shape}.py` |
+| **Core modules** | `src/identity/p3_association/{tracklet_graph,associator,geometry_cache,cue_calibration,appearance}.py`; `src/identity/common/{geometry,pose_shape}.py` |
 | **Facing pairs** | `opposite_camera_pairs: [cam_01,cam_04],[cam_02,cam_06],[cam_03,cam_05]` |
 
 ## Flowchart (tracklet-graph mode, the default)

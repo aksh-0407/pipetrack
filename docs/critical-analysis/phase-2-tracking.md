@@ -1,5 +1,7 @@
 # P2 — per-camera tracking
 
+> **Stage 02** (was P2) — code `src/identity/p2_tracking/`, config `configs/02_tracking.yaml`.
+
 ## Role & intuition
 
 P2 links per-frame detections into **per-camera tracklets** (`local_track_id`) — the temporally

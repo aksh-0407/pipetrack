@@ -19,6 +19,28 @@ fixes in priority order, each backed by a verifiable source.
 Nothing here is invented: quantitative claims trace to the repo's own logs (`wip/*.md`,
 committed `*_metrics.json`) and every external method is cited in [references.md](references.md).
 
+## Stage numbering (post-2026-07 restructure)
+
+This analysis was written with the original phase labels (**P1**…**P6**). The repository has
+since been restructured into `src/{core,identity}` with execution-ordered stage folders, and
+the **3D lift now runs before global identity** (Associate → Triangulate → Track). Read the
+phase docs through this map:
+
+| Analysis label | New stage / folder | Code location |
+|---|---|---|
+| **P1** 2D inference | foundation (unnumbered) | `src/core/inference/` |
+| **P1.5** stabilization | **01** | `src/identity/p1_stabilization/`, `configs/01_stabilization.yaml` |
+| **P2** per-camera tracking | **02** | `src/identity/p2_tracking/`, `configs/02_tracking.yaml` |
+| **P3** cross-camera association | **03** | `src/identity/p3_association/`, `configs/03_association.yaml` |
+| **P6/P3.5** 3D lift (triangulation) | **04** — *before global-id* | `src/identity/p4_lift/run_triangulation.py` |
+| **P4** global identity | **05** | `src/identity/p5_global_id/`, `configs/05_global_id.yaml` |
+| **P5** roles | **06** | `src/identity/p6_roles/`, `configs/06_roles.yaml` |
+| export / render | terminal | `src/identity/export/`, `src/identity/visualization/` |
+
+Shared math/geometry/triangulation live in `src/identity/common/`; the cross-group data
+contract, calibration, keypoints and UE transform live in `src/core/`. The pipeline runs under
+the single **`pose-lab`** conda env via `python -m main`.
+
 ## The one-paragraph thesis
 
 The calibration is **centimetre-accurate** (ball reprojection p95 ≤ 4.5 px), and the 3D
@@ -49,15 +71,15 @@ everywhere — a hard invariant held by construction.)
 
 ## Reading order
 
-1. [phases.md](phases.md) — the ordered pipeline (current **and** the proposed re-order) with flowcharts.
-2. Per-phase deep dives:
-   - [phase-1-inference.md](phase-1-inference.md) — P1: detection + 2D pose (RTMDet + RTMPose-X).
-   - [phase-1b-2d-stabilization.md](phase-1b-2d-stabilization.md) — P1.5: 2D temporal stabilization (new).
-   - [phase-2-tracking.md](phase-2-tracking.md) — P2: per-camera tracking.
-   - [phase-3-association.md](phase-3-association.md) — P3: cross-camera association (the identity core).
-   - [phase-triangulation-3d.md](phase-triangulation-3d.md) — the 3D lift and its optimal placement.
-   - [phase-4-global-id.md](phase-4-global-id.md) — P4: global identity + stitching.
-   - [roles-render-export.md](roles-render-export.md) — P5 roles, UE export, mosaic/BEV render.
+1. [phases.md](phases.md) — the ordered pipeline (now with the lift-before-global-id order adopted) with flowcharts.
+2. Per-phase deep dives (new stage number in brackets):
+   - [phase-1-inference.md](phase-1-inference.md) — **P1** (foundation): detection + 2D pose (RTMDet + RTMPose-X).
+   - [phase-1b-2d-stabilization.md](phase-1b-2d-stabilization.md) — **[01]** 2D temporal stabilization.
+   - [phase-2-tracking.md](phase-2-tracking.md) — **[02]** per-camera tracking.
+   - [phase-3-association.md](phase-3-association.md) — **[03]** cross-camera association (the identity core).
+   - [phase-triangulation-3d.md](phase-triangulation-3d.md) — **[04]** the 3D lift (now runs *before* global-id).
+   - [phase-4-global-id.md](phase-4-global-id.md) — **[05]** global identity + stitching.
+   - [roles-render-export.md](roles-render-export.md) — **[06]** roles, then UE export + mosaic/BEV render.
 3. [fixes-roadmap.md](fixes-roadmap.md) — the cross-cutting, priority-ordered fix roadmap.
 4. [references.md](references.md) — repo anchors + verified external sources.
 

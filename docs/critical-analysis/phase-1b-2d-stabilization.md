@@ -1,5 +1,7 @@
 # P1.5 — 2D temporal stabilization (new)
 
+> **Stage 01** (was P1.5) — code `src/identity/p1_stabilization/`, config `configs/01_stabilization.yaml`.
+
 ## Role & intuition
 
 Off-the-shelf 2D keypoints jitter frame-to-frame even when a player is standing still, and that

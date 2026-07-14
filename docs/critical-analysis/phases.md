@@ -27,7 +27,7 @@ flowchart TD
   P3["P3 · cross-camera association<br/>tracklet-graph LLR on the ground plane<br/>run_cross_camera_association.py"]
   P4["P4 · global identity + stitching<br/>online Singer-KF MOT + min-cost-flow<br/>run_global_id.py"]
   P5["P5 · roles<br/>run_role_assignment.py"]
-  P6["P6 · 3D lift (terminal)<br/>weighted-DLT + RANSAC triangulation<br/>triangulate_predictions.py"]
+  P6["P6 · 3D lift (terminal)<br/>weighted-DLT + RANSAC triangulation<br/>run_triangulation.py"]
   UE["UE pose packets<br/>export_ue_packets.py"]
   R["Mosaic / bird's-eye render<br/>render_phase1_videos.py"]
 
@@ -46,7 +46,7 @@ exactly what the re-ordering below fixes.
 
 > v8.0 update: P1 detection is now **tiled RTMDet-m + NMS 0.55** (produced on the L40S
 > via `run_phase1_l40s.py --tiled-det --nms-thr 0.55`), P2 adds `lowconf_can_spawn:
-> false`, P5 runs roles v1.1 + Wave-6 suppression. Driver defaults: `configs/v8/`.
+> false`, P5 runs roles v1.1 + Wave-6 suppression. Driver defaults: the numbered `configs/0N_*.yaml` set.
 
 Two structural changes, both justified below:
 
@@ -59,9 +59,9 @@ Two structural changes, both justified below:
    global-ID-keyed 3D (now with native-26 keypoints, cheirality, frame-aware fills and a
    zero-phase Butterworth by default).
 
-`src/main.py` now defaults to this order with `configs/v8/`
+`src/main.py` now defaults to this order with the numbered `configs/0N_*.yaml` set
 (tiled-detection stack; `configs/v7/` = the previous identity-stack cut). The legacy
-order remains reproducible via `--no-enable-stabilization --no-enable-lift` + `configs/v6/`.
+order remains reproducible via `--no-enable-stabilization --no-enable-lift` (the pre-restructure `configs/v6/` legacy set was removed).
 
 ```mermaid
 flowchart TD

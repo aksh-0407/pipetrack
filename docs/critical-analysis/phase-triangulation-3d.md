@@ -1,5 +1,7 @@
 # Triangulation / 3D lift — and its optimal placement
 
+> **Stage 04** — the 3D lift, now run **before** global-id (Associate→Triangulate→Track). Code: `src/identity/p4_lift/run_triangulation.py`.
+
 ## Role & intuition
 
 This stage turns the multi-view 2D keypoints of one identified player into a single **3D world
