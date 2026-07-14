@@ -149,3 +149,32 @@ algorithm changes. Bugs marked **FIXED** were corrected in the scrub pass; the r
   `AssertionError("08_render")` before rendering. Now `if stage == "08_render": continue` (render is
   handled by `run_render`). Uncovered by tests (they exercise `_stage_window`/`DeliveryPlan`, not the
   subprocess compute loop) — a future `tests/test_main.py` should drive the loop with a stubbed `_run_stage`.
+
+---
+
+## Data-layout + skeleton + pipeline restructure (2026-07-15)
+
+Landed locally (unit-verified, 201 tests); end-to-end + A/B pending on the L40S box.
+
+- **DONE — dataset abstraction.** `--data-root/--dataset/--version` + `configs/datasets.yaml` +
+  `src/core/datasets.py`; one tree under `DATA_ROOT` (laptop `data/` == L40S `~/bits-pose-data`),
+  borrow-aware calibration (40_full reads 8_init). `dataset.py`/`calibration.py` treat the passed
+  root as the dataset root (no `/dataset` segment).
+- **DONE — Halpe-26 canonical (replaces COCO-17).** Contract `halpe26`/26/`g1_player_frame/v1`;
+  `pose_2d`/`pose_3d` are 26; `*_native` dropped; `pose_3d_named` (root-relative, named) added;
+  viz draws 26 (feet). **Consumer-facing** — coordinate the v1 bump with downstream groups.
+- **DONE — 04 the single triangulation; 07_lift3d deleted.** 04 copies correspondences forward;
+  05 reads 04 and carries `pose_3d` forward; 06 emits the terminal role-stamped, suppression-filtered
+  predictions (the merged handoff); `export_ue_packets` retargeted to the 26-joint run-dir.
+- **OPEN — decide-in-3D (flag-gated A/B).** 05/06 should *consume* the 3D (pelvis_ground_xy +
+  pelvis_cov_m2 as measurement/R from 04's `lift3d.jsonl`; 3D re-ID). Implement behind `--track-in-3d`
+  (default OFF = current ground-plane path), A/B on 8 then 40, adopt only on generalised gain.
+- **OPEN — docs sync.** `docs/{pipeline/04-lift,05-global-id,07-export-and-render,meeting-debug-reference,
+  architecture,shared-data}.md`, README, CHANGELOG still describe `07_lift3d` / COCO-17 / old paths —
+  refresh to 04-single-triangulation, Halpe-26, `data/derived/<dataset>/pipetrack_v<n>` + `data/viz`,
+  and the `pipetrack` repo name.
+- **NOTE — secondary de-hardcoding deferred.** `run_phase1_{l40s,parallel}.py` `/home/ubuntu/...`
+  defaults + `id_pipeline.py --drive-root` default still legacy; harmless (main.py/P1 derive paths),
+  finish during the L40S pass.
+- **NOTE — YOLO/generic P1 path.** `phase1_outputs.coerce_coco17_keypoints` now pads to 26 (feet = 0)
+  under the halpe26 contract — fine for the benchmark-only YOLO path; RTMPose-x (the mandate) emits real 26.
