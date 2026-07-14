@@ -37,8 +37,19 @@ class Track:
         self.kalman = KalmanBoxTracker(bbox_xywh)
         self.last_ground_xy = ground_xy.copy() if ground_xy is not None else None
         self._gallery: deque[PoseVector] = deque(maxlen=config.pose_gallery_size)
+        # Monotonic id per gallery member, kept in lockstep with `_gallery` (same
+        # maxlen -> evicts the oldest in parallel). Lets the medoid cache key pairwise
+        # cosines stably across ring-buffer eviction without unsafe id() reuse.
+        self._gallery_seq: deque[int] = deque(maxlen=config.pose_gallery_size)
+        self._next_seq = 0
+        # (min_seq, max_seq) -> masked_weighted_cosine, reused across frames so the
+        # medoid recomputes only the newly-added member's row (O(K) not O(K^2)).
+        self._pair_cost: dict[tuple[int, int], float] = {}
+        self._pair_cost_min_seq = 0
         if pose.defined:
             self._gallery.append(pose)
+            self._gallery_seq.append(self._next_seq)
+            self._next_seq += 1
         self._gallery_version = 1 if pose.defined else 0
         self._gallery_repr_cache: PoseVector | None = None
         self._gallery_repr_version = -1
@@ -92,6 +103,8 @@ class Track:
             self.last_ground_xy = ground_xy.copy()
         if pose.defined:
             self._gallery.append(pose)
+            self._gallery_seq.append(self._next_seq)
+            self._next_seq += 1
             self._gallery_version += 1
         self.hits += 1
         if confidence > self._config.stage1_confidence_threshold:
@@ -177,6 +190,15 @@ class Track:
             self._gallery_repr_cache = members[0]
             self._gallery_repr_version = self._gallery_version
             return members[0]
+        if self._config.pose_medoid_incremental:
+            self._gallery_repr_cache = self._medoid_incremental(members)
+        else:
+            self._gallery_repr_cache = self._medoid_full(members)
+        self._gallery_repr_version = self._gallery_version
+        return self._gallery_repr_cache
+
+    def _medoid_full(self, members: list[PoseVector]) -> PoseVector:
+        """Legacy O(K^2) medoid: recompute every pairwise cosine each call."""
         best_idx, best_cost = 0, float("inf")
         for i, vi in enumerate(members):
             total = sum(
@@ -186,6 +208,40 @@ class Track:
             )
             if total < best_cost:
                 best_idx, best_cost = i, total
-        self._gallery_repr_cache = members[best_idx]
-        self._gallery_repr_version = self._gallery_version
-        return self._gallery_repr_cache
+        return members[best_idx]
+
+    def _medoid_incremental(self, members: list[PoseVector]) -> PoseVector:
+        """O(K) medoid: reuse the cached pairwise cosines, computing only the pairs
+        involving the newly-appended member. Bit-identical to `_medoid_full` — the
+        cosine is symmetric, values are memoised (not recomputed), and every row sum
+        adds the same per-pair values in the same member order with the same
+        first-minimum tie-break."""
+        seqs = list(self._gallery_seq)
+        cache = self._pair_cost
+        # Drop entries whose older endpoint was evicted from the ring buffer. Current
+        # seqs are a contiguous range; anything below the current minimum is stale.
+        min_seq = seqs[0]
+        if min_seq > self._pair_cost_min_seq:
+            if cache:
+                self._pair_cost = cache = {k: v for k, v in cache.items() if k[0] >= min_seq}
+            self._pair_cost_min_seq = min_seq
+        n = len(members)
+        msk = self._config.min_shared_keypoints
+        for a in range(n):
+            sa = seqs[a]
+            for b in range(a + 1, n):
+                key = (sa, seqs[b])
+                if key not in cache:
+                    cache[key] = masked_weighted_cosine(members[a], members[b], min_shared_keypoints=msk)
+        best_idx, best_cost = 0, float("inf")
+        for i in range(n):
+            si = seqs[i]
+            total = 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                sj = seqs[j]
+                total += cache[(si, sj)] if si < sj else cache[(sj, si)]
+            if total < best_cost:
+                best_idx, best_cost = i, total
+        return members[best_idx]

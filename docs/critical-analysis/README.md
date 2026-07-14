@@ -1,5 +1,15 @@
 # Critical Analysis — Cricket 3D-Pose & Identity Pipeline
 
+> **2026-07-14 — read the fresh 40-delivery production diagnosis first.**
+> For the current, *measured* state of the 40-delivery output (why teleports / many IDs /
+> split IDs / non-smooth persist) see **[`../diagnosis/`](../diagnosis/README.md)** and the
+> meeting-ready single-file reference **[`meeting-debug-reference.md`](meeting-debug-reference.md)**;
+> the prioritized fix list is **[`../changes_tbd.md`](../changes_tbd.md)**.
+> ⚠️ Correction to the thesis below: the "worst per-frame jump 14.0 → 0.36 m" Kalman-emit
+> claim was measured on 8 deliveries and does **not** hold on the full 40 — the emitted
+> `ground_tracks.jsonl` carries 1528 non-physical jumps (root cause: mean-over-fragments
+> emission, `../diagnosis/04-issue-emitted-ground-teleports.md`).
+
 An expert, evidence-grounded review of the pipeline that turns 7-camera cricket footage into
 per-player 3D pose, stable global identity, and the mosaic render. For every phase it walks
 the methods and their math, separates the pros from the cons, enumerates the issues (with

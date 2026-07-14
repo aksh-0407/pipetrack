@@ -1,24 +1,38 @@
 # Active threads (2026-07-14 evening)
 
-## 1. NEXT UP (user's stated plan for a new session): VRAM-accelerated mosaic rendering
-Goal: use the L40S's 46 GB VRAM to render all mosaics fast (8-batch, then all 40).
-Current renderer is CPU-bound (~10 min/delivery: cv2 decode + numpy compositing + x264).
-Leads, in expected-yield order:
-- **NVENC encoding**: renderer already probes `_ffmpeg_has_nvenc()`
-  (`render_phase1_videos.py:94`) and prefers `h264_nvenc` — but the static ffmpeg at
-  `~/bin/ffmpeg` (johnvansickle) has NO nvenc. Install an nvenc-capable ffmpeg (conda
-  `ffmpeg` with nvenc, or a BtbN/ffmpeg-builds GPL binary) → encoding offloaded to GPU.
-- **GPU decode**: frame JPEG decode via nvJPEG (torchvision.io.decode_jpeg(device='cuda')
-  in the cricket-rtmpose-l env) instead of cv2.imread — decode is a large slice of render
-  time (7 cams × 600 × 2560×1440). Caveat: nvJPEG lost to cv2 on the laptop 4060 (~19 vs
-  14 ms, GPU shared with pose) — but during renders the L40S GPU is IDLE, so measure fresh
-  there rather than trusting that verdict.
-- **Compositing on GPU**: torch tensor ops for resize/blend instead of cv2/numpy (biggest
-  rewrite; only if the first two don't reach the target).
-- Parallelism: renders are per-delivery independent — with GPU decode+encode, 4+ parallel
-  renders become feasible (8 vCPUs stop being the ceiling).
-Mosaic spec: upgraded renderer (collision-free chips, body paint, roles in roster only);
-8 benchmark deliveries pulled to laptop for review first, then all 40 stay on the box.
+## 1. RESOLVED (2026-07-14): mosaic + P1 "VRAM" optimization — VRAM was NOT the lever
+Full writeup: `wip/optimization_findings_2026-07-14.md`. Measured on the L40S:
+- **GPU decode is 3.2× SLOWER** than cv2 even on the idle L40S (per-image D2H copy +
+  tensor reshape). NVENC is not the bottleneck at 1080p (encode overlaps the draw loop).
+  The mosaic is CPU/memory-bandwidth-bound rasterisation. Force `QT_RENDER_GPU_DECODE=0`.
+- Real lever = multiprocess across the 40 independent deliveries: **3.2× at 6-wide**
+  (8-wide oversubscribes). Built `scripts/visualization/render_all_mosaics.py` (resumable,
+  thread-capped, per-delivery logs). **All 40 rendered in 18.9 min, 0 fail** (~21× vs
+  serial). Pack: `artifacts/mosaics_all40/` on the box (+ laptop copy).
+- **P1 is GPU-compute bound at ~28 f/s using only 1.6 GB VRAM**; batch size is flat
+  (batch-invariant). Idle SMs → data-parallel processes give 1.5× (2-wide) / 2.0× (3-wide).
+  Built `scripts/inference/run_phase1_parallel.py` (delivery shards, resume-safe).
+  Reminder: the sweep needs `--sweep --grid` TOGETHER; `--grid` alone starts a FULL run.
+- CPU chain profile (clean serial): **P2 44%, P3 39%** dominate; triangulation already
+  fast. Batch is core-bound at jobs=7.
+
+## 1b. DSA optimizations SHIPPED (2026-07-14, byte-identical — user rule: accuracy first, zero output diff)
+Full writeup: `wip/optimization_findings_2026-07-14.md`. User standard tightened to
+**every speed change must be byte-identical** (appearance-disable was DROPPED — it moved
+cycle-consistency 0.701→0.687).
+- **P2 medoid cache (the big win)**: `track.py`/`config.py`. `gallery_repr` recomputed the
+  O(K²) gallery medoid (K=30) every hit; cached pairwise cosines keyed by monotonic seq id
+  → O(K) per update. **154s→10s per delivery (15.5×)**, bit-identical (proven vs baseline
+  AND vs shipped production output, 3 deliveries × p2/p3/p4/p6). Flag `pose_medoid_incremental`.
+- **P3 `ground_anchored_skeleton` vectorised** (`pose_shape.py`): per-joint loop → batched;
+  bit-identical on 20k random cases + full-chain. Modest P3 win.
+- Full single-delivery chain 348s→111s, byte-identical end-to-end. 212 tests pass.
+- **No byte-identical win found** in: P4 (61% irreducible json.dumps), P3.5/P6 (already
+  W10-PERF batched), P1.5 OneEuroFilter (stateful, risky, 4% phase — flagged), P3 appearance
+  (output-changing, dropped). CPU batch is 8-vCPU-core-bound; more throughput needs DSA or
+  more vCPUs (deliveries independent → scales ~linearly with cores).
+- Changed files uncommitted on laptop+box (user runs commits): track.py, config.py,
+  pose_shape.py + new render_all_mosaics.py, run_phase1_parallel.py.
 
 ## 2. Manager's reprojection questions (analysis DONE, answer in chat 2026-07-14)
 Numbers measured on v8.1 (`_14_4`+`_14_7`, ~331k joint-view residuals):

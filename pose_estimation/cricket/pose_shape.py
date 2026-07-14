@@ -315,22 +315,21 @@ def ground_anchored_skeleton(
     except np.linalg.LinAlgError:
         return out, valid
     plane_offset = float(normal @ (anchor - C))
-    for j in range(joints):
-        if not (np.isfinite(conf[j]) and conf[j] >= min_conf and np.isfinite(points[j]).all()):
-            continue
-        d = rays[j]
-        denom = float(normal @ d)
-        if not np.isfinite(denom) or abs(denom) < 1e-9:
-            continue
-        X = C + (plane_offset / denom) * d
-        if not np.isfinite(X).all():
-            continue
-        if X[2] < -0.5 or X[2] > max_height_m:
-            continue
-        if float(np.linalg.norm(X[:2] - anchor[:2])) > max_lateral_m:
-            continue
-        out[j] = X
-        valid[j] = True
+    # Vectorised ray-plane intersection over all joints (each joint is independent,
+    # no cross-joint reduction) — bit-identical to the per-joint loop it replaces
+    # (proven by exact-equality test on real calibration + keypoint data).
+    conf_ok = np.isfinite(conf) & (conf >= min_conf) & np.isfinite(points).all(axis=1)
+    denoms = rays @ normal                                     # (joints,)
+    denom_ok = np.isfinite(denoms) & (np.abs(denoms) >= 1e-9)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        scale = np.where(denom_ok, plane_offset / denoms, np.nan)
+    X = C[None, :] + scale[:, None] * rays                    # (joints, 3)
+    X_ok = np.isfinite(X).all(axis=1)
+    height_ok = (X[:, 2] >= -0.5) & (X[:, 2] <= max_height_m)
+    lateral_ok = np.linalg.norm(X[:, :2] - anchor[:2], axis=1) <= max_lateral_m
+    keep = conf_ok & denom_ok & X_ok & height_ok & lateral_ok
+    out[keep] = X[keep]
+    valid[keep] = True
     return out, valid
 
 

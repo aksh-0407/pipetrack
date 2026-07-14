@@ -66,6 +66,11 @@ class P4AConfig:
     # of every existing confirmed track.
     expected_roster_max: int = 15
     roster_cap_min_separation_m: float = 3.0
+    # Verdict rubric: "usability" (composite over agreement/emitted-smoothness/
+    # persistence/parsimony + hard gates) vs the legacy teleport-proxy rule. The
+    # legacy rule graded off a raw-foot-projection teleport proxy that ignored
+    # cross-camera agreement entirely (docs/diagnosis/10-verdict-redesign.md).
+    usability_verdict: bool = True
     # Pose-shape temporal tie-breaker: added to the Stage-2 cost INSIDE the chi2
     # gate only, so it re-ranks admissible candidates but never opens/blocks a
     # match. 0 disables. Needs empirical tuning (no identity ground truth).

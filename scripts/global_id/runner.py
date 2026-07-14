@@ -418,33 +418,111 @@ def run_global_id(
     roster_max = config.p4a.expected_roster_max
     distinct_ids = identity_proxy["distinct_global_id_count"]
     teleports = teleport_metrics["teleport_event_count"]
+    collisions = collision_metrics["same_camera_identity_collision_frames"]
+    coloc_pairs = colocated_metrics["colocated_disjoint_pair_count"]
+
+    # Emitted big jumps: single-frame (>25 m/s) leaps in the EMITTED ground track
+    # (the delivered posterior), NOT the raw-foot-projection teleport proxy. This is
+    # the real smoothness signal (docs/diagnosis/04-issue-emitted-ground-teleports.md).
+    _emit_series: dict[str, dict[int, np.ndarray]] = defaultdict(dict)
+    for frame_index, rows in ground_rows_by_frame.items():
+        for row in rows:
+            xy = np.asarray(row["ground_xy"], dtype=float)
+            if np.isfinite(xy).all():
+                _emit_series[row["global_player_id"]][frame_index] = xy
+    emitted_big_jumps = 0
+    for series in _emit_series.values():
+        frames = sorted(series)
+        for prev_f, curr_f in zip(frames, frames[1:]):
+            if curr_f - prev_f != 1:
+                continue
+            speed = float(np.linalg.norm(series[curr_f] - series[prev_f])) * config.frame_rate_fps
+            if speed > 25.0:
+                emitted_big_jumps += 1
+
     verdict_reasons: list[str] = []
-    verdict = "pass"
-    if distinct_ids > 2 * roster_max:
-        verdict = "fail"
-        verdict_reasons.append(f"id_overmint: {distinct_ids} ids for <= {roster_max} people")
-    elif distinct_ids > int(1.2 * roster_max):
-        verdict = "warn"
-        verdict_reasons.append(f"id_overmint: {distinct_ids} ids for <= {roster_max} people")
-    if teleports > 60:
-        verdict = "fail"
-        verdict_reasons.append(f"teleport_storm: {teleports} events")
-    elif teleports > 20 and verdict != "fail":
-        verdict = "warn"
-        verdict_reasons.append(f"teleports_elevated: {teleports} events")
-    if collision_metrics["same_camera_identity_collision_frames"] > 0:
-        verdict = "fail"
-        verdict_reasons.append("same_camera_id_collision")
-    if colocated_metrics["colocated_disjoint_pair_count"] > 0 and verdict != "fail":
-        verdict = "warn"
-        verdict_reasons.append(
-            f"colocated_split_ids: {colocated_metrics['colocated_disjoint_pair_count']} pairs"
+    if getattr(config.p4a, "usability_verdict", True):
+        # Composite usability grade. Hard gates first, then a weighted score whose
+        # dominant axis is cross-camera AGREEMENT (the primary identity axis the
+        # legacy rule ignored). Coverage (a P6 metric) is folded in by the panel
+        # re-grade tool; here we renormalize over the four P4-available axes.
+        # Rubric + thresholds: docs/diagnosis/10-verdict-redesign.md.
+        agreement = agreement_metrics["cross_camera_agreement_rate"]
+        persist = (
+            completeness.get("confirmed_frame_completeness", {}).get("mean", 0.0)
+            if isinstance(completeness, dict) else 0.0
         )
-    quality_verdict = {
-        "verdict": verdict,
-        "reasons": verdict_reasons,
-        "expected_roster_max": roster_max,
-    }
+
+        def _clamp(value: float) -> float:
+            return max(0.0, min(1.0, value))
+
+        sub = {
+            "agreement": _clamp((agreement - 0.72) / 0.24),
+            "smoothness": _clamp(1.0 - emitted_big_jumps / 50.0),
+            "persistence": _clamp((persist - 0.80) / 0.18),
+            "parsimony": _clamp((16 - distinct_ids) / 3.0),
+        }
+        weights = {"agreement": 0.45, "smoothness": 0.30, "persistence": 0.12, "parsimony": 0.13}
+        score = sum(weights[k] * sub[k] for k in weights) - 0.10 * coloc_pairs
+        score = max(0.0, score)
+
+        gate = None
+        if collisions > 0:
+            gate = "same_camera_collision"
+        elif distinct_ids > 20:
+            gate = f"id_overmint: {distinct_ids} ids"
+        elif agreement < 0.65:
+            gate = f"identity_broken: agreement {agreement:.3f}"
+
+        if gate is not None:
+            verdict = "fail"
+            verdict_reasons.append(gate)
+        elif score >= 0.75:
+            verdict = "good"
+        elif score >= 0.55:
+            verdict = "usable"
+        elif score >= 0.40:
+            verdict = "weak"
+        else:
+            verdict = "fail"
+        limiting = min(sub, key=sub.get)
+        verdict_reasons.append(f"limiting_axis: {limiting} ({sub[limiting]:.2f})")
+        if coloc_pairs > 0:
+            verdict_reasons.append(f"colocated_split_ids: {coloc_pairs} pairs")
+        quality_verdict = {
+            "verdict": verdict,
+            "score": round(score, 3),
+            "subscores": {k: round(v, 3) for k, v in sub.items()},
+            "emitted_big_jumps": emitted_big_jumps,
+            "reasons": verdict_reasons,
+            "expected_roster_max": roster_max,
+        }
+    else:
+        # Legacy teleport-proxy rule (recoverable for reproducibility).
+        verdict = "pass"
+        if distinct_ids > 2 * roster_max:
+            verdict = "fail"
+            verdict_reasons.append(f"id_overmint: {distinct_ids} ids for <= {roster_max} people")
+        elif distinct_ids > int(1.2 * roster_max):
+            verdict = "warn"
+            verdict_reasons.append(f"id_overmint: {distinct_ids} ids for <= {roster_max} people")
+        if teleports > 60:
+            verdict = "fail"
+            verdict_reasons.append(f"teleport_storm: {teleports} events")
+        elif teleports > 20 and verdict != "fail":
+            verdict = "warn"
+            verdict_reasons.append(f"teleports_elevated: {teleports} events")
+        if collisions > 0:
+            verdict = "fail"
+            verdict_reasons.append("same_camera_id_collision")
+        if coloc_pairs > 0 and verdict != "fail":
+            verdict = "warn"
+            verdict_reasons.append(f"colocated_split_ids: {coloc_pairs} pairs")
+        quality_verdict = {
+            "verdict": verdict,
+            "reasons": verdict_reasons,
+            "expected_roster_max": roster_max,
+        }
 
     metrics = {
         "schema_version": "global_id_metrics/v1",

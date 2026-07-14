@@ -48,6 +48,11 @@ class TrackingConfig:
     # Gallery
     pose_gallery_size: int = 30
     gallery_repr: str = "medoid"
+    # Perf: cache pairwise gallery cosines so the medoid recomputes only the new
+    # member's distances (O(K) vs O(K^2)) instead of the whole matrix every hit.
+    # Bit-identical to the legacy full recompute (reuses the same cosine values);
+    # flag lets the byte-identity A/B prove flags-off equality.
+    pose_medoid_incremental: bool = True
 
     def __post_init__(self) -> None:
         _require_range("stage1_confidence_threshold", self.stage1_confidence_threshold, 0.0, 1.0)
