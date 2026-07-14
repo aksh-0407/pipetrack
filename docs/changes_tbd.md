@@ -117,3 +117,29 @@ deliberately.
 3. **Larger lever**: C8 (F16) — the structural fix for coverage/single-cam.
 
 Each lands with a `fixes-log.md` entry (mechanism, panel, verdict) the moment it's A/B'd.
+
+---
+
+## Restructure follow-ups & bugs found (2026-07 docs/scrub pass)
+
+These are repo-hygiene items from the `src/{core,identity}` + `tools/` restructure — not
+algorithm changes. Bugs marked **FIXED** were corrected in the scrub pass; the rest are notes.
+
+- **FIXED — `tools/` kept old imports.** Root cause: the restructure's import-rewrite pass scoped
+  only `src/` + `tests/`, so `tools/` modules still imported the removed `pose_estimation.*` /
+  `scripts.*` names and would crash at runtime. Fixed:
+  - `tools/diagnosis/eval_ground_accuracy.py` → `identity.common.triangulation`, `core.calibration`.
+  - `tools/diagnosis/split_identity.py` → `core.calibration`, `identity.p2_tracking.runner`;
+    replaced the hardcoded `/home/ubuntu/pose-estimation-benchmark` `sys.path` insert with a
+    repo-relative `src/` insert.
+  - `src/identity/visualization/render_all_mosaics.py` → `RENDERER` now points at
+    `src/identity/visualization/render_videos.py` (was the removed `scripts/.../render_phase1_videos.py`).
+  - `tools/run_v8_l40s.sh` → `python -m main`, `pose-lab` env, `configs/0N_*.yaml`; also fixed a
+    `REPO=$(… /../..)` depth bug (script moved one level shallower into `tools/`).
+- **NOTE — `--show p4` render flag.** `src/main.py`'s render call passes `--show p4` as a *semantic*
+  stage selector consumed by `render_videos.py` (P2/P3/P4 id vocabulary), not a run-dir name — left
+  as-is intentionally; revisit if the renderer's `--show` vocabulary is ever renumbered.
+- **NOTE — deferred algorithm items unchanged.** The Associate→Triangulate→Track payoff (feed the
+  triangulated 3D into `05_global_id` instead of the z=0 reproj ground point) and dropping the
+  redundant terminal `07_lift3d` re-triangulation remain open (see the code-restructure notes); the
+  reorder made them *possible* but they need the standard 8-/40-delivery A/B before adoption.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Batch mosaic renderer — render every delivery's mosaic in parallel.
 
-Each delivery's mosaic render (``render_phase1_videos.py --mode mosaic``) is a
+Each delivery's mosaic render (``render_videos.py --mode mosaic``) is a
 CPU-bound rasterisation job: 7 camera JPEG decodes + skeleton/chip/text drawing
 + 1920x1080 compositing per frame, with libx264 encode overlapping on spare
 cores. On the L40S it runs at ~1.7 CPU-cores and ~100 s for a 600-frame
@@ -34,7 +34,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-RENDERER = ROOT / "scripts" / "visualization" / "render_phase1_videos.py"
+RENDERER = ROOT / "src" / "identity" / "visualization" / "render_videos.py"
 
 
 def discover_deliveries(deliveries_root: Path, run_subdir: str) -> list[tuple[str, Path]]:

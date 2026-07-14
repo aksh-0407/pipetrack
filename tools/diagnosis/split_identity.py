@@ -4,12 +4,13 @@
 then for each physical cluster spanning >=2 cameras, count distinct global ids and
 which camera-pairs disagree. Tally by camera pair to test the facing-pair hypothesis."""
 import sys, os, json, glob
-sys.path.insert(0, "/home/ubuntu/pose-estimation-benchmark")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
 import numpy as np
 from collections import defaultdict
-from scripts.tracking.calibration import build_ground_calibrators
-from scripts.tracking.runner import infer_match_id
+from core.calibration import build_ground_calibrators
+from identity.p2_tracking.runner import infer_match_id
 
+# ROOT/DRIVE point at the box's production tree; override for a local run.
 ROOT="/home/ubuntu/pipetrack_v8/deliveries"
 DRIVE="/home/ubuntu/render_drive"
 RAD=1.5
