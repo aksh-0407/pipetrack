@@ -1,5 +1,8 @@
 # Campaign knowledge — settled verdicts (do NOT re-litigate without new evidence)
 
+> **RESTRUCTURE 2026-07-14:** repo reorganised into `src/{core,identity}` + `tools/`, stages renumbered (`01…06`), single `pose-lab` env, benchmarking off `main`. New layout/commands: see `01-current-state.md` + `04-conventions.md`. The L40S box is UNCHANGED until it pulls the branch and rebuilds/renames its env — its `/home/ubuntu/...` paths and old `pN` stage-dir names below remain valid as-is.
+
+
 Full record: docs/critical-analysis/fixes-log.md. Highlights:
 
 **Detection**

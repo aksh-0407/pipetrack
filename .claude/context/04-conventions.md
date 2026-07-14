@@ -23,3 +23,23 @@
   timely unprompted progress updates.
 - Laptop crashes historically (work in repo, sync often); it has been stable lately but
   don't leave long-running local state unsaved.
+
+## Repo layout & commands (post-2026-07 restructure)
+
+- **Layout**: `src/core/` (contract, schemas, ue_transform, calibration, keypoints, dataset,
+  + `inference/` = P1) · `src/identity/common/` (geometry, triangulation, pose_shape, metrics)
+  · `src/identity/pN_<stage>/` = `p1_stabilization, p2_tracking, p3_association, p4_lift,
+  p5_global_id, p6_roles` · `src/identity/{export,visualization}` · `src/main.py` (orchestrator)
+  · `tools/` (setup/audit/env, `diagnosis/`, `detector_bakeoff/`) · `configs/0N_<stage>.yaml`
+  (+ `configs/reference/*.jpeg`) · outputs in gitignored `data/derived/{runs,mosaics}/`.
+- **Imports**: `core.*`, `identity.*`, `tools.*` (src on path via `pip install -e .` /
+  `pyproject.toml pythonpath`). Rule: `core` never imports `identity`.
+- **Env**: `pose-lab` only. Run everything as `python -m main` / `python -m identity.id_pipeline`
+  / `python -m core.inference.run_phase1_rtmpose_inference`.
+- **Stage-dir names** in a run tree: `deliveries/<D>/{01_stabilization,02_tracking,03_association,
+  04_lift,05_global_id,06_roles,07_lift3d,08_render,logs}/`. NOTE the pre-restructure remote
+  production tree still uses old `p2/p3/p4/p5/p6_3d` names — don't rewrite those historical paths.
+- **Tests**: `env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+  /home/aksh/miniconda3/envs/pose-lab/bin/python -m pytest -q` (exclude the ROS pytest plugin).
+- **Docs numbering**: `docs/critical-analysis/README.md` carries the label↔new-number map; the
+  analysis keeps the historical P1–P6 labels, bridged by that map + per-phase-doc header notes.

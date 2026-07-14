@@ -1,5 +1,8 @@
 # L40S box operations
 
+> **RESTRUCTURE 2026-07-14:** repo reorganised into `src/{core,identity}` + `tools/`, stages renumbered (`01…06`), single `pose-lab` env, benchmarking off `main`. New layout/commands: see `01-current-state.md` + `04-conventions.md`. The L40S box is UNCHANGED until it pulls the branch and rebuilds/renames its env — its `/home/ubuntu/...` paths and old `pN` stage-dir names below remain valid as-is.
+
+
 - **SSH**: `ssh quidich-gpu-intern` (ubuntu@3.238.21.21, key `~/.ssh/quidich-gpu-intern.pem`).
   L40S 46 GB VRAM, 8 vCPU EPYC, 61 GB RAM. ALL GPU work runs here (user directive); CPU-bound
   pipeline can run either side (laptop i9 is ~1.5× faster CPU but crashes; box is stable).

@@ -1,5 +1,8 @@
 # Active threads (2026-07-14 evening)
 
+> **RESTRUCTURE 2026-07-14:** repo reorganised into `src/{core,identity}` + `tools/`, stages renumbered (`01…06`), single `pose-lab` env, benchmarking off `main`. New layout/commands: see `01-current-state.md` + `04-conventions.md`. The L40S box is UNCHANGED until it pulls the branch and rebuilds/renames its env — its `/home/ubuntu/...` paths and old `pN` stage-dir names below remain valid as-is.
+
+
 ## 1. RESOLVED (2026-07-14): mosaic + P1 "VRAM" optimization — VRAM was NOT the lever
 Full writeup: `wip/optimization_findings_2026-07-14.md`. Measured on the L40S:
 - **GPU decode is 3.2× SLOWER** than cv2 even on the idle L40S (per-image D2H copy +

@@ -1,5 +1,8 @@
 # User, machines, accounts (consolidated from auto-memory 2026-07-14)
 
+> **RESTRUCTURE 2026-07-14:** repo reorganised into `src/{core,identity}` + `tools/`, stages renumbered (`01…06`), single `pose-lab` env, benchmarking off `main`. New layout/commands: see `01-current-state.md` + `04-conventions.md`. The L40S box is UNCHANGED until it pulls the branch and rebuilds/renames its env — its `/home/ubuntu/...` paths and old `pN` stage-dir names below remain valid as-is.
+
+
 ## User / internship (PS-1)
 Aksh Shah, BITS Pilani K. K. Birla Goa Campus, B.E. CS, ID 2024A7PS0532G. PS-1 at Quidich
 Innovation Labs (sports broadcasting, Mumbai), 8 weeks from 25 May 2026; mid-sem presented
