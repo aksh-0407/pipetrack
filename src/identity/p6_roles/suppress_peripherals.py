@@ -31,6 +31,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
+from core.contract import validate_group1_frame  # noqa: E402
+
 CORE_ROLES = ("bowler", "striker", "non_striker", "wicketkeeper")
 
 DEFAULTS = {
@@ -132,6 +134,42 @@ def decide(quality: dict[str, dict], roles: dict[str, str], cfg: dict) -> dict[s
     return suppressed
 
 
+def write_terminal_predictions(
+    src_run_dir: Path, out_run_dir: Path, roles: dict[str, str], suppressed: dict[str, dict]
+) -> int:
+    """Write the terminal per-camera output (``06_roles/predictions``): the global-id
+    records with ``role`` stamped and suppressed identities dropped. This is the merged
+    downstream handoff — pose_2d + pose_3d + pose_3d_named + global_player_id + role.
+    """
+    suppressed_ids = set(suppressed)
+    pred_out = out_run_dir / "predictions"
+    pred_out.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for path in sorted((src_run_dir / "predictions").glob("*.jsonl")):
+        rows = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                kept = []
+                for player in record.get("players", []):
+                    gid = player.get("global_player_id")
+                    if gid is not None and str(gid) in suppressed_ids:
+                        continue
+                    if gid is not None:
+                        player["role"] = roles.get(str(gid), player.get("role", "unknown"))
+                    kept.append(player)
+                record["players"] = kept
+                validate_group1_frame(record, final_handoff=False)
+                rows.append(record)
+        with (pred_out / path.name).open("w", encoding="utf-8") as handle:
+            for record in rows:
+                handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+        written += 1
+    return written
+
+
 def main() -> None:
     args = parse_args()
     run_dir = Path(args.input_run_dir)
@@ -154,6 +192,8 @@ def main() -> None:
         "track_count": len(quality),
         "suppressed": suppressed,
     }, indent=2))
+    written = write_terminal_predictions(run_dir, out_path.parent, roles, suppressed)
+    print(f"06 terminal predictions: {written} camera streams -> {out_path.parent / 'predictions'}")
     kept_named = {pid: roles.get(pid) for pid in quality if pid not in suppressed
                   and roles.get(pid) in CORE_ROLES}
     print(f"P5b: {len(suppressed)}/{len(quality)} ids suppressed "

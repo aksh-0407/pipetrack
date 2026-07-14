@@ -21,7 +21,7 @@ def _args(tmp_path, extra=()):
 def test_stage_window_bounds_and_order():
     assert _stage_window("01_stabilization", "08_render") == [
         "01_stabilization", "02_tracking", "03_association", "04_lift",
-        "05_global_id", "06_roles", "07_lift3d", "08_render",
+        "05_global_id", "06_roles", "08_render",
     ]
     # 04_lift (binding-keyed) sits inside the window BEFORE global_id; self-skips
     # unless --enable-lift is set.
@@ -36,7 +36,7 @@ def test_plan_resolves_reused_stage_from_base_tree(tmp_path):
     base = tmp_path / "base"
     (base / "deliveries" / "D1" / "02_tracking").mkdir(parents=True)
     args = _args(tmp_path, ["--base-tree", str(base), "--from-stage", "03_association"])
-    plan = DeliveryPlan("D1", args, _stage_window("03_association", "07_lift3d"))
+    plan = DeliveryPlan("D1", args, _stage_window("03_association", "06_roles"))
     # tracking is outside the window -> read in place from the base tree
     assert plan.stage_dir("02_tracking") == base / "deliveries" / "D1" / "02_tracking"
     # association is inside the window -> written to the output tree

@@ -137,3 +137,50 @@ def test_p3_p4_p6_canonical_run_smoke(tmp_path: Path):
     assert len(named["joints_root_relative_m"]) == 26
     assert named["joints_root_relative_m"]["hip"] == [0.0, 0.0, 0.0]  # root is the origin
     validate_group1_frame(lifted)
+
+
+def test_lift_before_global_id_chain(tmp_path: Path):
+    """04 lift (binding) runs before global-id, copies correspondences forward, and
+    global-id carries the 26-joint pose_3d through; 06 finalize stamps role."""
+    from identity.p6_roles.suppress_peripherals import write_terminal_predictions
+
+    p2_run, drive_root = _write_fixture(tmp_path)
+    p3_run = tmp_path / "03"
+    run_association(
+        p2_run, p3_run, drive_root, DELIVERY,
+        P3AssociationConfig(image_w=1280, image_h=720, baseline_angle_degen_deg=1.0,
+                            cycle_reproj_tol_px=3.0, triangulation_reproj_threshold_px=2.0),
+        expected_frames=3,
+    )
+    # 04 binding-keyed lift runs BEFORE global-id and copies correspondences forward.
+    p4_lift = tmp_path / "04"
+    triangulate_canonical_run(
+        input_run_dir=p3_run, output_run_dir=p4_lift, drive_root=drive_root,
+        delivery_id=DELIVERY, cameras=None, reprojection_threshold_px=2.0,
+        min_views=2, ema_alpha=0.65, id_source="binding",
+    )
+    assert (p4_lift / "diagnostics" / "correspondences.jsonl").exists()
+    lift_rec = json.loads(next((p4_lift / "predictions").glob("*.jsonl")).read_text().splitlines()[-1])
+    assert len(lift_rec["players"][0]["pose_3d"]["keypoints_world_m"]) == 26
+
+    # 05 reads the 04 lift run; pose_3d rides forward while global ids are assigned.
+    p5_run = tmp_path / "05"
+    run_global_id(
+        p4_lift, p5_run, drive_root, DELIVERY,
+        P4Config(p4a=replace(P4AConfig(), confirm_hits=2, confidence_high=0.4)),
+        expected_frames=3,
+    )
+    p5_player = json.loads(
+        next((p5_run / "predictions").glob("*.jsonl")).read_text().splitlines()[-1]
+    )["players"][0]
+    assert p5_player["global_player_id"] == "P001"
+    assert len(p5_player["pose_3d"]["keypoints_world_m"]) == 26  # carried through global-id
+
+    # 06 terminal finalize: role stamped onto the identified player, suppressed dropped.
+    p6_run = tmp_path / "06"
+    assert write_terminal_predictions(p5_run, p6_run, {"P001": "bowler"}, {}) >= 1
+    final_player = json.loads(
+        next((p6_run / "predictions").glob("*.jsonl")).read_text().splitlines()[-1]
+    )["players"][0]
+    assert final_player["role"] == "bowler"
+    assert final_player["global_player_id"] == "P001"

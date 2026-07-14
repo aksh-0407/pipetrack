@@ -1,15 +1,14 @@
-"""Full-pipeline batch driver: stabilization -> tracking -> association -> lift ->
-global_id -> roles -> (terminal 3D lift) -> mosaic render.
+"""Full-pipeline batch driver: stabilization -> tracking -> association -> 3D lift ->
+global_id -> roles -> mosaic render.
 
 Extends the identity inner-loop driver (``identity.id_pipeline``) to the whole delivery
-chain starting from a P1 predictions run (e.g. ``data/derived/runs/rtmpose-x``).
-Each stage writes the canonical run-dir layout under
-``<output-tree>/deliveries/<DELIVERY>/{01_stabilization,02_tracking,03_association,
-04_lift,05_global_id,06_roles,07_lift3d,logs}`` and the mosaics land in
-``<artifacts-root>/mosaics/<DELIVERY>/`` (point --artifacts-root at data/derived/mosaics/<run>).
+chain starting from a P1 predictions run. Each stage writes the canonical run-dir layout
+under ``<output-tree>/deliveries/<DELIVERY>/{01_stabilization,02_tracking,03_association,
+04_lift,05_global_id,06_roles,logs}`` and the mosaics land in ``<artifacts-root>/<DELIVERY>/``.
 
-Note the logical order: the binding-keyed 3D lift (04_lift) runs BEFORE global_id, so
-identity can build on 3D positions (Associate -> Triangulate -> Track).
+The 3D lift (04_lift) is the single triangulation and runs BEFORE global_id (Associate ->
+Triangulate -> Track): global_id and roles carry its 3D forward, and 06_roles emits the
+terminal role-stamped, suppression-filtered predictions consumed downstream.
 
 Designed as the A/B workhorse (docs/critical-analysis/, docs/changes_tbd.md):
 
@@ -21,10 +20,7 @@ Designed as the A/B workhorse (docs/critical-analysis/, docs/changes_tbd.md):
 
 Example (full chain on the reference delivery, run under the ``pose-lab`` env)::
 
-    python -m main \
-        --input-tree data/derived/runs/rtmpose-x \
-        --output-tree data/derived/runs/smoke \
-        --artifacts-root data/derived/mosaics/smoke \
+    python -m main --dataset 8_init --version 9 \
         --deliveries CCPL080626M1_1_14_1 \
         --jobs 8 --p2-max-workers 2 --render-jobs 2
 
@@ -59,7 +55,7 @@ from identity.id_pipeline import (  # noqa: E402
     _run_stage,
 )
 
-STAGE_ORDER = ["01_stabilization", "02_tracking", "03_association", "04_lift", "05_global_id", "06_roles", "07_lift3d", "08_render"]
+STAGE_ORDER = ["01_stabilization", "02_tracking", "03_association", "04_lift", "05_global_id", "06_roles", "08_render"]
 
 # Columns are read jointly — no single one is optimized in isolation.
 # (name, metrics file relative to deliveries/<D>/, dotted key, format)
@@ -79,8 +75,8 @@ PANEL_COLUMNS = [
     ("chimera", "04_lift/triangulation_metrics.json", "chimera_suspect_count", "{:d}"),
     ("d_app", "03_association/association_metrics.json", "cue_d_prime.appearance", "{:.2f}"),
     ("jitter_px", "01_stabilization/stabilization_metrics.json", "mean_jitter_px_after", "{:.2f}"),
-    ("tri_reproj", "07_lift3d/triangulation_metrics.json", "mean_reprojection_error_px", "{:.1f}"),
-    ("tri_cov", "07_lift3d/triangulation_metrics.json", "triangulation_coverage", "{:.3f}"),
+    ("tri_reproj", "04_lift/triangulation_metrics.json", "mean_reprojection_error_px", "{:.1f}"),
+    ("tri_cov", "04_lift/triangulation_metrics.json", "triangulation_coverage", "{:.3f}"),
     ("verdict", "05_global_id/global_id_metrics.json", "quality_verdict.verdict", "{}"),
 ]
 
@@ -193,9 +189,12 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                 args.python, log,
             )
         elif stage == "05_global_id":
+            # Global-id reads the 04 lift run (single triangulation before identity, which
+            # carries pose_3d forward); falls back to 03 only when the lift is disabled.
+            gid_input = plan.stage_dir("04_lift") if args.enable_lift else plan.stage_dir("03_association")
             rc = _run_stage(
                 "identity.p5_global_id.run_global_id",
-                common(plan.stage_dir("03_association"), out_dir)
+                common(gid_input, out_dir)
                 + ["--config", args.p4_config,
                    "--expected-frames", str(args.expected_frames)],
                 args.python, log,
@@ -218,20 +217,6 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                     + (["--config", args.p5_config] if args.p5_config else []),
                     args.python, log,
                 )
-        elif stage == "07_lift3d":
-            rc = _run_stage(
-                "identity.p4_lift.run_triangulation",
-                common(plan.stage_dir("05_global_id"), out_dir)
-                + ["--reprojection-threshold-px", str(args.tri_reproj_px),
-                   "--min-views", str(args.tri_min_views),
-                   "--ema-alpha", str(args.tri_ema_alpha),
-                   "--smoother", args.tri_smoother,
-                   "--butter-cutoff-hz", str(args.tri_butter_cutoff_hz)]
-                + (["--cheirality"] if args.tri_cheirality else [])
-                + (["--native-skeleton"] if args.tri_native_skeleton else [])
-                + (["--dense-fill"] if args.tri_dense_fill else []),
-                args.python, log,
-            )
         else:  # pragma: no cover - registry and loop must stay in sync
             raise AssertionError(stage)
         result[f"{stage}_rc"] = rc
@@ -372,7 +357,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--from-stage", default="01_stabilization", choices=STAGE_ORDER)
     parser.add_argument("--until-stage", default="08_render", choices=STAGE_ORDER)
     parser.add_argument("--skip-render", action="store_true",
-                        help="Shorthand for --until-stage p6_3d.")
+                        help="Shorthand for --until-stage 06_roles (skip the mosaic render).")
     parser.add_argument("--enable-stabilization", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Run 01 (stabilization) before P2 (v7 default ON; --no-enable-stabilization for v6-style runs).")
@@ -439,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_tree is None:
         raise SystemExit("provide --output-tree (or --dataset with --version)")
     if args.skip_render and args.until_stage == "08_render":
-        args.until_stage = "07_lift3d"
+        args.until_stage = "06_roles"
     if args.deliveries == "all":
         # Discover every delivery present in the input tree's P1 predictions
         # (filenames are <capture_group>__<delivery>__cam_NN.jsonl).

@@ -382,6 +382,11 @@ def triangulate_canonical_run(
 
         diagnostics_dir = output_run_dir / "diagnostics"
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        # Carry the P3 correspondences forward so global-id (05) can read everything
+        # it needs from the 04 lift run (the lift now runs before global-id).
+        src_correspondences = input_run_dir / "diagnostics" / "correspondences.jsonl"
+        if src_correspondences.exists():
+            (diagnostics_dir / "correspondences.jsonl").write_bytes(src_correspondences.read_bytes())
         by_frame: dict[int, list[dict]] = defaultdict(list)
         for (frame_index, binding), lift in sorted(lifts.items()):
             points = smoothed.get((frame_index, binding), lift.points3d)
