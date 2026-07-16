@@ -1,117 +1,164 @@
 # 04 — 3D lift (triangulation)
 
-> **Stage 04** — the 3D lift, now run **before** global-id (Associate→Triangulate→Track). Code: `src/identity/p4_lift/run_triangulation.py`.
+> **Stage 04** — turns the multi-view 2D keypoints of one identified player into a single **3D world
+> skeleton**. Runs *before* global identity (order: Associate → Triangulate → Track). Code:
+> `src/identity/p4_lift/run_triangulation.py`, `src/identity/common/triangulation.py`.
 
-> **Status update (2026-07-16) — `--robust-refit` (1C, flag-gated, default-off, byte-identical):**
-> an optional IRLS-Huber M-estimator polish on the per-joint inlier re-fit (down-weights a
-> marginal-inlier camera on its pixel residual), the principled "robust average" alternative to a naive
-> median — the repo already ships the same estimator for the ground plane (`geometry.robust_fuse_ground`).
-> Forces the per-joint reference loop so the batched kernels stay bit-identical when off. 8_init: reproj
-> p95 6.61→6.56 px (marginal — RANSAC+DLT is already robust). `main --tri-robust-refit` /
-> `--tri-robust-huber-px`. Per-camera reprojection / leave-one-camera-out robustness now measurable via
-> `tools/diagnosis/camera_robustness.py` (no single bad camera on this rig; hip robust to dropping any
-> one camera by 5–7 cm).
+---
 
-## Role & intuition
+## 1. What this stage does (and why here)
 
-This stage turns the multi-view 2D keypoints of one identified player into a single **3D world
-skeleton**. It runs at **stage 04, binding-keyed (`--id-source binding`), immediately after
-association and *before* global identity** — the **single triangulation** in the pipeline. It emits
-the full **Halpe-26** world skeleton (`pose_3d`, 26 joints incl. feet) plus the self-describing
-**`pose_3d_named`** (root at the mid-hip, every joint relative to it), and copies the P3
-`correspondences.jsonl` forward so global-id (05) reads everything from the lift run and **carries
-the 3D forward**. The old terminal re-triangulation (`07_lift3d`) is **gone**: 06 stamps roles onto
-04's 3D for the final handoff. By default 05 still *tracks* on the ground plane; **consuming** the 3D
-(decide-in-3D) is the flag-gated A/B in [to_do.md](../../wip/to_do.md).
+Stage 03 has told us "these tracklets across cameras are the same player" (a `binding_id`). Stage 04
+takes that player's 2D skeleton **as seen from several cameras at the same instant** and reconstructs
+their **3D skeleton in world coordinates** — all 26 Halpe joints, in metres, on the actual pitch.
 
-## I/O & config
+- It runs **binding-keyed** (`--id-source binding`), right after association and **before** global
+  identity — so identity can later be built on top of real 3D. It is the pipeline's **single
+  triangulation** ("single" = one lift stage, not one point — it fully triangulates all 26 joints).
+- It emits `pose_3d` (the 26-joint world skeleton) and `pose_3d_named` (the same skeleton re-expressed
+  with the **mid-hip as the root** and every other joint relative to it — a pose descriptor that
+  doesn't care *where* on the pitch the player is).
+
+> **In plain words:** several cameras each see a flat 2D shadow of the player. This stage crosses those
+> shadows to rebuild the real 3D body — like how your two eyes give you depth, but with up to 7 "eyes".
+
+---
+
+## 2. Inputs and outputs
 
 | | |
 |---|---|
-| **Input** | 03 association run (predictions + `diagnostics/correspondences.jsonl` with `binding_id`) + calibration |
-| **Output** | `pose_3d` (Halpe-26, 26 joints incl. feet) + `pose_3d_named` (root-relative) on each camera stream; `diagnostics/{lift3d.jsonl, lift_purity.json, correspondences.jsonl}`; `triangulation_metrics.json` |
-| **Core** | `src/identity/p4_lift/run_triangulation.py`; `src/identity/common/triangulation.py` |
-| **Knobs** | `--reprojection-threshold-px 10`, `--min-views 2`, `--cheirality`, `--smoother butterworth`, `--dense-fill` (`--id-source` defaults to `binding`; `--native-skeleton` is now a no-op — the lift is always 26) |
+| **Input** | a 03 run (predictions + `diagnostics/correspondences.jsonl` with `binding_id`) + calibration |
+| **Output** | `pose_3d` + `pose_3d_named` on each camera stream; `diagnostics/{lift3d.jsonl, lift_purity.json, correspondences.jsonl}`; `triangulation_metrics.json` |
+| **Knobs** | `--reprojection-threshold-px 10`, `--min-views 2`, `--cheirality`, `--smoother butterworth`, `--dense-fill`; **`--tri-robust-refit`** (1C, default-off); `--id-source` defaults to `binding` |
 
-## Flowchart
+---
+
+## 3. How it works, step by step
 
 ```mermaid
 flowchart TD
-  C["correspondences (same player, >=2 views)"] --> T["per-joint RANSAC DLT<br/>triangulate_skeleton_ransac:162"]
-  T --> R["reprojection inlier refit<br/>threshold 10px"]
-  R --> F["temporal occlusion fill<br/>fill_occluded_joints:208 (gap<=25)"]
-  F --> S["skeletal-prior fill<br/>fill_from_skeletal_prior:259"]
-  S --> E["confidence-aware EMA<br/>confidence_ema_smooth:296 (alpha 0.65)"]
+  C["correspondences (same player, ≥2 views)"] --> T["per-joint RANSAC triangulation<br/>triangulate_skeleton_ransac"]
+  T --> R["reprojection inlier refit<br/>keep views within 10 px"]
+  R --> F["temporal occlusion fill<br/>interpolate gaps ≤ 25 frames"]
+  F --> S["skeletal-prior fill<br/>place never-seen joints from a bone prior"]
+  S --> E["confidence-aware EMA smoothing (α 0.65)"]
   E --> OUT["pose_3d.keypoints_world_m"]
-  R -. per-cluster reprojection / cycle-consistency .-> SPLIT["chimera split signal (-> 03/05)"]
+  R -. per-cluster reprojection .-> SPLIT["chimera-split signal → 03 / 05"]
 ```
 
-## Methods walkthrough
+### 3a. Triangulation by weighted DLT — `triangulate_point_dlt` ([triangulation.py:31](../../src/identity/common/triangulation.py#L31))
 
-**Weighted DLT — `triangulate_point_dlt` ([triangulation.py:31](../../src/identity/common/triangulation.py#L31)).**
-The classic linear triangulation: for each view stack the two rows `x·P₃−P₁`, `y·P₃−P₂`, weight
-each by `√conf`, and solve `A X = 0` by SVD (the 3D point is the smallest right singular vector,
-dehomogenised). Confidence weighting is the differentiable-triangulation idea from **Iskakov et al.,
-Learnable Triangulation, ICCV 2019** ([arXiv 1905.05754](https://arxiv.org/abs/1905.05754)).
+To find one 3D joint, we combine the *rays* from every camera that saw it.
 
-**RANSAC over views — `ransac_triangulate_point:90` / `triangulate_skeleton_ransac:162`.**
-Triangulate every camera pair, count inliers by reprojection error ≤ `reprojection_threshold_px`,
-keep the best inlier set, and **re-fit** the DLT on inliers. This robustly rejects a single bad
-view — the practical robustification recommended by **Lee & Civera 2020**
-([arXiv 2008.01258](https://arxiv.org/abs/2008.01258)) and used in markerless sports capture
-(**Pose2Sim**, [PMC8512754](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8512754/)).
+- Each camera + its 2D observation defines a **ray** in 3D (a line from the camera centre through the
+  pixel). The true 3D joint is where those rays meet. Because of noise they don't meet *exactly*, so we
+  find the point closest to all of them.
+- **DLT (Direct Linear Transform):** stacks two linear equations per camera (`x·P₃ − P₁`, `y·P₃ − P₂`)
+  into a matrix `A` and solves `A X = 0` via **SVD** (Singular Value Decomposition) — the answer is the
+  smallest right singular vector. Each camera's rows are weighted by **√confidence** so a shaky joint
+  counts less. (Confidence-weighted DLT is the differentiable-triangulation idea from
+  [Iskakov et al., ICCV 2019](https://arxiv.org/abs/1905.05754).)
+  > **In plain words:** every camera "points" at the joint; the joint is roughly where all the pointing
+  > lines cross. DLT is the linear-algebra way to find that best crossing point, trusting confident
+  > cameras more. **SVD** is just the standard tool for solving this kind of "best-fit intersection".
 
-**Occlusion / prior fill + smoothing.** `fill_occluded_joints:208` linearly interpolates NaN
-joints within a 25-frame gap; `fill_from_skeletal_prior:259` places a never-seen joint from its
-parent + a bone vector scaled to the identity's median bone length; `confidence_ema_smooth:296`
-applies confidence-weighted temporal EMA (α=0.65). Together these take multi-camera completeness to
-100% of ≥2-view frames (per-joint reprojection 2–4 px; `../diagnosis/README.md` R4).
+### 3b. Robustness across views — `ransac_triangulate_point:90` / `triangulate_skeleton_ransac:162`
 
-## Pros
+One hallucinated joint in one camera can wreck the crossing point. **RANSAC** guards against it:
+
+- **RANSAC (RANdom SAmple Consensus):** triangulate from small subsets (here, camera pairs), see which
+  *other* cameras agree with each candidate (their **reprojection error** ≤ `10 px`), keep the
+  candidate with the most agreers ("inliers"), then **re-fit** using only those inliers.
+  > **In plain words:** try lots of small juries, find the story most cameras agree with, then throw
+  > out the cameras that disagree and recompute. One lying camera gets outvoted instead of averaged in.
+- **Reprojection error:** take the 3D estimate, project it *back* into a camera, and measure how far
+  that lands from what the camera actually saw. Small = consistent; large = that camera disagrees.
+  This is the pipeline's cleanest "is this cluster actually one person?" signal — a **chimera** (two
+  people merged) fails torso reprojection badly. (It's a currently-unused split signal for 03/05.)
+- **Cheirality** (`--cheirality`): a sanity check that the solved 3D point is **in front of** the
+  cameras, not behind them (a mathematical solution can be geometrically impossible).
+  > **In plain words:** "cheirality" just means: the point has to be *in front of* the lens, not behind
+  > it — reject physically impossible solutions.
+
+### 3c. Robust refit — the 1C option (`--tri-robust-refit`, default-off)
+
+An optional **IRLS-Huber** polish on the inlier re-fit: after RANSAC picks the inliers, down-weight a
+*marginal* inlier camera by its pixel residual (the same robust-averaging idea used for the ground
+plane in `robust_fuse_ground`). Forces the per-joint reference loop so the fast batched kernels stay
+**bit-identical when the flag is off**. Effect is marginal (reproj p95 6.61 → 6.56 px) because RANSAC +
+DLT is already robust — kept as an option, not enabled. See [fixes-log](fixes-log.md).
+
+> **In plain words:** a gentle extra "trust the cleaner cameras a bit more" step. Barely moves the
+> numbers here because the earlier RANSAC step already did most of that job.
+
+### 3d. Filling gaps + smoothing
+
+- `fill_occluded_joints:208` — linearly interpolates a joint that's briefly missing (gap ≤ 25 frames).
+- `fill_from_skeletal_prior:259` — a joint *never* triangulated (e.g. an always-occluded wrist) is
+  placed from its parent joint + a bone vector scaled to the player's own median bone length.
+  > **In plain words:** if we never saw the wrist, we guess it from the elbow plus a typical forearm
+  > length. A plausible fill — but a *guess*, and flagged low-confidence.
+- `confidence_ema_smooth:296` — a confidence-weighted temporal **EMA** (Exponential Moving Average,
+  α = 0.65): each frame's value is blended with the running average so the 3D doesn't stutter. Together
+  these reach 100% joint completeness on ≥2-view frames (per-joint reprojection 2–4 px).
+
+---
+
+## 4. Strengths
 
 - **Right estimator for a calibrated rig** — confidence-weighted DLT + reprojection-RANSAC is the
-  field-standard for cm-accurate multi-view capture; it is cheap and needs no training.
-- **Robust to one bad view** — the inlier refit rejects a hallucinated joint instead of averaging
-  it in.
-- **Complete skeletons** — occlusion/prior fill + EMA yield a full, temporally smooth 3D pose on
-  every multi-view frame.
-- **The reprojection residual is a free purity signal** — a chimera (two people merged) fails
-  torso/limb reprojection hard; this is a clean, unused split signal.
+  field standard for cm-accurate multi-view capture; cheap, no training.
+- **Robust to one bad view** — the inlier refit rejects a hallucinated joint instead of averaging it.
+- **Complete, smooth skeletons** — occlusion/prior fill + EMA give a full 3D pose on every multi-view
+  frame.
+- **Reprojection residual is a free purity signal** — a chimera fails it hard (an unused split signal).
 
-## Cons
+## 5. Weaknesses
 
-- **Needs ≥2 views** — the ~39% single-camera frames get *no* 3D pose at all (V2-L1). This is the
-  biggest coverage gap.
-- **Flat z=0 for the ground point** — an airborne foot (running stride, bowler load, jump) with
-  z≫0 is mislocated when forced to the plane (V2-L3; ankle z p95 = 0.56 m).
-- **Skeletal-prior fill can fabricate plausible-but-wrong joints** — a never-seen limb placed from
-  a prior is a guess, low-confidence but still emitted.
-- **Global identity doesn't consume the 3D by default** — 05 now reads 04 and carries the 3D
-  forward, but by default still tracks on the ground plane and ignores the 3D pose/covariance.
-  Consuming it (decide-in-3D) is implemented behind a flag and A/B-gated — [to_do.md](../../wip/to_do.md).
+- **Needs ≥ 2 views** — the ~39% single-camera frames get **no** 3D pose at all. The biggest coverage
+  gap.
+- **Flat z = 0 ground point** — an airborne foot (running stride, jump) is mislocated when forced to the
+  plane (ankle-z p95 = 0.56 m).
+- **Skeletal-prior fill can fabricate plausible-but-wrong joints** on long single-view stretches.
+- **The 3D isn't consumed by default** — 05 reads 04 and carries the 3D forward, but by default still
+  tracks on the 2D ground plane (using the 3D is the flag-gated "decide-in-3D" A/B).
 
-## Issues
+---
 
-- **V2-L1 (★★) Single-camera → no 3D pose.** ~39% of player-frames (`../diagnosis/README.md`
-  V2-L1). No triangulation possible with one ray.
-- **V2-L3 (★) Flat z=0 airborne error.** Triangulated ankle z p95 0.56 m; the ground point forced
-  to z=0 lands beyond the true position at grazing angle.
-- **T-1 (★★) The 3D is produced before 05 and carried forward, but not yet *consumed*.** 05 reads
-  04 and passes the 3D through, but by default tracks on the ground plane; using the binding-lift's
-  reprojection / cycle-consistency (chimera split) and 3D position for identity is the decide-in-3D
-  A/B (flag-gated), not a sequencing problem.
+## 6. Known issues (severity ★)
+
+- **V2-L1 (★★) Single-camera → no 3D pose.** ~39% of player-frames; no triangulation from one ray.
+- **T-1 (★★) 3D produced but not yet *consumed* by identity.** 05 passes it through but tracks on the
+  ground plane; using the reprojection/cycle-consistency split signal + 3D position is the decide-in-3D
+  A/B, not a sequencing bug.
+- **V2-L3 (★) Flat z = 0 airborne error** — the ground point forced to z = 0 lands beyond the true
+  position at a grazing angle.
 - **T-2 (★) Skeletal-prior fabrication risk** for never-seen joints on long single-view stretches.
 
-## Fixes (all, priority-ordered)
+---
 
-| # | Fix | Priority | Reasoning | Expected effect | Effort | Source |
-|---|---|---|---|---|---|---|
-| 1 | **Decide in 3D.** 05 now reads 04 and carries its 3D + covariance forward; the remaining step is *consuming* it — the binding-lift `pelvis_ground_xy` + `pelvis_cov_m2` as 05's measurement/R and a 3D pose-shape re-ID, plus reprojection/cycle-consistency as the chimera-split signal. Behind `--track-in-3d`, A/B-gated. | ★★★ | The richest geometric signal is now produced before identity is finalised; consuming it unlocks 3D-aware tracking and splittable clustering (ID-5). Needs the standard 8-delivery A/B. | Fewer chimeras; 3D-aware 05; no extra model. | Medium (wiring) | VoxelPose "decide in 3D" [Faster VoxelPose 2207.10955]; Iskakov [1905.05754] |
-| 2 | **Single-view → canonical-skeleton lift (PnP)** for the ~39% single-camera frames: fit the identity's canonical 3D skeleton (learned from its multi-view frames) to the lone 2D view at its z0 ground position. | ★★ | Half of coverage is single-camera; a PnP/optimisation lift gives a plausible full 3D pose where triangulation can't. | 3D pose on single-camera frames → far higher completeness. | Medium-High | monocular lift / SMPLify-style fitting; UPose3D [2404.14634] |
-| 3 | **Uncertainty-aware triangulation** — propagate 2D keypoint covariance into the DLT weights and emit a per-joint 3D covariance to carry downstream (into 05's Kalman R). | ★★ | Weighting by real uncertainty (not just √conf) is the modern robust-triangulation recipe and gives 05 a principled measurement noise. | Better fusion + anti-teleport R. | Medium | LOSTU [2311.11171]; UPose3D [2404.14634]; Lee & Civera [2008.01258] |
-| 4 | **Airborne handling** — take the ground position from the triangulated **pelvis vertical projection** (robust to a raised foot), flag airborne frames (ankle z≫0) and inflate their covariance. | ★ | Removes the z=0 grazing-angle error on jumps/strides. | Correct location for airborne feet. | Low-Medium | Pose2Sim [PMC9002957] |
-| 5 | **Offline zero-phase temporal filter (4th-order Butterworth / RTS)** on the whole-delivery 3D trajectory for the non-real-time render path. | ★ | The delivery is offline; a zero-phase low-pass is the sports-capture standard for the smoothest final trajectory. | Smoother final 3D with no lag. | Low | Pose2Sim [PMC8512754] |
-| 6 | **Gate skeletal-prior fill** — cap how long a joint may be prior-filled and down-weight/flag it, or prefer the single-view PnP lift (fix 2) over pure priors. | ★ | Avoids emitting fabricated limbs on long single-view stretches. | Fewer wrong emitted joints. | Low | — |
+## 7. Fix-implementation status (2026-07-16)
 
-Cross-phase: fix 1 here is the enabler for 03's splittable clustering and 05's 3D tracking —
-see [to_do.md](../../wip/to_do.md).
+| §8 fix | status | setting | verdict |
+|---|---|---|---|
+| #3 uncertainty-aware triangulation | ✅ **ENABLED** | 03 `emit_ground_cov: true` emits per-cluster GN covariance | consumed as 05's Kalman R (`use_measurement_covariance`) |
+| #1 decide-in-3D | 🟡 **PARTIAL** | the covariance path above is the *measurement* half | full 3D tracking (3D KF + 3D re-ID) **NOT DONE** |
+| 1C robust IRLS-Huber refit | ✅ **BUILT** (used in candidate stack) | `--tri-robust-refit` | ~neutral (reproj p95 6.61→6.56); kept as option |
+| #5 offline Butterworth filter | ✅ **AVAILABLE** | `--smoother butterworth` | opt-in for the offline render path |
+| #2 single-view PnP lift | ⬜ **NOT DONE** | — | the ~39% single-camera coverage gap ([BUG-7](known-bugs.md)); 1F sticky-hip was a **rejected** narrower attempt |
+| #4 airborne handling | ⬜ **NOT DONE** | — | z=0 grazing error on jumps |
+| #6 gate skeletal-prior fill | ⬜ **NOT DONE** | — | fabrication risk on long single-view stretches |
+
+## 8. Candidate fixes (priority-ordered)
+
+| # | Fix | Priority | Why | Effort | Source |
+|---|---|---|---|---|---|
+| 1 | **Decide in 3D** — consume 04's `pelvis_ground_xy` + covariance as 05's measurement, add a 3D pose-shape re-ID, and use reprojection/cycle-consistency as the chimera-split signal. Behind `--track-in-3d`, A/B-gated. | ★★★ | The richest geometric signal is produced *before* identity is finalised; consuming it unlocks 3D-aware tracking + splittable clustering (ID-5). | Medium (wiring) | VoxelPose [2207.10955] |
+| 2 | **Single-view → canonical-skeleton lift (PnP)** for the ~39% single-camera frames: fit the player's learned canonical 3D skeleton to the lone 2D view at its ground position. | ★★ | Half of coverage is single-camera; a PnP fit gives a plausible full 3D pose where triangulation can't. | Medium-High | UPose3D [2404.14634] |
+| 3 | **Uncertainty-aware triangulation** — propagate 2D keypoint covariance into the DLT weights and emit a per-joint 3D covariance for 05's Kalman R. | ★★ | Weighting by real uncertainty (not just √conf) is the modern robust recipe and gives 05 principled measurement noise. | Medium | LOSTU [2311.11171] |
+| 4 | **Airborne handling** — take the ground position from the triangulated **pelvis vertical projection** (robust to a raised foot); flag airborne frames and inflate their covariance. | ★ | Removes the z = 0 grazing-angle error on jumps/strides. | Low-Medium | Pose2Sim |
+| 5 | **Gate skeletal-prior fill** — cap how long a joint may be prior-filled and flag it, or prefer the single-view PnP lift. | ★ | Avoids emitting fabricated limbs on long single-view stretches. | Low | — |
+
+Cross-phase: fix 1 here is the enabler for 03's splittable clustering and 05's 3D tracking — see
+[`wip/to_do.md`](../../wip/to_do.md).

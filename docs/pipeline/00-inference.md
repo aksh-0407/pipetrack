@@ -1,119 +1,201 @@
 # P1 — 2D pose inference
 
-> **Stage P1 (foundation)** — 2D pose inference. Code: `src/core/inference/`. Upstream producer, not a numbered identity stage.
+> **Stage P1 (the foundation).** Finds every person in every camera frame and estimates their 2D
+> skeleton. Code: `src/core/inference/`. This is the *upstream producer* — not a numbered identity
+> stage — and everything after it inherits its mistakes.
 
-## Role & intuition
+---
 
-P1 is the foundation: for every camera frame it finds the people and estimates each person's
-2D skeleton. Everything downstream (tracking, identity, 3D) inherits P1's errors, so its
-**recall** (did we find every player, including the dark/distant umpire?) and **keypoint
-noise** (how much do joints jitter?) set the ceiling for the whole pipeline.
+## 1. What this stage does (and why it matters most)
 
-It is a **top-down** design: an **RTMDet** person detector produces boxes, then **RTMPose-X**
-estimates keypoints inside each box. Top-down maximises per-person accuracy (the pose model
-sees a normalised crop) at the cost of runtime scaling with the number of people and total
-dependence on the detector — if the detector misses a person, that person has no pose at all.
+For each of the 7 cameras, for each video frame, P1 answers two questions:
+1. **Where are the people?** (a box around each person)
+2. **What pose is each person in?** (the pixel location of 26 body joints — head, shoulders, elbows,
+   hips, knees, ankles, feet…)
 
-## I/O & config
+Its output is a list of people per frame, each with a 2D skeleton, a bounding box, and confidence
+scores.
+
+**Why it's the most important stage:** every later stage (tracking, cross-camera matching, 3D) is
+built *on top of* these detections. If P1 misses a player, no later stage can invent them; if P1's
+joints are noisy, that noise flows all the way to the 3D output. So the two things P1 must get right
+are **recall** (did we find *every* player, including the dark, distant umpire?) and **keypoint
+precision** (how much do the joints jitter frame-to-frame?). These set the ceiling for the whole
+pipeline.
+
+> **In plain words:** P1 is the eyes of the system. If the eyes don't see a player, the brain
+> (everything downstream) can't reason about them. Garbage in → garbage out.
+
+---
+
+## 2. The core design choice: "top-down"
+
+P1 is a **top-down** pose estimator: first a **detector** draws a box around each person, then a
+separate **pose model** runs *inside each box* to place the joints.
+
+The alternative is **bottom-up**: find *all* joints in the whole image at once, then figure out which
+joints belong to which person. Top-down is more accurate per person (the pose model sees a clean,
+zoomed-in crop of one person) but slower (it runs once per person) and it is **only as good as the
+detector** — if the detector misses someone, that person gets no pose at all.
+
+```mermaid
+flowchart LR
+  subgraph TD["Top-down (what we use)"]
+    A1["whole frame"] --> A2["detector: boxes"] --> A3["pose model runs<br/>inside each box"] --> A4["one clean skeleton per box"]
+  end
+  subgraph BU["Bottom-up (the alternative)"]
+    B1["whole frame"] --> B2["find ALL joints at once"] --> B3["group joints into people"]
+  end
+```
+
+> **In plain words:** top-down is like handing a cropped photo of *one* player to an expert and
+> asking "what pose is this?" — very accurate, but you first need someone to point at each player
+> (the detector), and if they miss a player, the expert never gets asked about them.
+
+---
+
+## 3. Inputs and outputs
 
 | | |
 |---|---|
-| **Input** | `data/raw/<dataset>/.../camera<NN>/frame_*.jpg`; pose model from `configs/model_envs.yaml`; detector config/weights |
-| **Output** | per delivery `<D>/00_inference/predictions/<group>__<delivery>__cam_NN.jsonl` — per player: `pose_2d` (Halpe-26, 26 kpts incl. feet), `bbox_xywh_px`, `detection_confidence`; `run_manifest.json`, `p1_metrics.json` |
-| **Key knobs** | `--dataset`/`--version` (derive paths), `--model-id` (default `rtmpose_x_body8`), `--det-config/--det-checkpoint`, `--bbox-thr` (0.3), `--nms-thr` (0.3), `--max-people`, batch/prefetch |
-| **Skeletons** | `src/core/keypoints.py` (`HALPE26_KEYPOINTS`); `configs/keypoint_mappings.yaml` (COCO-17 subset) |
+| **Input** | `data/raw/<dataset>/.../camera<NN>/frame_*.jpg`; pose model from `configs/model_envs.yaml`; a detector config + weights |
+| **Output** | per delivery `<D>/00_inference/predictions/<group>__<delivery>__cam_NN.jsonl` — per player: `pose_2d` (Halpe-26, 26 joints incl. feet), `bbox_xywh_px` (the box), `detection_confidence`; plus `run_manifest.json`, `p1_metrics.json` |
+| **Key knobs** | `--model-id` (default `rtmpose_x_body8`), `--det-config/--det-checkpoint`, `--bbox-thr` (0.3), `--nms-thr` (0.3), `--max-people`, batch/prefetch sizes |
+| **Skeleton** | `src/core/keypoints.py` (`HALPE26_KEYPOINTS`); `configs/keypoint_mappings.yaml` |
 
-## Flowchart
+---
+
+## 4. How it works, step by step
 
 ```mermaid
 flowchart TD
-  F["frame (2560x1440)"] --> D["RTMDet-m person detector<br/>boxes_from_det_result:488"]
-  D --> G{"score > bbox_thr(0.3)<br/>label == person<br/>NMS(0.3), top-N"}
+  F["frame (2560×1440)"] --> D["RTMDet-m detector<br/>boxes_from_det_result"]
+  D --> G{"keep box if:<br/>label == person<br/>score > bbox_thr (0.3)<br/>then NMS(0.3), top-N"}
   G --> B["person boxes (N,5)"]
-  B --> C["top-down crops<br/>build_pose_pipeline:525"]
-  C --> P["RTMPose-X (SimCC head)<br/>inference_topdown_batch:531"]
-  P --> H["Halpe-26 keypoints (26)"]
-  H --> REC["player record:<br/>pose_2d = Halpe-26 (26)<br/>player_records"]
+  B --> C["crop + normalise each box<br/>build_pose_pipeline"]
+  C --> P["RTMPose-X (SimCC head)<br/>inference_topdown_batch"]
+  P --> H["Halpe-26 keypoints (26 per person)"]
+  H --> REC["player record:<br/>pose_2d + bbox + confidence"]
 ```
 
-## Methods walkthrough
+### 4a. Detection — `boxes_from_det_result` ([run_phase1_rtmpose_inference.py:488](../../src/core/inference/run_phase1_rtmpose_inference.py#L488))
 
-**Detection — `boxes_from_det_result` ([run_phase1_rtmpose_inference.py:488](../../src/core/inference/run_phase1_rtmpose_inference.py#L488)).**
-RTMDet-m (a fast anchor-free one-stage detector, [Lyu et al. 2022, arXiv 2212.07784](https://arxiv.org/abs/2212.07784))
-runs per frame; boxes are kept where `label == person` **and** `score > bbox_thr (0.3)`, then
-de-duplicated with `nms(bboxes, 0.3)`, optionally truncated to the top-N by score. The
-checkpoint is fine-tuned on Objects365 + COCO person, which is why it is used over a generic
-COCO-80 detector.
+An **RTMDet-m** detector runs on the frame and proposes boxes. We keep a box only if its class is
+`person` **and** its score exceeds `bbox_thr = 0.3`, then remove duplicate boxes with **NMS** and
+optionally keep only the top-N by score.
 
-**Pose — `inference_topdown_batch` ([:531](../../src/core/inference/run_phase1_rtmpose_inference.py#L531)).**
-Each box becomes a top-down sample through `pose_model.cfg.test_dataloader.dataset.pipeline`,
-batched through `pose_model.test_step`. RTMPose ([Jiang et al. 2023, arXiv 2303.07399](https://arxiv.org/abs/2303.07399))
-uses a **SimCC** head: it treats keypoint localisation as *coordinate classification* — each
-joint's x and y are predicted as 1-D probability distributions over binned sub-pixel locations,
-which is cheaper and more robust than 2-D heatmap argmax. RTMPose-**X** is the largest body
-variant, trained on Body8 with the **Halpe-26** skeleton (COCO-17 + head/neck/hip + 6 foot
-keypoints), 384×288 input — the accuracy-first choice.
+- **RTMDet** ([Lyu et al. 2022](https://arxiv.org/abs/2212.07784)) is a fast, **anchor-free**,
+  **one-stage** detector. *One-stage* = it predicts boxes directly in a single pass (no slow
+  "propose regions, then classify" second stage). *Anchor-free* = it doesn't rely on a fixed grid of
+  pre-set box shapes ("anchors"); it predicts each box's extent directly, which is simpler and copes
+  better with unusual sizes.
+  > **In plain words:** a quick, single-glance "there's a person here, and here" detector, rather
+  > than a slow, careful two-pass one.
+- **NMS (Non-Maximum Suppression):** the detector often fires several overlapping boxes on the same
+  person; NMS keeps the highest-scoring box and deletes the others that overlap it too much (`nms_thr
+  = 0.3` = "if two boxes overlap by >30%, drop the weaker one").
+  > **In plain words:** "you've drawn three boxes on the same batsman — keep the best one, bin the
+  > rest."
+- **`bbox_thr = 0.3`** is the confidence cut-off. Lower it → catch more faint/distant people but also
+  more false boxes (crowd, shadows); raise it → cleaner but you miss the dark umpire. It's a single
+  global dial trading recall against false positives.
 
-**Skeleton harmonisation — `select_coco17_pose` ([:586](../../src/core/inference/run_phase1_rtmpose_inference.py#L586))
-and `player_records` ([:622](../../src/core/inference/run_phase1_rtmpose_inference.py#L622)).**
-`pose_2d` carries the full **Halpe-26** (26 keypoints); indices 0–16 are COCO-17 in COCO order,
-17–25 add head/neck/hip + 6 feet. The whole pipeline consumes the 26-joint pose directly, and the
-**feet** feed the ground-contact estimate. Names/edges: `src/core/keypoints.py`.
+### 4b. Pose — `inference_topdown_batch` ([:531](../../src/core/inference/run_phase1_rtmpose_inference.py#L531))
 
-## Pros
+Each person-box is cropped, resized to a normalised patch (384×288), and fed to **RTMPose-X**, which
+outputs the 26 joint locations.
 
-- **Top-down accuracy** — the pose model sees a normalised per-person crop, giving the best
-  per-joint precision available off-the-shelf, and RTMPose-X is at the top of the RTMPose family.
-- **Halpe-26 with feet is already persisted** — the 6 foot keypoints are exactly what the ground
-  -contact / z0 solver wants; the pipeline is not throwing them away.
-- **Batch/prefetch decoupling** — det/pose batch, io-workers, and prefetch change *speed only,
-  never* the keypoints (numerically batch-invariant), so tuning is accuracy-free.
-- **Detector fully configurable** — `--det-config/--det-checkpoint` allow a drop-in stronger
-  detector with no code change.
-- **Fine domain fit for the ground plane** — COCO-17 + feet + confidence per joint is exactly the
-  input the cm-accurate calibration needs.
+- **RTMPose** ([Jiang et al. 2023](https://arxiv.org/abs/2303.07399)) uses a **SimCC head**. Normally
+  a pose model predicts a 2-D *heatmap* per joint (a blurry blob whose peak is the joint) and takes
+  the peak — but the peak is quantised to whole pixels. **SimCC** instead treats each joint's **x**
+  and **y** as two *1-D classification* problems over finely-binned sub-pixel positions. This is
+  cheaper and gives **sub-pixel** accuracy without the heatmap's memory cost.
+  > **In plain words:** instead of asking "which pixel blob is the elbow?", SimCC asks two ruler
+  > questions — "how far along the x-ruler is the elbow? how far along the y-ruler?" — and can point
+  > *between* pixel marks, so joints land more precisely.
+- **RTMPose-X** is the largest, most accurate variant in the family, trained on the **Body8** dataset
+  with the **Halpe-26** skeleton. We deliberately chose the accuracy-first model (see the
+  [RTMPose mandate](../../wip/) — P1 stays RTMPose, do not switch to YOLO-pose).
 
-## Cons
+### 4c. Skeleton — Halpe-26 ([:586](../../src/core/inference/run_phase1_rtmpose_inference.py#L586), `player_records:622`)
 
-- **Total dependence on the detector.** A missed person = no pose. The `bbox_thr=0.3` gate plus
-  RTMDet-m's recall on **dark/distant umpires** is the root cause of a chain of downstream
-  work-arounds (synthetic tracklets, feet-approximation, bbox-top-as-head — see
-  [03-association.md](03-association.md)).
-- **No temporal information.** Each frame is independent, so keypoints jitter frame-to-frame;
-  P1 has no mechanism to damp it (that is why 01 (stabilization) exists).
-- **Runtime scales with people** (top-down) — ~35 crops/frame × 7 cameras is the throughput
-  bottleneck; the render, not pose, is usually the wall-clock limiter here.
-- **Single global image size assumption in places** — camera 07 is ~3775×960, not 2560×1440;
-  any path that reads a global size mishandles it (surfaces in 03, see that doc).
-- **COCO-17 is body-only** — no hands/face; fine for tracking, a limit for fine pose.
+`pose_2d` carries the full **Halpe-26** skeleton: 26 joints where indices **0–16 are the standard
+COCO-17** body joints (nose, eyes, shoulders, elbows, wrists, hips, knees, ankles) in COCO order, and
+**17–25 add** head, neck, mid-hip, and **6 foot** keypoints (big toe, small toe, heel × 2).
 
-## Issues
+- **Why the feet matter:** the extra foot joints are exactly what the ground-contact / 3D-location
+  solver wants — a player's *feet on the ground* is the most reliable anchor for "where on the pitch
+  are they standing?".
+  > **In plain words:** COCO-17 stops at the ankle; Halpe-26 adds the actual feet, which is what you
+  > need to know where someone is *standing*.
+
+Joint names and skeleton edges live in `src/core/keypoints.py`.
+
+### 4d. Speed knobs are accuracy-neutral
+
+Batch size, prefetch, and worker counts change **speed only** — the keypoints they produce are
+numerically identical regardless of batching. So you can tune throughput freely without touching
+accuracy. (This was hard-won: an earlier GPU-starvation slowdown was traced to cold-disk I/O + thread
+oversubscription, fixed with prefetch overlap and thread caps — not a model change.)
+
+---
+
+## 5. Strengths
+
+- **Top-down accuracy** — the pose model sees a clean, normalised per-person crop, giving the best
+  off-the-shelf per-joint precision; RTMPose-X is the top of its family.
+- **Feet are already computed and kept** — the 6 foot joints the ground solver needs are persisted,
+  not discarded.
+- **Speed is decoupled from accuracy** — batching/prefetch tuning is numerically invariant.
+- **Detector is swappable** — `--det-config/--det-checkpoint` let you drop in a stronger detector
+  with no code change.
+
+## 6. Weaknesses
+
+- **Total dependence on the detector.** A missed person = no pose, unrecoverable downstream. The
+  `bbox_thr=0.3` gate + RTMDet-m's recall on **dark/distant umpires** is the root cause of a whole
+  chain of downstream work-arounds (synthetic tracklets, feet-approximation — see
+  [03-association](03-association.md)).
+- **No temporal information.** Each frame is processed independently, so joints jitter frame-to-frame
+  and P1 has no way to damp it — that is exactly why stage [01 (stabilization)](01-stabilization.md)
+  was added.
+- **Runtime scales with the number of people** (top-down): ~35 person-crops/frame × 7 cameras.
+- **COCO-17 core is body-only** — no hands/face detail (fine for tracking; a limit for fine pose).
+
+---
+
+## 7. Known issues (severity ★)
+
+These feed the [known-bugs tracker](known-bugs.md).
 
 - **P1-1 (★★★) Detector-recall bound.** RTMDet-m @0.3 misses dark/distant/occluded subjects.
-  Evidence: the association layer contains dedicated machinery precisely for players the
-  detector/pose never tracks — `synthetic tracklets` and `apply_feet_approximation`
-  (`src/identity/p3_association/tracklet_graph.py`), and `../diagnosis/09-per-phase-issue-register.md` ID-2 attributes fragmentation
-  partly to weak detection of the "dark umpire". This is the single highest-leverage P1 issue
-  because recall lost here is unrecoverable downstream.
-- **P1-2 (★★) No 2D temporal stabilization at source.** Off-the-shelf keypoints jitter; measured
-  mean 2D jitter ~1.6 px on real frames (`stabilization_metrics.json` on the `rtmpose-x` run).
-  Addressed by the new 01 (stabilization) stage — see [01-stabilization.md](01-stabilization.md).
-- **P1-3 (★★) Detector choice is unbenchmarked for this domain.** RTMDet-m was chosen for speed;
-  there is no cricket-specific recall/precision measurement justifying it over stronger detectors.
-- **P1-4 (★) `bbox_thr=0.3` is a single global threshold.** It trades recall (dark umpires) against
-  false positives (crowd/background) with one number for all cameras and lighting.
-- **P1-5 (★) Halpe-26 feet are available but under-used.** `pose_2d` carries the feet, but the
-  identity gate still uses the legacy bbox-bottom/ankle foot pixel in several paths
-  (`geometry.py` foot logic), leaving accuracy on the table.
+  *Evidence:* the association layer contains dedicated machinery — `synthetic tracklets`,
+  `apply_feet_approximation` — that exists *only* because the detector never tracked those players.
+  Recall lost here is unrecoverable, so this is the single highest-leverage P1 issue.
+- **P1-2 (★★) No 2D temporal stabilization at source.** Off-the-shelf keypoints jitter (~1.6 px mean
+  on real frames). Addressed by stage [01](01-stabilization.md).
+- **P1-3 (★★) Detector unbenchmarked for this domain.** RTMDet-m was picked for speed; there is no
+  cricket-specific recall/precision measurement justifying it over a stronger detector.
+- **P1-4 (★) `bbox_thr=0.3` is one global number** trading recall vs false positives across all 7
+  cameras and all lighting.
+- **P1-5 (★) Halpe-26 feet under-used downstream** — `pose_2d` carries the feet, but some identity
+  paths still use the legacy bbox-bottom/ankle pixel for ground contact.
 
-## Fixes (all, priority-ordered)
+---
 
-| # | Fix | Priority | Reasoning | Expected effect | Effort / blast-radius | Source |
-|---|---|---|---|---|---|---|
-| 1 | **Upgrade the detector** to RTMDet-l/x (drop-in, same ecosystem) and evaluate **RT-DETR** / **Co-DETR** for max recall on small/dark subjects; judge recall by cross-camera coverage/agreement and mosaic review of the missing-subject frames (no labels exist). | ★★★ | Recall lost here is unrecoverable; a stronger detector directly reduces the missing-umpire fragmentation. | Fewer synthetic-tracklet work-arounds; higher multi-camera binding. | Medium; weights + one config, `--det-*` already wired. | RTMDet [2212.07784]; RT-DETR [2304.08069]; Co-DETR [2211.12860] |
-| 2 | **Evaluate RTMO (one-stage)** as an alternative that removes the detector bottleneck entirely — bottom-up, so recall is not gated by a separate box stage; 74.8 AP / 141 FPS. | ★★ | Directly attacks P1-1 by eliminating the detector-recall dependency; also faster. | Better small-person recall + throughput; needs re-validation of the whole 2D contract. | Medium-High; new model path + schema check. | RTMO [2312.07526], CVPR 2024 |
-| 3 | **Confidence-recalibration + per-camera / adaptive `bbox_thr`** (lower where a camera is dark, with stronger NMS to control FPs); optionally test-time augmentation (multi-scale) for distant people. | ★★ | Cheap recall gains on exactly the hard subjects, without a model swap. | +recall on umpires/deep fielders. | Low; CLI/config only. | standard TTA; RTMDet |
-| 4 | **Use the Halpe-26 feet** as the primary ground-contact keypoint everywhere, replacing the bbox-bottom fallback. | ★★ | Feet are already computed; using them tightens the z0 ground solve at no inference cost. | Lower ground error on visible-foot players. | Low-Medium; `geometry.py` foot selection. | Pose2Sim foot handling |
-| 5 | **Learned temporal 2D refinement (SmoothNet)** as an alternative/complement to 01 (stabilization)'s One-Euro filter for the long-tail jitter under occlusion. | ★ | One-Euro is causal and local; SmoothNet fixes long-range jitter bursts 01 (stabilization) cannot. | Lower jitter on hard occluded segments. | Medium; offline model (self-supervised / pretrained; no cricket labels). | SmoothNet [2112.13715], ECCV 2022 |
+## 8. Candidate fixes (priority-ordered)
 
-See the cross-phase priorities in [to_do.md](../../wip/to_do.md).
+> **Implementation status (2026-07-16):** **none of these are implemented** — P1 runs the RTMDet-m +
+> RTMPose-X (Halpe-26) baseline described above. All rows are future roadmap (detector upgrade / RTMO /
+> adaptive `bbox_thr` / feet-as-ground / SmoothNet). The detector-recall bound is tracked as
+> [BUG-4](known-bugs.md).
+
+| # | Fix | Priority | Why | Effort | Source |
+|---|---|---|---|---|---|
+| 1 | **Upgrade the detector** to RTMDet-l/x (drop-in) and evaluate **RT-DETR / Co-DETR** for max recall on small/dark subjects; judge by cross-camera coverage + mosaic review (no labels exist). | ★★★ | Recall lost here is unrecoverable; directly reduces missing-umpire fragmentation. | Medium; `--det-*` already wired. | RTMDet [2212.07784]; RT-DETR [2304.08069]; Co-DETR [2211.12860] |
+| 2 | **Evaluate RTMO (one-stage bottom-up)** — removes the detector bottleneck entirely (74.8 AP / 141 FPS). | ★★ | Attacks P1-1 by eliminating the detector-recall dependency; also faster. | Medium-High; new model path + schema re-validation. | RTMO [2312.07526] |
+| 3 | **Per-camera / adaptive `bbox_thr`** (lower where a camera is dark, stronger NMS to control FPs) + multi-scale test-time augmentation for distant people. | ★★ | Cheap recall gains on the hard subjects with no model swap. | Low; CLI/config only. | standard TTA |
+| 4 | **Use the Halpe-26 feet** as the primary ground-contact joint everywhere, replacing the bbox-bottom fallback. | ★★ | Feet are already computed; using them tightens the 3D ground solve for free. | Low-Medium; `geometry.py`. | Pose2Sim |
+| 5 | **Learned temporal 2D refinement (SmoothNet)** as a complement to stage 01's One-Euro filter for long occlusion-burst jitter. | ★ | One-Euro is causal/local; SmoothNet fixes long-range bursts it can't. | Medium; offline model. | SmoothNet [2112.13715] |
+
+See the cross-phase priorities in [`wip/to_do.md`](../../wip/to_do.md).

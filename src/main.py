@@ -55,7 +55,7 @@ from identity.id_pipeline import (  # noqa: E402
     _run_stage,
 )
 
-STAGE_ORDER = ["01_stabilization", "02_tracking", "03_association", "04_lift", "05_global_id", "06_roles", "08_render"]
+STAGE_ORDER = ["01_stabilization", "02_tracking", "03_association", "04_lift", "05_global_id", "06_roles", "07_refine", "08_render"]
 
 # Columns are read jointly — no single one is optimized in isolation.
 # (name, metrics file relative to deliveries/<D>/, dotted key, format)
@@ -77,6 +77,10 @@ PANEL_COLUMNS = [
     ("jitter_px", "01_stabilization/stabilization_metrics.json", "mean_jitter_px_after", "{:.2f}"),
     ("tri_reproj", "04_lift/triangulation_metrics.json", "mean_reprojection_error_px", "{:.1f}"),
     ("tri_cov", "04_lift/triangulation_metrics.json", "triangulation_coverage", "{:.3f}"),
+    # 07 refinement: 3D-skeleton smoothness / physical validity (after vs before).
+    ("jit3d", "07_refine/refinement_metrics.json", "jitter_mean_m_after", "{:.4f}"),
+    ("hipjit", "07_refine/refinement_metrics.json", "hip_jitter_mean_m_after", "{:.4f}"),
+    ("bonecv", "07_refine/refinement_metrics.json", "max_bone_cv_after", "{:.3f}"),
     ("verdict", "05_global_id/global_id_metrics.json", "quality_verdict.verdict", "{}"),
 ]
 
@@ -226,6 +230,17 @@ def run_compute_chain(plan: DeliveryPlan) -> dict:
                     + (["--config", args.p5_config] if args.p5_config else []),
                     args.python, log,
                 )
+        elif stage == "07_refine":
+            # Physics-constrained 3D skeleton refinement AFTER identity is frozen.
+            # Rewrites only pose_3d / pose_3d_named -> IDs are byte-identical.
+            if not args.enable_refine:
+                continue
+            rc = _run_stage(
+                "identity.p7_refine.run_refinement",
+                common(plan.stage_dir("06_roles"), out_dir)
+                + ["--config", args.refine_config],
+                args.python, log,
+            )
         else:  # pragma: no cover - registry and loop must stay in sync
             raise AssertionError(stage)
         result[f"{stage}_rc"] = rc
@@ -259,6 +274,7 @@ def write_pipeline_manifest(args: argparse.Namespace, stages: list[str], deliver
     configs = {
         "01_stabilization": args.p1b_config, "02_tracking": args.p2_config,
         "03_association": args.p3_config, "05_global_id": args.p4_config, "06_roles": args.p5_config or None,
+        "07_refine": args.refine_config,
     }
     manifest = {
         "schema_version": "pipeline_manifest/v1",
@@ -269,6 +285,7 @@ def write_pipeline_manifest(args: argparse.Namespace, stages: list[str], deliver
         "deliveries": deliveries,
         "enable_stabilization": args.enable_stabilization,
         "enable_lift": args.enable_lift,
+        "enable_refine": args.enable_refine,
         "configs": {
             stage: ({"path": path, "sha256": _sha256(ROOT / path)} if path else None)
             for stage, path in configs.items()
@@ -364,13 +381,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--from-stage", default="01_stabilization", choices=STAGE_ORDER)
     parser.add_argument("--until-stage", default="08_render", choices=STAGE_ORDER)
     parser.add_argument("--skip-render", action="store_true",
-                        help="Shorthand for --until-stage 06_roles (skip the mosaic render).")
+                        help="Shorthand for --until-stage 07_refine (skip the mosaic render only).")
     parser.add_argument("--enable-stabilization", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Run 01 (stabilization) before P2 (v7 default ON; --no-enable-stabilization for v6-style runs).")
     parser.add_argument("--enable-lift", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Run the 04 (binding lift) binding-keyed 3D lift after P3 (v7 default ON).")
+    parser.add_argument("--enable-refine", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Run 07 (refinement): physics-constrained 3D-skeleton smoothing AFTER "
+                             "identity (rewrites only pose_3d; IDs unchanged). Default ON.")
+    parser.add_argument("--refine-config", default="configs/07_refine.yaml")
     parser.add_argument("--p1b-config", default="configs/01_stabilization.yaml")
     parser.add_argument("--p2-config", default="configs/02_tracking.yaml")
     parser.add_argument("--p3-config", default="configs/03_association.yaml")
@@ -432,7 +454,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_tree is None:
         raise SystemExit("provide --output-tree (or --dataset with --version)")
     if args.skip_render and args.until_stage == "08_render":
-        args.until_stage = "06_roles"
+        # Skip only the mosaic; still run 07 refinement so the 3D export is refined.
+        args.until_stage = "07_refine"
     if args.deliveries == "all":
         # Discover every delivery with P1 output in the run (<run>/<DELIVERY>/00_inference).
         run_root = Path(args.output_tree).resolve()

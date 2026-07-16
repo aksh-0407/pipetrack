@@ -1,0 +1,22 @@
+# 07 (refinement) — physics-constrained 3D skeleton refinement.
+# Runs AFTER identity (06_roles); rewrites only pose_3d / pose_3d_named, never any
+# identity field, so IDs are unaffected. Offline / whole-clip (non-causal smoothing).
+enabled: true
+
+# (3) Low-confidence handling: joints below this per-keypoint confidence are dropped
+# and refilled from neighbours (predict-and-substitute) instead of trusted raw.
+conf_floor: 0.5
+max_gap_frames: 25          # longest temporal-interpolation gap (real frames)
+
+# (2) Smoothing cutoffs (Hz). Root (mid-hip) uses the lower cutoff so the hips stop
+# wobbling; limb bone directions use the higher cutoff to keep genuine motion.
+fps: 50.0
+root_cutoff_hz: 3.0
+limb_cutoff_hz: 6.0
+filter_order: 4
+
+# (1) Physics constraints.
+dev_tol: 0.25               # bone deviation vs canonical length counted as "impossible" (metrics)
+clamp_angles: true
+min_hinge_deg: 15.0         # min knee/elbow flexion (prevents self-intersection)
+max_hinge_deg: 178.0        # max flexion before it reads as hyperextension / backward bend

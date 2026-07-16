@@ -20,7 +20,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True,
                         help="Canonical stage run dir with predictions/*.jsonl carrying "
-                             "global_player_id + pose_3d (e.g. 06_roles).")
+                             "global_player_id + pose_3d. Prefer 07_refine (physics-constrained, "
+                             "smoothed 3D); fall back to 06_roles if refinement was disabled.")
     parser.add_argument("--output", required=True, help="UE packet JSONL")
     parser.add_argument("--model-version", required=True)
     return parser.parse_args()

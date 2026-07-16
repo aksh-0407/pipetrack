@@ -38,6 +38,75 @@ HALPE26_EDGES = [
     (16, 25), (16, 21), (16, 23),                  # right foot: heel, big toe, small toe
 ]
 
+# Kinematic tree as an ordered (parent -> child) bone list, rooted at the mid-hip
+# (index 19 = HALPE26_ROOT_INDEX). The order is breadth-first from the root, so a
+# forward pass over the list always sees a bone's parent joint already placed —
+# this is what makes forward-kinematics rebuild / bone-length enforcement a single
+# linear sweep (used by the 07 refinement stage). Covers all 26 joints (root has no
+# incoming bone), a spanning tree of HALPE26_EDGES plus the face->head link.
+HALPE26_BONES = [
+    (19, 11), (19, 12), (19, 18),                          # pelvis -> hips + spine
+    (18, 5), (18, 6), (18, 17),                            # neck -> shoulders + head
+    (11, 13), (12, 14),                                    # hips -> knees
+    (5, 7), (6, 8),                                        # shoulders -> elbows
+    (17, 0),                                               # head -> nose
+    (13, 15), (14, 16),                                    # knees -> ankles
+    (7, 9), (8, 10),                                       # elbows -> wrists
+    (0, 1), (0, 2),                                        # nose -> eyes
+    (15, 20), (15, 22), (15, 24),                          # left ankle -> toes + heel
+    (16, 21), (16, 23), (16, 25),                          # right ankle -> toes + heel
+    (1, 3), (2, 4),                                        # eyes -> ears
+]
+
+# Left/right bone pairs whose lengths are anatomically equal — pooled to a single
+# per-player length so the emitted skeleton is bilaterally symmetric.
+HALPE26_SYMMETRIC_BONES = [
+    ((19, 11), (19, 12)),   # pelvis width halves
+    ((18, 5), (18, 6)),     # neck -> shoulder
+    ((5, 7), (6, 8)),       # upper arm
+    ((7, 9), (8, 10)),      # forearm
+    ((11, 13), (12, 14)),   # thigh
+    ((13, 15), (14, 16)),   # shank
+    ((0, 1), (0, 2)),       # nose -> eye
+    ((1, 3), (2, 4)),       # eye -> ear
+    ((15, 20), (16, 21)),   # ankle -> big toe
+    ((15, 22), (16, 23)),   # ankle -> small toe
+    ((15, 24), (16, 25)),   # ankle -> heel
+]
+
+# Absolute anatomical bone-length limits in METRES: {(parent, child): (min, max, default)}.
+# Adult cricketer proportions (~1.7-1.95 m). These are a hard biomechanical guardrail: a
+# per-player median bone that falls outside its range is a triangulation artefact (a bad /
+# chimera identity), NOT a real limb, so the refinement caps it — the emitted skeleton can
+# never "go beyond physics" regardless of how bad the underlying 3D is. `default` is used
+# when a bone has no reliable samples at all.
+HALPE26_BONE_LIMITS_M = {
+    (19, 11): (0.06, 0.17, 0.11), (19, 12): (0.06, 0.17, 0.11),   # pelvis half-width
+    (19, 18): (0.40, 0.62, 0.52),                                 # hip -> neck (trunk)
+    (18, 5): (0.12, 0.26, 0.18), (18, 6): (0.12, 0.26, 0.18),     # neck -> shoulder
+    (18, 17): (0.10, 0.30, 0.20),                                 # neck -> head
+    (11, 13): (0.35, 0.55, 0.45), (12, 14): (0.35, 0.55, 0.45),   # thigh
+    (13, 15): (0.33, 0.50, 0.43), (14, 16): (0.33, 0.50, 0.43),   # shank
+    (5, 7): (0.23, 0.38, 0.30), (6, 8): (0.23, 0.38, 0.30),       # upper arm
+    (7, 9): (0.20, 0.32, 0.26), (8, 10): (0.20, 0.32, 0.26),      # forearm
+    (17, 0): (0.05, 0.30, 0.15),                                  # head -> nose
+    (0, 1): (0.02, 0.10, 0.05), (0, 2): (0.02, 0.10, 0.05),       # nose -> eye
+    (1, 3): (0.03, 0.14, 0.09), (2, 4): (0.03, 0.14, 0.09),       # eye -> ear
+    (15, 20): (0.10, 0.28, 0.19), (16, 21): (0.10, 0.28, 0.19),   # ankle -> big toe
+    (15, 22): (0.10, 0.28, 0.19), (16, 23): (0.10, 0.28, 0.19),   # ankle -> small toe
+    (15, 24): (0.03, 0.13, 0.08), (16, 25): (0.03, 0.13, 0.08),   # ankle -> heel
+}
+
+# Hinge joints as (proximal, joint, distal) triplets — the flexion angle is measured
+# at ``joint`` between the (proximal - joint) and (distal - joint) vectors. Used to
+# clamp anatomically impossible bends (backward knees / elbows).
+HALPE26_HINGES = [
+    (5, 7, 9),      # left elbow
+    (6, 8, 10),     # right elbow
+    (11, 13, 15),   # left knee
+    (12, 14, 16),   # right knee
+]
+
 
 def named_root_relative(
     points: np.ndarray,

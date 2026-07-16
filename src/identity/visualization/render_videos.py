@@ -420,22 +420,18 @@ def draw_chip(
     x, y = origin
     (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
     pad_x, pad_y = 10, 7
-    blend_rect(
-        image,
-        (x, y - text_h - pad_y),
-        (x + text_w + 2 * pad_x, y + pad_y),
-        (18, 24, 32),
-        0.82,
-    )
-    cv2.rectangle(
-        image,
-        (x, y - text_h - pad_y),
-        (x + text_w + 2 * pad_x, y + pad_y),
-        color,
-        1,
-        cv2.LINE_AA,
-    )
-    draw_text(image, text, (x + pad_x, y), scale=scale, color=(248, 250, 255), thickness=1)
+    p1 = (x, y - text_h - pad_y)
+    p2 = (x + text_w + 2 * pad_x, y + pad_y)
+    # Fill the chip with the player's OWN colour so a label is unmistakably tied to its
+    # player even when the leader line is long. The text + border use a contrasting
+    # colour (black on light fills, white on dark) picked from the fill's luminance so
+    # the text stays readable on any player colour.
+    b, g, r = (int(c) for c in color[:3])
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    fg = (0, 0, 0) if luminance > 140 else (255, 255, 255)
+    cv2.rectangle(image, p1, p2, color, cv2.FILLED)
+    cv2.rectangle(image, p1, p2, fg, 1, cv2.LINE_AA)
+    draw_text(image, text, (x + pad_x, y), scale=scale, color=fg, thickness=1)
     return x + text_w + 2 * pad_x + 8, y
 
 
@@ -628,7 +624,7 @@ def draw_players(
     if body_paint and players:
         overlay = image.copy()
         draw_body_paint(overlay, players, colors, keypoint_threshold)
-        cv2.addWeighted(overlay, 0.35, image, 0.65, 0, dst=image)
+        cv2.addWeighted(overlay, 0.42, image, 0.58, 0, dst=image)
     # Left-to-right processing makes the collision-aware chip placement stable.
     order = sorted(range(len(players)), key=lambda i: players[i]["bbox_xywh_px"][0])
     placed_chips: list[tuple[int, int, int, int]] = []
@@ -644,7 +640,7 @@ def draw_players(
         detection_conf = float(detection_confidence or 0.0)
 
         if not body_paint:
-            blend_rect(image, (x, y), (x2, y2), color, 0.08)
+            blend_rect(image, (x, y), (x2, y2), color, 0.12)
         cv2.rectangle(image, (x, y), (x2, y2), color, line_thickness, cv2.LINE_AA)
         corner = max(12, min(w, h) // 7)
         cv2.line(image, (x, y), (x + corner, y), (255, 255, 255), line_thickness, cv2.LINE_AA)
@@ -674,7 +670,10 @@ def draw_players(
             (top_clear, bottom_clear), placed_chips,
         )
         if stacked:
-            cv2.line(image, (label_x + 6, label_y + 2), (x + 6, y), color, 1, cv2.LINE_AA)
+            # Thicker leader line (matches the box stroke) so a label stacked far from
+            # its player is easy to trace back to the right detection box.
+            cv2.line(image, (label_x + 6, label_y + 2), (x + 6, y), color,
+                     max(2, line_thickness), cv2.LINE_AA)
         next_x, _ = draw_chip(image, label, (label_x, label_y), color=color, scale=font_scale)
         bar_w = 56 if compact else 84
         bar_h = 5 if compact else 7

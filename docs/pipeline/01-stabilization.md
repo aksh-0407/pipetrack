@@ -1,119 +1,164 @@
-# 01 (stabilization) — 2D temporal stabilization (new)
+# 01 — 2D temporal stabilization
 
-> **Stage 01** (was P1.5) — code `src/identity/p1_stabilization/`, config `configs/01_stabilization.yaml`.
+> **Stage 01** (was P1.5) — smooths the jittery 2D keypoints *before* anything else uses them.
+> Code: `src/identity/p1_stabilization/`, config `configs/01_stabilization.yaml`.
 
-> **Status update (2026-07-16) — stabilization-order A/B (keeps this stage's ordering).** Tested
-> stabilize-first (2D One-Euro here → triangulate → 3D-smooth in 04, the current default) vs
-> triangulate-raw-then-3D-smooth (`main --no-enable-stabilization`). Stab-first wins on every axis on
-> 8_init: cross-camera agreement 0.9160 vs 0.9114, 3D-joint jitter 0.0105 vs 0.0117 m, teleports 258 vs
-> 280, reprojection tied. Removing per-view pixel jitter *before* triangulation prevents 3D
-> depth-swimming a post-hoc 3D smoother can't fully recover — so the "2D stabilization distorts the 3D
-> coordinates" concern is not borne out. **Keep stabilize-first.** (SmoothNet as a learned complement to
-> One-Euro remains an open option — see [00-inference.md](00-inference.md) fixes.)
+---
 
-## Role & intuition
+## 1. What this stage does (and why)
 
-Off-the-shelf 2D keypoints jitter frame-to-frame even when a player is standing still, and that
-noise propagates into tracking (spurious motion), association (noisy ground points), and
-triangulation (noisy rays). 01 (stabilization) is a new stage inserted **between P1 and 02** that denoises the
-2D keypoint trajectories *once, at the source*, so every downstream stage inherits a cleaner
-signal instead of re-fighting the same jitter. It is the logical answer to "clean the data
-before it helps the next phase."
+P1 processes each frame independently, so even a perfectly still player's joints **wobble a pixel or
+two every frame** — pure measurement noise. That wobble then poisons everything downstream: tracking
+sees fake motion, association gets noisy ground points, triangulation gets noisy rays.
 
-The central subtlety: smoothing a trajectory needs to know **which detection is the same person
-across frames** — i.e. temporal correspondence. Full identity tracking is 02's job, so 01 (stabilization) does
-the *minimum* correspondence needed for smoothing — short IoU **micro-tracks** — and never spans a
-real occlusion or crosses cameras. A mislink just means two detections are smoothed together for
-a frame or two; it cannot create an identity error.
+Stage 01 sits **between P1 and 02** and **denoises each keypoint's trajectory over time, once, at the
+source** — so every later stage inherits a clean signal instead of re-fighting the same jitter.
 
-## I/O & config
+> **In plain words:** clean the data once, up front, where it's cheapest — instead of making five
+> later stages each cope with the same shaking.
+
+**The subtlety:** to smooth "this joint over time" you must know *which detection in frame t+1 is the
+same person as in frame t* — a mini temporal-matching problem. Full identity tracking is 02's job, so
+01 does the *bare minimum* matching needed to smooth: short **micro-tracks** that never span a real
+occlusion or cross cameras. If it mis-links two people for a frame, the only cost is a frame or two of
+slightly-blended smoothing — it can **never** create an identity error.
+
+---
+
+## 2. Inputs and outputs
 
 | | |
 |---|---|
 | **Input** | a P1 run dir (`predictions/*.jsonl`) |
-| **Output** | a stabilized run dir in the identical canonical format — a **drop-in 02 input** (`local_track_id` stays null, schema-valid) + `stabilization_metrics.json` (jitter before/after) |
-| **Config** | `configs/01_stabilization.yaml` (all flag-gated; `enabled: false` = byte-identical passthrough) |
+| **Output** | a stabilized run dir in the *identical* format — a drop-in 02 input (`local_track_id` stays null, schema-valid) + `stabilization_metrics.json` (jitter before/after) |
+| **Config** | `configs/01_stabilization.yaml` — all flag-gated; `enabled: false` = a byte-identical passthrough (so A/Bs are clean) |
 | **CLI** | `python -m identity.p1_stabilization.run_stabilization --input-run-dir <p1> --output-run-dir <p1b> --delivery-id <D>` |
 
-## Flowchart
+---
+
+## 3. How it works, step by step
 
 ```mermaid
 flowchart TD
-  IN["P1 predictions (per camera)"] --> L["IoU micro-track linking<br/>linker.py: greedy IoU, gap-bridge"]
-  L --> S["per keypoint trajectory"]
-  S --> C{"low conf and big jump?"}
-  C -- yes --> CL["spike clamp -> predicted pos"]
-  C -- no --> OE
-  CL --> OE["One-Euro filter (x,y)<br/>smoothing.py"]
-  OE --> W["write smoothed pose_2d (Halpe-26)<br/>recompute keypoints_norm"]
+  IN["P1 predictions (per camera)"] --> L["IoU micro-track linking<br/>linker.py"]
+  L --> S["per-keypoint trajectory over time"]
+  S --> C{"low confidence AND<br/>big jump from last position?"}
+  C -- yes --> CL["spike clamp → hold last position"]
+  C -- no --> OE["One-Euro filter (x,y)<br/>smoothing.py"]
+  CL --> OE
+  OE --> W["write smoothed pose_2d<br/>(recompute keypoints_norm)"]
   W --> M["jitter before/after metric"]
 ```
 
-## Methods walkthrough
+### 3a. Micro-track linking — `link_micro_tracks` ([linker.py:35](../../src/identity/p1_stabilization/linker.py#L35))
 
-**Micro-track linking — `link_micro_tracks` ([linker.py:35](../../src/identity/p1_stabilization/linker.py#L35)).**
-Greedy IoU association across consecutive frames (`iou_min=0.3`), bridging up to
-`max_gap_frames=2` missed frames. This is *not* identity tracking — it is the temporal
-correspondence a smoother requires, and by construction it cannot span an occlusion.
+Greedy **IoU** matching across consecutive frames (`iou_min=0.3`), bridging up to
+`max_gap_frames=2` missed frames.
 
-**One-Euro filter — `OneEuroFilter` ([smoothing.py:26](../../src/identity/p1_stabilization/smoothing.py#L26)).**
-The One-Euro filter ([Casiez, Roussel & Vogel, CHI 2012](https://gery.casiez.net/1euro/)) is a
-low-pass filter whose cutoff frequency **rises with the signal speed**:
-`cutoff = min_cutoff + β·|ẋ̂|`, where `ẋ̂` is a smoothed derivative. When a joint is still, the
-cutoff is low → strong smoothing (kills jitter); when it moves fast, the cutoff rises → little
-lag. This is the standard speed/lag trade-off tool for noisy interactive signals and is causal
-(online-friendly). One filter runs per keypoint per coordinate along a micro-track.
+- **IoU (Intersection-over-Union):** a 0–1 overlap score between two boxes — the area they share
+  divided by the area they jointly cover. 1 = identical boxes, 0 = no overlap. "Greedy" = for each box
+  in frame t, grab the best-overlapping box in t+1, first-come-first-served.
+  > **In plain words:** "the box in this frame that most overlaps a box in the next frame is probably
+  > the same person." Good enough for a 2–3 frame smoothing window; not trusted for real identity.
 
-**Confidence-gated spike clamp ([smoothing.py:78](../../src/identity/p1_stabilization/smoothing.py#L78)).**
-Before filtering, a keypoint whose confidence is below `confidence_min (0.3)` **and** whose jump
-from the last filtered position exceeds `max(max_jump_px, max_jump_bbox_frac·bbox_diag)` is
-replaced by the last filtered position — so a single hallucinated ankle 200 px away cannot drag
-the trajectory. Missing/placeholder joints (`(0,0)`) are passed through untouched and do not
-advance their filter.
+### 3b. One-Euro filter — `OneEuroFilter` ([smoothing.py:26](../../src/identity/p1_stabilization/smoothing.py#L26))
 
-**Jitter metric — `mean_jitter_px` ([smoothing.py:110](../../src/identity/p1_stabilization/smoothing.py#L110)).**
-Mean frame-to-frame displacement over confident, valid keypoints — the before/after number that
-proves the stage did something.
+The **One-Euro filter** ([Casiez et al., CHI 2012](https://gery.casiez.net/1euro/)) is a low-pass
+filter whose smoothing strength **automatically adapts to how fast the signal is moving**:
 
-## Pros
+```
+cutoff = min_cutoff + β · |smoothed velocity|
+```
 
-- **Denoises once, benefits every downstream stage** — the correct place for a shared cost.
-- **Speed-adaptive** (One-Euro) — removes jitter at rest without smearing fast motion (a bat
-  swing / sprint), unlike a fixed EMA.
-- **Causal / online-friendly** — no future frames needed, so it does not block a real-time path.
+- A **low-pass filter** removes fast wiggles (noise) and keeps slow changes (real motion). Its
+  **cutoff frequency** sets where "fast" begins — a low cutoff smooths hard, a high cutoff barely
+  smooths.
+- One-Euro makes the cutoff *rise with speed*: when a joint is **still**, cutoff is low → heavy
+  smoothing kills the jitter; when a joint moves **fast** (a bat swing, a sprint), cutoff rises →
+  almost no smoothing, so it doesn't lag or smear the real motion.
+  > **In plain words:** it smooths hard when nothing's happening (killing the shake) and gets out of
+  > the way the instant the player actually moves — so you lose the jitter but not the action. A
+  > fixed smoother can't do both: it either leaves jitter or blurs fast moves.
+- It is **causal** (uses only past frames), so it works in a live/online setting. One filter runs per
+  keypoint per coordinate along a micro-track.
+
+### 3c. Spike clamp ([smoothing.py:78](../../src/identity/p1_stabilization/smoothing.py#L78))
+
+Before filtering, if a keypoint is both **low-confidence** (`< 0.3`) **and** has **jumped
+implausibly far** from its last filtered position (beyond `max(max_jump_px, max_jump_bbox_frac ·
+bbox_diag)`), it is replaced by the last good position.
+
+> **In plain words:** if the model briefly hallucinates an ankle 200 px away with low confidence,
+> don't let that one bad guess yank the whole smoothed trajectory — just hold the last believable
+> spot. (Missing joints marked `(0,0)` are passed through untouched.)
+
+### 3d. Jitter metric — `mean_jitter_px` ([smoothing.py:110](../../src/identity/p1_stabilization/smoothing.py#L110))
+
+Mean frame-to-frame movement of confident, valid joints — the before/after number that proves the
+stage did something real.
+
+---
+
+## 4. Does smoothing-first hurt the 3D? (measured — no)
+
+A natural worry (raised by a colleague): *if you distort the 2D pixels before triangulating, do you
+corrupt the 3D?* We tested it directly (A/B on 8_init):
+
+| | ARM A: stabilize-first (current) | ARM B: triangulate raw, then smooth 3D |
+|---|---|---|
+| cross-camera agreement | **0.9160** | 0.9114 |
+| 3D-joint jitter | **0.0105 m** | 0.0117 m |
+| teleports | **258** | 280 |
+| reprojection | tied | tied |
+
+**Verdict: keep stabilize-first — it wins on every axis.** Removing per-camera pixel jitter *before*
+triangulation prevents 3D "depth-swimming" that a post-hoc 3D smoother can't fully undo. The worry is
+not borne out. (Details in [fixes-log](fixes-log.md).)
+
+> **In plain words:** clean each camera's 2D first, *then* combine into 3D — that beats combining
+> noisy 2D and trying to clean the 3D afterward. Cleaning early wins.
+
+---
+
+## 5. Strengths
+
+- **Denoises once, benefits every downstream stage** — the right place for a shared cost.
+- **Speed-adaptive** — kills rest-jitter without smearing fast motion (unlike a fixed EMA).
+- **Causal/online-friendly** — no future frames needed.
 - **Safe by construction** — micro-tracks never cross occlusion/cameras; `enabled:false` is a
-  byte-identical passthrough for clean A/B; output is schema-validated and `local_track_id` stays
-  null (a true drop-in 02 input).
-- **Measured win** — mean 2D jitter **1.58 → 1.07 px (−32%)** on the real `rtmpose-x` delivery-1
-  run, and 02 consumes the output cleanly (validated).
+  byte-identical passthrough. Measured win: mean 2D jitter **1.58 → 1.07 px (−32%)** on real footage.
 
-## Cons
+## 6. Weaknesses
 
-- **Micro-track linking is IoU-only** — in a dense pack of players with overlapping boxes it can
-  briefly link the wrong pair; the effect is bounded (a frame or two of shared smoothing) but not
-  zero.
-- **One-Euro is local/causal** — it cannot repair a *long* jitter burst under sustained occlusion
-  the way a learned, non-causal model (SmoothNet) can.
-- **Tuned, not learned** — `min_cutoff/β` are global constants; the optimal smoothing differs by
-  joint (ankles jitter more than the torso) and by motion regime.
-- **Adds a stage/pass** — one more run dir and I/O pass over the predictions.
+- **IoU-only linking** can briefly mislink in a dense pack of overlapping boxes (bounded, not zero).
+- **Causal One-Euro can't repair a *long* jitter burst** under sustained occlusion (a non-causal
+  learned model like SmoothNet could).
+- **Global constants** — one `min_cutoff/β` for all joints; ankles jitter more than the torso.
+- **Adds a stage/pass** — one more run dir and I/O pass.
 
-## Issues
+---
 
-- **P15-1 (★★) Linking is appearance-blind.** Pure IoU can mislink in crowds; a cheap pose-cosine
-  tiebreaker (already computed elsewhere) would make micro-tracks more reliable.
-- **P15-2 (★) Global smoothing constants.** One `min_cutoff/β` for all joints under-smooths the
-  torso or over-smooths the feet; per-joint (or confidence-scaled) parameters would do better.
-- **P15-3 (★) No long-range jitter handling.** The causal filter leaves the occlusion-burst tail
-  that SmoothNet targets.
-- **P15-4 (★) Not yet wired into the default delivery flow.** The stage exists and is validated but
-  is opt-in; the batch driver does not yet call it before 02.
+## 7. Known issues (severity ★)
 
-## Fixes (all, priority-ordered)
+- **P15-1 (★★) Linking is appearance-blind** — pure IoU can mislink in crowds; a cheap pose-cosine
+  tiebreaker (already computed elsewhere) would help.
+- **P15-2 (★) Global smoothing constants** — per-joint / confidence-scaled parameters would smooth
+  feet and torso appropriately.
+- **P15-3 (★) No long-range jitter handling** — the causal filter leaves the occlusion-burst tail.
+- **P15-4 (★) Not wired into the default delivery flow** — validated but opt-in; the batch driver
+  doesn't yet call it before 02.
 
-| # | Fix | Priority | Reasoning | Expected effect | Effort | Source |
-|---|---|---|---|---|---|---|
-| 1 | **Add a pose-cosine tiebreaker to micro-track linking** (reuse `pose_vector`), so IoU ties in a pack are broken by body pose. | ★★ | Removes the main failure mode (crowd mislinks) cheaply. | Cleaner micro-tracks → better smoothing in packs. | Low | ByteTrack pose/appearance cues [2110.06864] |
-| 2 | **Per-joint / confidence-scaled `min_cutoff`** (feet vs torso). | ★ | Different joints have different noise; one constant is suboptimal. | More jitter removed without added lag. | Low | One-Euro [Casiez 2012] |
-| 3 | **Offer a SmoothNet post-pass** for offline runs to fix long occlusion-burst jitter. | ★ | Causal One-Euro cannot fix long bursts; SmoothNet is the SOTA plug-in for exactly this. | Lower jitter on hard occluded clips. | Medium | SmoothNet [2112.13715] |
-| 4 | **Wire 01 (stabilization) into the default delivery flow** (batch driver runs it before 02, behind the enable flag) and add its jitter metric to the joint panel. | ★★ | A validated win that is not yet on by default delivers nothing until wired. | Realises the −32% jitter gain end-to-end. | Low | — |
+---
+
+## 8. Fix-implementation status + candidate fixes (priority-ordered)
+
+> **Implementation status (2026-07-16):** stage 01 **is wired into the driver** (`src/main.py`, gated by
+> `--enable-stabilization`) — it is **opt-in**, not on by default (that's fix #2 / [BUG-8](known-bugs.md)).
+> The other listed fixes (pose-cosine tiebreaker, per-joint cutoff, SmoothNet) are **NOT DONE** — future.
+
+| # | Fix | Priority | Why | Effort | Source |
+|---|---|---|---|---|---|
+| 1 | **Add a pose-cosine tiebreaker to micro-track linking** (reuse `pose_vector`) so IoU ties in a pack are broken by body pose. | ★★ | Removes the main failure mode (crowd mislinks) cheaply. | Low | ByteTrack [2110.06864] |
+| 2 | **Wire 01 into the default flow** (batch driver runs it before 02, behind the enable flag) and add its jitter metric to the panel. | ★★ | A validated win delivers nothing until it's actually on. | Low | — |
+| 3 | **Per-joint / confidence-scaled `min_cutoff`** (feet vs torso). | ★ | Different joints have different noise. | Low | One-Euro [Casiez 2012] |
+| 4 | **Offer a SmoothNet post-pass** for offline runs to fix long occlusion-burst jitter. | ★ | Causal One-Euro can't fix long bursts. | Medium | SmoothNet [2112.13715] |

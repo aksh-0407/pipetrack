@@ -11,7 +11,92 @@ follows the conventions of `../../wip/methods_log.md`.
 
 ## Current-era entries (post-restructure, `src/` layout)
 
-### 2026-07-16 — Session analyses & 40-confirmations (see wip/session_2026-07-16_summary.md)
+### 2026-07-16 — CORRECTION: many "candidate" flags are ALREADY ENABLED in production
+
+A late, important correction. When asked to "implement" pose-shape-primary (#2a), splittable clustering
+(#2b), parallax-adaptive gate (#3), distance-dependent Kalman R (#4/#5a), and adaptive lost-window (#5b),
+I audited `config.py` and reported them as default-off options to build. **That was wrong** — I read the
+**dataclass defaults** (`False`); the **production YAML overrides them to `True`.** Verified from
+`run_manifest.json` of real runs:
+
+- `configs/03_association.yaml`: `graph_shape_enabled: true`, `graph_split_enabled: true`,
+  `graph_facing_gate_scale: 1.3`, `emit_ground_cov: true` (+ cap `3.5`).
+- `configs/05_global_id.yaml`: `use_measurement_covariance: true`, `adaptive_lost_window: true`,
+  `emit_kalman_posterior: true`.
+
+So these features are **live in the shipped pipeline** (and baked into every mosaic). My first flag A/B
+"tested" turning them on **on top of a baseline that already had them on** → all arms byte-identical
+(on-vs-on — the same trap as `emit_kalman_posterior`). **Corrected test — OFF-vs-ON A/B (8_init),
+disabling each production flag:**
+
+| flag OFF | dAgr | dTeleport(indep) | dIds | observation (NOT an auto-verdict) |
+|---|---|---|---|---|
+| `use_measurement_covariance` (distance-R) | −0.0003 | +11 (258→269) | 0 | marginal / noise-level on 8_init |
+| `adaptive_lost_window` | −0.0001 | +8 (258→266) | +1 | marginal / noise-level on 8_init |
+| `graph_shape_enabled` | 0 | 0 | 0 | inert on 8_init (byte-identical) |
+| `graph_split_enabled` | 0 | 0 | 0 | inert on 8_init (no chimeras here) |
+| `graph_facing_gate_scale 1.3` | 0 | 0 | 0 | inert on 8_init (gate not binding post-cap) |
+
+**Interpretation is deferred to human review (per user directive 2026-07-16): keep / disable / enable
+decisions are NOT auto-verdicted by the agent.** The measured facts: the agreement deltas are within
+run-to-run noise (±0.0003) and the teleport deltas are small on a 258 base of a proxy metric over 8 clean
+clips — i.e. **not a compelling result on this set.** shape/split/parallax do nothing here; whether they
+help on the chimera-heavy 40-set worst clips is untested. No config change is being made off these numbers. Config-hygiene hazard logged as
+[known-bugs NB-2](known-bugs.md); mis-filed BUG-2 (distance-blind R) retracted, BUG-3 (chimera split)
+downgraded (split is on, conservative). **The verified headline wins are unaffected** — cap fix
+(1.5→3.5), A3 (`emit_velocity_gate` off→on), and IMPACT-2 (`drop_partial_singlecam` false→true) each used
+genuinely different flag values (confirmed in manifests) and stand.
+
+### 2026-07-16 — CHANGE SCORECARD (before → after, pros/cons for every change)
+
+Every change this session at a glance. Metrics are the joint panel (cross-camera **agr**eement,
+**tele**ports > 25 m/s, distinct **id** count, **coloc** ghost pairs, same-camera **coll**isions).
+Detailed per-change entries follow below; the neutrals get expanded pros/cons.
+
+| Change | Scope / flag | Before → After (best measured set) | Verdict | Size |
+|---|---|---|---|---|
+| **Cap fix** | `graph_llr_positive_cap 1.5→3.5` (03) | 40: agr **0.853→0.883**, under-merge 11→6%, coloc **5→0**, coll 0 | ✅ **ENABLED** | 1 line |
+| **A3 velocity-gate** | `emit_velocity_gate` (05), default-off | 40: tele **367→0**, max **2224→11.9 m/s**, ids 462→462, agr 0.8831=0.8831 | ✅ **40-conf, recommend enable** | ~70 ln, drop-only |
+| **IMPACT-2 drop** | `drop_partial_singlecam` (05), default-off | 40: **13 ghost ids dropped** (462→449), agr held, coll 0, coloc 0 | 🟢 40-conf clean, awaiting mosaic | ~30 ln, drop-only |
+| **1A hip emit** | `emit_ground_source: triangulated_hip` (05), default-off | 8: tele 33→32, agr 0.9160=0.9160 (**neutral**) | 🟡 neutral — option | ~40 ln |
+| **1C robust refit** | `--tri-robust-refit` (04), default-off | 8: reproj p95 6.61→6.56 px (**neutral**) | 🟡 neutral — option | ~50 ln |
+| **1F sticky-hip** | `single_view_hip_fallback` (05), default-off | 8: tele **33→35** (worse), p95 1.4→2.0 | ❌ **rejected on merit** | ~40 ln |
+| **Tracklet-id lock** | (removed) | 8: 2D-switches 65→39 BUT stable **wrong-person id** | ❌ **rejected, code removed** | was ~200 ln → 0 |
+| **GT removal** | delete `evaluate_ground_truth` + `--ground-truth` | n/a (cleanup; 217 tests green) | ✅ done | net −code |
+| **Kalman-posterior** | `emit_kalman_posterior` (already on in prod) | teleports **persist** with it on (33/8, 367/40) | ⚠️ ineffective — see known-bugs BUG-1 | finding |
+
+**Pros / cons — the two ENABLED / recommended wins**
+- **Cap fix** — *Pros:* biggest agreement gain of the campaign; 1-line, instantly reversible; over-merge
+  guards untouched; triple-confirmed (8 + 40 + mosaic). *Cons:* only *partially* closes facing-pair
+  under-merge (6% residual); a blunt global cap, not per-pair-adaptive.
+- **A3 velocity-gate** — *Pros:* removes 100% of emitted teleports with zero collateral (no ids lost,
+  agreement/p95 unchanged); drop-only so it can't put a marker in a wrong place; byte-identical off.
+  *Cons:* a **symptom** fix — the id-level mis-assignment behind the teleport still exists (root fix =
+  BUG-2 distance-aware R); a sustained wrong-id stretch is re-anchored after 5 frames, not gated.
+
+**Detailed pros / cons — the NEUTRAL changes (why parked, not enabled)**
+
+- **1A — hip-to-ground emission (`emit_ground_source: triangulated_hip`).** Emits the 04-triangulated
+  pelvis projected to z=0 instead of averaged foot rays.
+  - *Pros:* conceptually cleaner (one robust multi-view point vs two averaging layers); it is exactly the
+    user's "hip projected to ground" definition; removes the double-averaging in the emit path; a natural
+    partner for a future decide-in-3D.
+  - *Cons:* **metric-neutral** — teleports 33→32, agreement unchanged, so no measured win to justify
+    flipping the default; depends on 04 running `--id-source binding` (else it silently falls back to
+    feet); on single-camera frames the hip isn't triangulable so it reverts to the foot path anyway (the
+    1F attempt to cover that case *failed*). **Verdict:** keep as an option; A3 makes it moot for
+    teleports, and the real gain (if any) needs the decide-in-3D A/B, not emission alone.
+- **1C — Huber-IRLS robust triangulation refit (`--tri-robust-refit`).** An optional M-estimator polish
+  on the per-joint inlier re-fit.
+  - *Pros:* it is the principled "robust average" the brief asked for, in-repo-justified (same estimator
+    as `robust_fuse_ground`); stays in pixel-residual space (doesn't over-model noise); byte-identical
+    when off (forces the reference loop, batched kernels untouched); correct and available for a future
+    harder rig.
+  - *Cons:* **marginal** — reproj p95 6.61→6.56 px, because RANSAC + weighted-DLT already rejects the bad
+    view, so the extra Huber pass has little left to fix; it forces the slower per-joint loop when on
+    (a throughput cost); no teleport/agreement movement. **Verdict:** keep opt-in; revisit only if a
+    future noisier rig or the leave-one-camera-out metric shows headroom.
+
 
 - **IMPACT-2 partial-detection drop (`p4a.drop_partial_singlecam`, P5 emission, default-off):** drops a
   single-camera predominantly-partial (median <8 confident kpts) global id at emission — DROP-ONLY,
@@ -46,11 +131,17 @@ follows the conventions of `../../wip/methods_log.md`.
   `max = 1220 m/s` outlier is **identical in all three arms** → the dominant teleport is an id-level jump,
   independent of position source. Flag stays as a default-off option; **next teleport work = A3 per-tracklet
   emission velocity-gate**, not a better hip source. 3 unit tests, 212 green (built, kept, not enabled).
-- **`emit_kalman_posterior` (advertised ISSUE-5 teleport fix): latent NO-OP.** With the flag on and
-  `emit_ground_source=foot`, the emitted `ground_tracks.jsonl` is **byte-identical 8/8** to the flag-off run
-  (cmp) — the `track.kalman.pos_world_xy` branch at runner.py:233 never changes emission, so it does not
-  suppress the teleport it was built for. Flagged for a later fix; not blocking (default-off, nothing relies
-  on it). This is what motivated a *hard* gate (A3) over the soft Kalman path.
+- **`emit_kalman_posterior` (advertised ISSUE-5 teleport fix): INEFFECTIVE as a teleport guard; "no-op"
+  claim RETRACTED as untested.** Correction (2026-07-16): my first A/B was **unsound** — it compared the
+  base `configs/05_global_id.yaml` (which *already* sets `emit_kalman_posterior: true`) against an
+  explicit-true config, i.e. **true-vs-true**, so the byte-identical result proved nothing about the flag.
+  The loader *does* thread the flag (`emit_kalman_posterior` is a real `P4AConfig` field, wired via
+  `_build_nested`), and production runs with it **on**. **Isolated off-vs-on A/B now done (8_init, foot
+  source): ground_tracks DIFFER 8/8 → the flag IS active and changes the emission (NOT a no-op).** But
+  teleports still occur at 33/8-set and 367/40-set with it on → it is an **active but ineffective** guard:
+  the χ²-gated posterior *follows/admits* the mis-associated measurement (permissive gate + distance-blind
+  R, BUG-2). The literal "no-op" claim is fully retracted. The effective fix is the hard drop-gate (A3),
+  which eliminates the teleports regardless. See known-bugs.md BUG-1.
 - **A3 emitted-track velocity gate (`p4a.emit_velocity_gate`, default-off): ✅ 40-CONFIRMED WIN — drops
   teleport frames, drop-only. Awaiting only the before/after mosaic before recommending enable.** After the per-frame emitted ground
   positions are built, each id's track is walked in frame order and any frame whose implied speed from the

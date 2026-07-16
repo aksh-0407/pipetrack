@@ -54,8 +54,10 @@ P5.)
 
 ### A3: emitted-track velocity gate (`p4a.emit_velocity_gate`, P5 emission) — STRONG 8_init WIN
 The direct fix for the "haywire ghost markers going crazy". Built after the 1F A/B proved the teleport is
-**not** a position-source problem (foot/hip/sticky-hip and the built-in Kalman posterior all leave it
-untouched) — it is an id-level jump. A3 walks each id's emitted ground track and DROPS any frame whose
+**not** a position-source problem (foot/hip/sticky-hip all leave it untouched) — it is an id-level jump.
+(The `emit_kalman_posterior` guard, which is *on* in the production config, also fails to stop it — teleports
+persist at 33/8-set and 367/40-set with it on; my earlier "byte-identical no-op" A/B was unsound (true-vs-true)
+and is retracted — see fixes-log/known-bugs.) A3 walks each id's emitted ground track and DROPS any frame whose
 implied speed from the last kept frame exceeds 12 m/s (a real cricketer never exceeds ~11); gap-scaled, and
 re-anchors after 5 consecutive drops so a genuine relocation isn't deleted. **Drop-only — never moves or
 relabels a position, so like IMPACT-2 it structurally cannot repeat the lock's wrong-person failure.**

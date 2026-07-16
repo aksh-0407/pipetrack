@@ -1,108 +1,176 @@
 # 02 — per-camera tracking
 
-> **Stage 02** (was P2) — code `src/identity/p2_tracking/`, config `configs/02_tracking.yaml`.
+> **Stage 02** (was P2) — links per-frame detections into **per-camera tracks**. This is the first
+> point where a player gets a *temporal identity* (within one camera). Code:
+> `src/identity/p2_tracking/`, config `configs/02_tracking.yaml`.
 
-## Role & intuition
+---
 
-02 links per-frame detections into **per-camera tracklets** (`local_track_id`) — the temporally
-coherent "this box in frame t is the same person as that box in t+1, *within one camera*". These
-tracklets are the strongest identity primitive the rest of the pipeline has: 03 decides identity
-per *tracklet-pair* (not per detection), which denoises the association by roughly √n. So 02's
-job is to produce clean, un-fragmented, un-swapped per-camera tracks.
+## 1. What this stage does (and why)
 
-## I/O & config
+P1 gives you a bag of unlabelled people *per frame*. Stage 02 stitches those into **tracklets** — "the
+box in frame t is the same person as that box in t+1, **within this one camera**" — and stamps each
+with a `local_track_id`.
+
+These per-camera tracklets are the strongest identity primitive the rest of the pipeline has.
+Crucially, stage 03 decides cross-camera identity **per tracklet-pair, not per detection**, which
+averages out per-frame noise by roughly **√n** (n = tracklet length). So 02's whole job is to produce
+**clean, un-fragmented, un-swapped** per-camera tracks.
+
+> **In plain words:** 02 turns "a crowd of anonymous boxes each frame" into "player A's path in camera
+> 1, player B's path in camera 1, …". The cleaner these paths, the easier everything after it.
+
+*What 02 does **not** do:* it never links across cameras (that's 03) and it can't use other cameras to
+resolve an in-camera occlusion. Same-camera identity collisions are impossible by construction.
+
+---
+
+## 2. Inputs and outputs
 
 | | |
 |---|---|
-| **Input** | P1 (or 01 (stabilization)) run; calibration; `configs/02_tracking.yaml` |
-| **Output** | `predictions/*` with `local_track_id`; per-camera tracking diagnostics + `tracking_metrics.json` |
+| **Input** | a P1 (or 01-stabilized) run + calibration; `configs/02_tracking.yaml` |
+| **Output** | `predictions/*` now carrying `local_track_id`; per-camera diagnostics + `tracking_metrics.json` |
 | **Core modules** | `src/identity/p2_tracking/{tracker,kalman,track,pose_vector,jsonl_io}.py` |
 
-## Flowchart
+---
+
+## 3. How it works, step by step
 
 ```mermaid
 flowchart TD
-  DET["frame detections"] --> S1["Stage 1: high-conf (>0.5) vs active tracks<br/>IoU + pose-cosine cost, Hungarian"]
-  S1 --> S2["Stage 2: low-conf (0.1-0.5) vs remaining<br/>IoU only (ByteTrack idea)"]
-  S2 --> U{"unmatched high-conf?"}
-  U -- yes --> RE["dormant re-ID<br/>pose-cosine <= 0.25, margin 0.05"]
-  RE -- no match --> NEW["spawn TENTATIVE"]
-  U -- no --> UPD
-  S1 --> UPD["Kalman predict/update<br/>CV state [cx,cy,w,h,v...]"]
-  NEW --> CONF["confirm at 3 hits / 5-frame window"]
+  DET["frame detections"] --> S1["Stage 1: high-conf (>0.5) vs active tracks<br/>cost = IoU + pose-cosine, solved by Hungarian"]
+  S1 --> S2["Stage 2: low-conf (0.1–0.5) vs leftovers<br/>IoU only (the ByteTrack idea)"]
+  S2 --> U{"still-unmatched<br/>high-conf box?"}
+  U -- yes --> RE["dormant re-ID<br/>pose-cosine ≤ 0.25"]
+  RE -- no match --> NEW["spawn TENTATIVE track"]
+  U -- no --> UPD["Kalman predict/update<br/>state [cx,cy,w,h,velocities]"]
+  NEW --> CONF["confirm after 3 hits in a 5-frame window"]
 ```
 
-## Methods walkthrough
+### 3a. The motion model — a constant-velocity Kalman filter ([kalman.py:16](../../src/identity/p2_tracking/kalman.py#L16))
 
-**Motion model — `KalmanBoxTracker` ([kalman.py:16](../../src/identity/p2_tracking/kalman.py#L16)).**
-A **constant-velocity (CV)** Kalman filter on the box state `[cx, cy, w, h, vx, vy, vw, vh]`,
-measuring `[cx, cy, w, h]`, with a Joseph-form covariance update for numerical stability.
-`gating_distance_sq` is the Mahalanobis distance of the box centre; process noise is inflated
-while a track is dormant and the filter is `reseed`-ed (keeping velocity) on re-ID.
+Each track carries a **Kalman filter** that predicts where its box will be next frame.
 
-**Association — `CameraTracker.update` ([tracker.py:180](../../src/identity/p2_tracking/tracker.py#L180)).**
-A two-stage, **ByteTrack-style** ([Zhang et al. 2022, arXiv 2110.06864](https://arxiv.org/abs/2110.06864))
-match: Stage 1 matches high-confidence detections (`>0.5`) to active tracks with a cost that
-blends **IoU** and a **masked weighted-cosine pose distance** (`iou_alpha=0.6`, `pose_beta=0.4`),
-solved by the Hungarian algorithm (`scipy.linear_sum_assignment`); Stage 2 rescues low-confidence
-boxes (`0.1–0.5`) by IoU only. The gate combines IoU-of-predicted-box **or** a Mahalanobis χ² gate
-(`chi2_gate=9.21`), plus a hard distance cap (`gate_max_distance_px=600`) and an optional
-calibrated **ground-reachability** gate (`ground_vmax_mps=9.0`). Unmatched high-confidence boxes
-try a **dormant re-ID** (pose-cosine ≤ `0.25` with an ambiguity margin) before spawning a
-`TENTATIVE` track that confirms at `3` hits within a `5`-frame window.
+- A **Kalman filter** is a two-step "predict, then correct" estimator. **Predict:** using the track's
+  current position and velocity, guess the next box. **Update:** when a real detection arrives, blend
+  it with the prediction, trusting each in proportion to their uncertainty. It also tracks *how
+  uncertain* it is (a covariance) and grows that uncertainty when it goes unseen.
+  > **In plain words:** the filter is a little "where will this player be next frame?" predictor. It
+  > leans on its prediction when detections are missing/noisy, and snaps to the detection when one
+  > arrives — weighting whichever it trusts more.
+- **Constant-velocity (CV)** = it assumes players keep moving in a straight line at steady speed
+  between frames. State is `[cx, cy, w, h, vx, vy, vw, vh]` (box centre, size, and their velocities);
+  it measures `[cx, cy, w, h]`.
+- **Joseph-form update** is just a numerically-stable formula for the "correct" step that keeps the
+  uncertainty matrix valid (symmetric, positive) even after many updates. (Implementation detail, not
+  a behaviour change.)
+- When a track goes unseen ("dormant"), its process noise is inflated (uncertainty grows) and on
+  re-acquisition the filter is `reseed`-ed, keeping velocity.
 
-**Pose descriptor — `pose_vector.py` / `track.py`.** A per-track pose gallery (size 30,
-medoid representative) supplies the cosine cue and the dormant re-ID key. This is a *shape* cue
-(body configuration), independent of colour.
+### 3b. The association — a two-stage ByteTrack match ([tracker.py:180](../../src/identity/p2_tracking/tracker.py#L180))
 
-## Pros
+Matching this frame's detections to existing tracks is done in **two passes**, the
+**ByteTrack** idea ([Zhang et al. 2022](https://arxiv.org/abs/2110.06864)):
 
-- **ByteTrack two-stage** recovers low-confidence boxes (the dark/distant player that barely
-  clears detection), directly improving recall-in-tracking.
-- **Pose-cosine as the appearance substitute** — a smart choice given colour is dead on identical
-  kit; it uses body configuration, which does carry signal.
-- **Calibrated ground-reachability gate** — rejects physically impossible matches using the
-  cm-accurate calibration, not just pixels.
-- **Hungarian (global) assignment** per frame avoids greedy nearest-neighbour errors.
-- **Dormant re-ID** bridges short gaps without minting a new local ID.
+- **Stage 1 — confident boxes:** match high-confidence detections (`>0.5`) to active tracks using a
+  cost that blends **IoU** (box overlap) and a **pose-cosine distance** (how different their body
+  poses are), weighted `iou_alpha=0.6 / pose_beta=0.4`. The optimal assignment is found by the
+  **Hungarian algorithm**.
+  - **Hungarian algorithm** (`scipy.linear_sum_assignment`): given a cost table of every
+    track×detection pair, it finds the *globally cheapest* one-to-one matching in one shot — better
+    than greedily grabbing the nearest, which can paint itself into a corner.
+    > **In plain words:** instead of "everyone grab your closest match" (which causes clashes), it
+    > solves the whole seating chart at once for the lowest total cost.
+- **Stage 2 — faint boxes:** the low-confidence detections (`0.1–0.5`) that Stage 1 ignored are given
+  a second chance to attach to still-unmatched tracks, by **IoU only**. This is ByteTrack's key trick:
+  a faint box that's *exactly where a track predicted* is probably that player briefly fading (a dark
+  umpire), so keep it rather than throw it away.
+  > **In plain words:** "I'm not confident this blob is a person — but a track predicted someone right
+  > here, so it probably is. Keep it."
 
-## Cons
+**The gate** (which matches are even *allowed*): a match must pass IoU-of-predicted-box **or** a
+**Mahalanobis χ² gate**, plus a hard distance cap (`gate_max_distance_px=600`) and an optional
+calibrated **ground-reachability** check (`ground_vmax_mps=9.0`).
 
-- **Constant-velocity model** is a poor fit for cricket manoeuvres — a bowler accelerating, a
-  fielder diving, a batsman turning are non-linear; CV over-shoots and drops tracks in exactly
-  those moments (the DanceTrack/SportsMOT lesson).
-- **No camera-motion compensation** — if any camera is not perfectly static, IoU/Kalman gating
-  degrades (BoT-SORT's CMC exists for this).
-- **This is where the appearance cue's death originates** — 02's colour-independent design is
-  correct, but it also means the only re-acquisition signal is pose-cosine, which matures slowly.
-- **Gate constants are global** — one `chi2_gate`, one `gate_max_distance_px`, one dormant window
-  for all cameras, lighting, and player densities.
-- **Per-camera only** — 02 cannot use the other cameras' views to resolve an ambiguous in-camera
-  occlusion (that is deferred to 03, later).
+- **Mahalanobis distance / χ² gate:** a distance that accounts for *uncertainty and shape*. Instead of
+  raw pixels, it measures "how many standard deviations away is this detection, given the filter's
+  uncertainty ellipse?" `chi2_gate=9.21` is the statistical cut-off (the 99% point of a χ²
+  distribution with 2 degrees of freedom) — beyond it, the match is too unlikely to allow.
+  > **In plain words:** "is this detection within the believable bubble around where I predicted?" —
+  > and the bubble is bigger when the filter is less sure.
+- **Ground-reachability gate:** using the cm-accurate calibration, reject any match that would require
+  a player to move faster than 9 m/s on the actual pitch — physically impossible, so it's a wrong
+  match.
 
-## Issues
+### 3c. Dormant re-ID + confirmation
 
-- **02-1 (★★★) CV motion model under manoeuvre.** Non-linear player motion breaks CV gating,
-  causing fragmentation that 05 must later stitch. Evidence: fragmentation proxy 5–19 and
-  distinct-ID inflation in `../diagnosis/09-per-phase-issue-register.md` ID-2, which begins as per-camera track breaks.
-- **02-2 (★★) Pose-cosine re-ID matures slowly.** With colour dead (`../diagnosis/09-per-phase-issue-register.md` ID-4), the
-  only re-acquisition cue is the pose gallery, which needs many frames to become discriminative;
-  short-gap re-entries fail and mint fragments.
-- **02-3 (★★) No camera-motion compensation.** Any non-static camera degrades IoU/Kalman gating.
-- **02-4 (★) Global gate constants.** No per-camera / density adaptation of the χ² gate, distance
-  cap, or dormant window.
-- **02-5 (★) Fixed dormant window** (60 frames) is not scaled by track maturity or local
-  occupancy, so a well-established player lost briefly can still be deleted and re-born.
+An unmatched high-confidence box first tries a **dormant re-ID** against recently-lost tracks
+(pose-cosine ≤ `0.25` with an ambiguity margin) before it's allowed to **spawn a new TENTATIVE
+track**, which only becomes a real (CONFIRMED) track after **3 hits in a 5-frame window** (so a
+one-frame false detection never mints an identity).
 
-## Fixes (all, priority-ordered)
+- **Pose-cosine / the pose gallery** (`pose_vector.py`, `track.py`): each track keeps a small gallery
+  (size 30, a **medoid** representative) of its recent body-pose vectors. Cosine distance between pose
+  vectors is a *shape* cue — it works even though **colour is useless here** (both teams wear
+  near-identical kit). A **medoid** is the gallery member most central to the rest (a robust
+  "representative pose"), less sensitive to outliers than an average.
+  > **In plain words:** since you can't tell players apart by shirt colour, 02 remembers *how each
+  > player's body tends to be configured* and re-finds them by pose similarity.
 
-| # | Fix | Priority | Reasoning | Expected effect | Effort | Source |
-|---|---|---|---|---|---|---|
-| 1 | **Adopt OC-SORT's observation-centric modules** (OCM momentum + OCR recovery + OOS smoothing) over the plain CV Kalman. | ★★★ | OC-SORT is designed for non-linear motion + occlusion (SOTA on DanceTrack), exactly cricket's regime; keeps it simple/online. | Fewer per-camera breaks → less downstream fragmentation. | Medium | OC-SORT [2203.14360], CVPR 2023 |
-| 2 | **Add camera-motion compensation (BoT-SORT CMC)** + BoT-SORT's refined Kalman/IoU-ReID. | ★★ | Removes camera-jitter degradation; BoT-SORT tops MOT17/20. | More stable gating, fewer ID switches. | Medium | BoT-SORT [2206.14651] |
-| 3 | **Adopt a learned, kit-robust ReID embedding** as the re-acquisition key (Deep-OC-SORT-style adaptive appearance) to replace/augment the slow pose gallery. | ★★ | The dead colour cue + slow pose gallery is the re-ID weakness; a body/pose ReID net matures instantly per crop. | Faster, more reliable re-entry → fewer fragments. | Medium-High | Deep OC-SORT [2302.11813]; SoccerNet ReID [2404.11335] |
-| 4 | **Sports-tuned association (Deep-EIoU / SportsMOT)** — expansion-IoU + deep features tuned for fast, similar-looking athletes. | ★★ | Purpose-built for the cricket-like sports MOT setting. | Better matching in fast, crowded play. | Medium | Deep-EIoU [2306.13074]; GTA [2411.08216] |
-| 5 | **Adaptive gates + adaptive dormant window** scaled by track maturity and local detection density. | ★ | One global constant can't fit all cameras/densities; keep established players alive longer. | Fewer needless deletions/re-births. | Low-Medium | UCMCTrack [2312.08952] |
+---
 
-Cross-phase context: 02 fragmentation is the upstream half of the fragmentation problem 05 tries
-to stitch — see [05-global-id.md](05-global-id.md) and [to_do.md](../../wip/to_do.md).
+## 4. Strengths
+
+- **ByteTrack two-stage** recovers the faint/distant player that barely clears detection → better
+  recall-in-tracking.
+- **Pose-cosine as the appearance substitute** — a smart choice when colour is dead; uses body
+  configuration, which carries signal.
+- **Calibrated ground-reachability gate** rejects physically impossible matches using real geometry,
+  not just pixels.
+- **Hungarian (global) assignment** avoids greedy nearest-neighbour blunders.
+- **Dormant re-ID** bridges short gaps without minting a new id.
+
+## 5. Weaknesses
+
+- **Constant-velocity is a poor fit for cricket.** A bowler accelerating, a fielder diving, a batsman
+  turning are *non-linear*; CV over-shoots and drops the track in exactly those moments — the
+  DanceTrack/SportsMOT lesson. This is the main source of fragmentation that 05 must later stitch.
+- **No camera-motion compensation** — if a camera isn't perfectly static, IoU/Kalman gating degrades.
+- **Slow re-acquisition** — with colour dead, the only re-ID cue is the pose gallery, which matures
+  over many frames, so short-gap re-entries can fail and mint fragments.
+- **Global gate constants** — one χ² gate, one distance cap, one dormant window for all cameras,
+  lighting, and densities.
+
+---
+
+## 6. Known issues (severity ★)
+
+- **02-1 (★★★) CV motion model under manoeuvre.** Non-linear player motion breaks CV gating →
+  fragmentation that 05 must stitch. *Evidence:* fragmentation proxy 5–19; distinct-ID inflation.
+- **02-2 (★★) Pose-cosine re-ID matures slowly.** With colour dead, short-gap re-entries fail and
+  mint fragments.
+- **02-3 (★★) No camera-motion compensation.** Any non-static camera degrades gating.
+- **02-4 (★) Global gate constants** — no per-camera/density adaptation.
+- **02-5 (★) Fixed dormant window (60 frames)** — a well-established player lost briefly can still be
+  deleted and re-born as a new id.
+
+---
+
+## 7. Fix-implementation status + candidate fixes (priority-ordered)
+
+> **Implementation status (2026-07-16):** **none of these are implemented** — 02 runs the two-stage
+> ByteTrack + constant-velocity-Kalman baseline described above. All rows are future
+> (OC-SORT / BoT-SORT CMC / learned ReID / Deep-EIoU / adaptive gates). The CV-model fragility is tracked
+> as [BUG-5](known-bugs.md).
+
+| # | Fix | Priority | Why | Effort | Source |
+|---|---|---|---|---|---|
+| 1 | **Adopt OC-SORT's observation-centric modules** (momentum + recovery + smoothing) over the plain CV Kalman. | ★★★ | Built for non-linear motion + occlusion (SOTA on DanceTrack) — exactly cricket's regime. | Medium | OC-SORT [2203.14360] |
+| 2 | **Add camera-motion compensation (BoT-SORT CMC)** + its refined Kalman/IoU-ReID. | ★★ | Removes camera-jitter degradation. | Medium | BoT-SORT [2206.14651] |
+| 3 | **Learned, kit-robust ReID embedding** as the re-acquisition key (Deep-OC-SORT-style) to replace the slow pose gallery. | ★★ | The dead colour + slow pose gallery is the re-ID weakness; a body ReID net matures instantly per crop. | Medium-High | Deep OC-SORT [2302.11813] |
+| 4 | **Sports-tuned association (Deep-EIoU)** — expansion-IoU + deep features for fast, similar-looking athletes. | ★★ | Purpose-built for the cricket-like setting. | Medium | Deep-EIoU [2306.13074] |
+| 5 | **Adaptive gates + dormant window** scaled by track maturity and local density. | ★ | One global constant can't fit all cameras/densities. | Low-Medium | UCMCTrack [2312.08952] |
+
+Cross-phase: 02 fragmentation is the upstream half of the problem 05 tries to stitch — see
+[05-global-id](05-global-id.md).
