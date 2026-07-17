@@ -1,7 +1,7 @@
 # Consuming a run's outputs
 
 How a downstream consumer (broadcast biomechanics, event/officiating, the Unreal graphics layer)
-reads a pipeline run. The interface is the **JSON contract**, not our code — see
+reads a pipeline run. The interface is the **JSON contract**, not our code, see
 [architecture.md](architecture.md) for the full `g1_player_frame/v1` schema.
 
 ## Where a run lives
@@ -36,21 +36,21 @@ Each stage folder holds `predictions/*.jsonl` (one file per camera, one record p
 
 ## Fields you most likely want
 
-- **Who** — `global_player_id` (stable across cameras + time; `null` before global identity).
-- **Where (3D)** — `pose_3d.keypoints_world_m` (Halpe-26, 26×[x,y,z] metres, world origin = pitch
+- **Who**, `global_player_id` (stable across cameras + time; `null` before global identity).
+- **Where (3D)**, `pose_3d.keypoints_world_m` (Halpe-26, 26×[x,y,z] metres, world origin = pitch
   centre; per-joint `null` where not triangulated) + `mean_reprojection_error_px` per joint. The
   self-describing `pose_3d_named` (root in world + joints root-relative) is the rig-friendly view.
-- **Where (ground)** — `05_global_id/diagnostics/ground_tracks.jsonl` (fused world XY per ID/frame,
+- **Where (ground)**, `05_global_id/diagnostics/ground_tracks.jsonl` (fused world XY per ID/frame,
   the smooth bird's-eye channel), or `pose_3d_named.root_world_m`.
-- **Role** — stamped on every player in `06_roles/predictions/`, and summarised in `06_roles/roles.json`.
-- **Quality** — `track_confidence`, `single_camera`, and the run's `*_metrics.json`.
+- **Role**, stamped on every player in `06_roles/predictions/`, and summarised in `06_roles/roles.json`.
+- **Quality**, `track_confidence`, `single_camera`, and the run's `*_metrics.json`.
 
 Same-camera collisions are 0 by construction; identity/coverage caveats and current numbers are in
 [diagnosis/](diagnosis/README.md).
 
 ## Unreal Engine packets
 
-For UE-format packets rather than the JSONL 3D, run the exporter (world-metres → UE-cm transform):
+For UE-format packets rather than the JSONL 3D, run the exporter (world-metres to UE-cm transform):
 
 ```bash
 python -m identity.export.export_ue_packets --run-dir <06_roles> \
@@ -64,4 +64,4 @@ See [pipeline/07-export-and-render.md](pipeline/07-export-and-render.md).
 `pipeline_manifest.json` records every stage's config path + sha256 and the base-tree lineage, so
 any run is traceable to the exact configuration that produced it. Heavy payloads (predictions,
 videos) live under gitignored `data/derived/`; only the compact metrics/manifests are ever small
-enough to share directly — coordinate large-output sharing out of band.
+enough to share directly, coordinate large-output sharing out of band.

@@ -3,7 +3,7 @@
 One numbered YAML per identity stage under `configs/`, matching the `src/identity/pN_<stage>/`
 packages and the `0N_<stage>/` run-dir folders. `src/main.py` loads these by default; override
 per stage with `--pN-config`. Every loader **rejects unknown keys** and validates ranges, so a
-typo fails fast. Stage **04 (3D lift)** has no YAML — its parameters are CLI flags.
+typo fails fast. Stage **04 (3D lift)** has no YAML, its parameters are CLI flags.
 
 See each stage's doc for what a knob *does* and what's been tried: [../pipeline/](../pipeline/README.md).
 
@@ -17,7 +17,7 @@ gating `confidence_min`, `max_jump_bbox_frac`, `max_jump_px`.
 ## `02_tracking.yaml`
 
 `stage1_confidence_threshold`, `stage2_confidence_min`, `cost_accept_threshold`,
-**`lowconf_can_spawn: false`** (v8 default — low-conf specks associate but never birth);
+**`lowconf_can_spawn: false`** (v8 default, low-conf specks associate but never birth);
 cost mix `iou_alpha` / `pose_beta`, `min_shared_keypoints`; gates `chi2_gate`,
 `gate_bbox_factor`, `gate_max_distance_px`, `v_max_px_per_frame`; ground gating
 `ground_vmax_mps`, `ground_gate_base_m`, `ground_cost_weight`, `ankle_confidence_min`;
@@ -31,7 +31,7 @@ Cue weights `ground_weight`, `epipolar_weight`, `appearance_weight`; gates
 tracklet-graph `graph_llr_merge_threshold`, `graph_llr_veto`, `graph_llr_positive_cap`,
 `graph_min_covis_frames`, `binding_min_single_frames`, `graph_corrob_merge`,
 `graph_facing_gate_scale`; ground fusion `ground_fusion_mode: z0_reproj`, `ground_var_floor_m`
-(absorbs ~0.7–1.2 m cross-camera calibration bias); feet recovery `approx_feet_enabled`,
+(absorbs ~0.7-1.2 m cross-camera calibration bias); feet recovery `approx_feet_enabled`,
 `synthetic_tracklets_enabled`; W9 union-lift `graph_union_lift_merge`, `graph_union_colocate_m`,
 `graph_union_min_co_frames`; `foot_contact_mode: v3`, `graph_split_enabled`,
 `calibration_mode: auto`. Many opt-ins gate off (`contested_iou`, `airborne_pelvis_emit`).
@@ -55,9 +55,9 @@ v1 requires the 05 run to have `online_role_proxy: true`.
 
 ## Shared
 
-- `keypoint_mappings.yaml` — COCO-17 + Halpe-26 skeleton definitions and the source→COCO-17 index
+- `keypoint_mappings.yaml`, COCO-17 + Halpe-26 skeleton definitions and the source to COCO-17 index
   maps (the pipeline skeleton is Halpe-26; names/edges in `src/core/keypoints.py`).
-- `model_envs.yaml` / `model_registry.yaml` — the P1 model catalog (checkpoints, the `pose-lab`
+- `model_envs.yaml` / `model_registry.yaml`, the P1 model catalog (checkpoints, the `pose-lab`
   env, latency/reprojection budgets). P1 uses `rtmpose_x_body8`.
-- `reference/{ground_conventions,camera_layout}.jpeg` — the ground-convention and camera-layout
+- `reference/{ground_conventions,camera_layout}.jpeg`, the ground-convention and camera-layout
   reference images (the association runner derives facing pairs from calibration, not these).

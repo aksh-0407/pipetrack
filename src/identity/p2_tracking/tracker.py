@@ -64,13 +64,16 @@ class CameraTracker:
         self._prev_match: dict[int, str] = {}  # detection-centre key -> track id, for id-switch heuristic
 
     # ---- association helpers -------------------------------------------------
-    def _match(self, dets: list[Detection], tracks: list[Track], use_pose: bool) -> tuple[list[tuple[int, int]], set[int], set[int]]:
+    def _match(self, dets: list[Detection], tracks: list[Track], use_pose: bool,
+               use_last_obs: bool = False, accept_threshold: float | None = None) -> tuple[list[tuple[int, int]], set[int], set[int]]:
         if not dets or not tracks:
             return [], set(range(len(dets))), set(range(len(tracks)))
+        thr = self.config.cost_accept_threshold if accept_threshold is None else accept_threshold
         cost = np.full((len(dets), len(tracks)), _LARGE, dtype=float)
         for di, d in enumerate(dets):
             for ti, t in enumerate(tracks):
-                pred = t.kalman.predicted_bbox()
+                # OCR pass scores against the last real observation, not the KF prediction.
+                pred = t.last_obs_bbox() if use_last_obs else t.kalman.predicted_bbox()
                 iou = iou_xywh(d.bbox_xywh, list(pred))
                 # scale-adaptive gate: exclude only if no overlap AND beyond reach
                 if iou == 0.0:
@@ -105,9 +108,21 @@ class CameraTracker:
                         c = (a * iou_cost + b * pose_cost) / (a + b)
                 else:
                     c = iou_cost
-                if c <= self.config.cost_accept_threshold:
+                # OCM: penalise a match whose implied displacement direction disagrees with
+                # the track's recent observation-centric velocity (0 penalty same-heading,
+                # up to ocm_weight opposite). OC-SORT only; guarded so bytetrack is unchanged.
+                if self.config.tracker == "ocsort" and self.config.ocm_weight > 0.0:
+                    ov = t.observation_velocity(self.config.ocm_delta_t)
+                    if ov is not None:
+                        dc = np.array([d.bbox_xywh[0] + d.bbox_xywh[2] / 2.0,
+                                       d.bbox_xywh[1] + d.bbox_xywh[3] / 2.0]) - t.last_obs_center()
+                        dn = float(np.linalg.norm(dc))
+                        if dn > 1e-6:
+                            cos_dir = float(np.dot(ov, dc / dn))
+                            c = c + self.config.ocm_weight * (1.0 - cos_dir) / 2.0
+                if c <= thr:
                     c = self._apply_ground_cost(c, d, t)
-                if c <= self.config.cost_accept_threshold and np.isfinite(c):
+                if c <= thr and np.isfinite(c):
                     cost[di, ti] = c
         rows, cols = linear_sum_assignment(cost)
         matches, um_d, um_t = [], set(range(len(dets))), set(range(len(tracks)))
@@ -212,6 +227,20 @@ class CameraTracker:
             hit.add(id(remaining[ti]))
 
         unmatched_high = [high[i] for i in um_d1]
+
+        # OCR: observation-centric recovery. A second pass matching still-unmatched high-conf
+        # dets against each unmatched track's LAST OBSERVATION (not the drifted KF prediction),
+        # recovering tracks the constant-velocity model lost on a sharp manoeuvre. OC-SORT only.
+        if self.config.tracker == "ocsort" and self.config.ocr_enabled and unmatched_high:
+            ocr_tracks = [t for t in self.tracks
+                          if t.state in (CONFIRMED, TENTATIVE, DORMANT) and id(t) not in hit]
+            m3, um_d3, _ = self._match(unmatched_high, ocr_tracks, use_pose=True,
+                                       use_last_obs=True, accept_threshold=self.config.ocr_cost_threshold)
+            for di, ti in m3:
+                self._apply_hit(ocr_tracks[ti], unmatched_high[di], frame_index)
+                hit.add(id(ocr_tracks[ti]))
+            unmatched_high = [unmatched_high[i] for i in um_d3]
+
         if unmatched_high or um_d2:
             self.diagnostics["frames_with_unmatched_detections"] += 1
 

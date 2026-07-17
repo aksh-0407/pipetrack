@@ -1,7 +1,7 @@
 # Documentation
 
-The **Group-1 cricket 3D-pose & identity pipeline**: 7-camera footage → per-player 2D pose →
-cross-camera identity → 3D pose & ground location → roles → mosaic render.
+The Group-1 cricket 3D-pose and identity pipeline: 7-camera footage to per-player 2D pose, then
+cross-camera identity, then 3D pose and ground location, then roles, then the mosaic render.
 
 ## Start here
 
@@ -27,15 +27,15 @@ cross-camera identity → 3D pose & ground location → roles → mosaic render.
 
 | Doc | What it is |
 | --- | ---------- |
-| [../wip/to_do.md](../wip/to_do.md) | The single consolidated backlog — everything deferred / parked / pending, incl. the prioritized algorithm fix list (A1–A10). |
-| [diagnosis/README.md](diagnosis/README.md) | The measured 40-delivery production diagnosis (teleports, split identity, coverage). |
-| [pipeline/fixes-log.md](pipeline/fixes-log.md) | The dated A/B campaign ledger (historical). |
+| [methods_log.md](methods_log.md) | The combined method ledger: every method tried, its before/after A/B, pros and cons, status, and whether it is on or off by default. |
+| [../wip/open-work.md](../wip/open-work.md) | The single consolidated backlog and guiding principles, everything deferred, parked, or pending (the prioritized algorithm fix list A0 to A13). |
+| [diagnosis/README.md](diagnosis/README.md) | The measured 40-delivery production diagnosis (teleports, split identity, coverage), plus the v9 and 2026-07-session current state. |
 
 ## The pipeline at a glance
 
-P1 2D inference → **01** stabilization → **02** per-camera tracking → **03** cross-camera
-association → **04** 3D lift → **05** global identity → **06** roles → UE export / mosaic render.
-The 3D lift runs **before** global identity (Associate → Triangulate → Track). Each stage reads
+P1 2D inference to **01** stabilization to **02** per-camera tracking to **03** cross-camera
+association to **04** 3D lift to **05** global identity to **06** roles to UE export / mosaic render.
+The 3D lift runs **before** global identity (Associate to Triangulate to Track). Each stage reads
 and writes a canonical run directory; full detail in [pipeline/README.md](pipeline/README.md).
 
 ## Common commands
@@ -43,7 +43,7 @@ and writes a canonical run directory; full detail in [pipeline/README.md](pipeli
 Everything runs under the single `pose-lab` conda env, invoked as a module.
 
 ```bash
-# P1 — 2D pose over a delivery (RTMPose-X, top-down); emits Halpe-26 (26 joints)
+# P1, 2D pose over a delivery (RTMPose-X, top-down); emits Halpe-26 (26 joints)
 python -m core.inference.run_phase1_rtmpose_inference --model-id rtmpose_x_body8 \
   --dataset 8_init --version 9 --deliveries CCPL080626M1_1_14_1
 

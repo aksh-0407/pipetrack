@@ -1748,6 +1748,15 @@ def derive_layout_for_run(
 
 
 def main() -> int:
+    # Cap OpenCV's internal thread pool: this renderer runs one process per delivery
+    # under render_jobs / ProcessPoolExecutor, and cv2 otherwise grabs all cores per
+    # process (render_jobs x cores contention). _blas_capped_env does NOT cap OpenCV,
+    # so do it in-process — the reliable cap across both render harnesses.
+    cv2.setNumThreads(1)
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
     args = parse_args()
     run_dir = Path(args.run_dir)
     if not run_dir.is_absolute():

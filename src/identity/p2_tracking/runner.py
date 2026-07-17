@@ -138,6 +138,13 @@ def run_tracking(
     ]
     workers = max_workers or min(7, os.cpu_count() or 1)
 
+    # Cap BLAS threads so the per-camera worker processes (each numpy/Kalman/Hungarian)
+    # do not each spawn a full thread pool across all cores. Under id_pipeline these are
+    # already "1" (inherited); setdefault makes a standalone CLI run safe too.
+    for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_var, "1")
+
     results: dict[str, tuple[str, dict, str | None]] = {}
     with ProcessPoolExecutor(max_workers=workers) as pool:
         for cam, status, summary, error in pool.map(track_one_camera, jobs):

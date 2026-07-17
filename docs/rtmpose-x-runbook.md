@@ -1,4 +1,4 @@
-# RTMPose-x runbook — install, run, and tune on a new machine
+# RTMPose-x runbook, install, run, and tune on a new machine
 
 RTMPose-x (`rtmpose_x_body8`) is the largest RTMPose body model and the accuracy-first
 Phase-1 2D-pose model. This is the end-to-end guide to stand it up on a fresh machine
@@ -6,7 +6,7 @@ Phase-1 2D-pose model. This is the end-to-end guide to stand it up on a fresh ma
 throughput.
 
 RTMPose-X emits **Halpe-26** (26 keypoints): the first 17 are exactly COCO-17 in COCO
-order; 18–26 add head/neck/hip + 6 foot keypoints (heels, big/small toes).
+order; 18-26 add head/neck/hip + 6 foot keypoints (heels, big/small toes).
 
 ---
 
@@ -14,12 +14,12 @@ order; 18–26 add head/neck/hip + 6 foot keypoints (heels, big/small toes).
 
 - **Model:** RTMPose-x, 384×288, top-down (paired with an RTMDet-m person detector).
 - **Output skeleton:** Halpe-26 (26 keypoints). Its first 17 are exactly COCO-17 in
-  COCO order; 18–26 add head/neck/hip + 6 foot keypoints (heels, big/small toes).
-- **Per-frame record:** every player carries `pose_2d` — the full **Halpe-26** (26 kpts; the
+  COCO order; 18-26 add head/neck/hip + 6 foot keypoints (heels, big/small toes).
+- **Per-frame record:** every player carries `pose_2d`, the full **Halpe-26** (26 kpts; the
   first 17 are COCO-17 in COCO order, then head/neck/hip + 6 feet). This is the contract the rest
   of the pipeline consumes.
 - Runs in the shared `pose-lab` Conda env (mmpose 1.3.2 / mmcv 2.1.0 /
-  mmdet 3.2.0 / torch 2.1.0-cu121) — **no separate env**.
+  mmdet 3.2.0 / torch 2.1.0-cu121), **no separate env**.
 
 ---
 
@@ -43,7 +43,7 @@ python3 tools/setup_model_envs.py --models rtmpose_x_body8
 
 This creates/reuses the `pose-lab` env from the `mmpose_v1` profile in
 [`configs/model_envs.yaml`](../configs/model_envs.yaml) (torch is auto-selected for the
-detected driver). It is idempotent — an existing env is left in place.
+detected driver). It is idempotent, an existing env is left in place.
 
 ## 3. Download the weights + detector
 
@@ -71,7 +71,7 @@ Expect `status: ok`, `instances: 1`, `keypoints: 26`.
 ## 5. Tune batch/io/prefetch for THIS machine
 
 Throughput depends on the GPU, CPU core count, and disk speed, so tune on the actual box.
-The P1 runner itself exposes the knobs directly — do a short scoped run
+The P1 runner itself exposes the knobs directly, do a short scoped run
 (`--deliveries <one> --frame-limit 200 --no-resume`) at a few `--det-batch-size` /
 `--pose-batch-size` / `--io-workers` / `--prefetch-batches` settings and compare the FPS
 recorded in `run_manifest.json`. Note the winning combination for the full run below.
@@ -81,7 +81,7 @@ recorded in `run_manifest.json`. Note the winning combination for the full run b
 > 2560×1440 JPEGs read cold once (~50 GB), so on many machines the **disk-read + decode**
 > stage, not the GPU, is the limiter. `--io-workers` (parallel readers) and
 > `--prefetch-batches` (read-ahead depth that overlaps decode with GPU compute) are
-> therefore first-class tuning knobs — see the performance notes below.
+> therefore first-class tuning knobs, see the performance notes below.
 
 ## 6. Run the full detection over all deliveries
 
@@ -102,7 +102,7 @@ conda run -n pose-lab python src/core/inference/run_phase1_rtmpose_inference.py 
   --dataset 8_init --version 9
 ```
 
-Output → `data/derived/8_init/pipetrack_v9/<delivery>/00_inference/predictions/bt_XX__<delivery>__cam_YY.jsonl`
+Output to `data/derived/8_init/pipetrack_v9/<delivery>/00_inference/predictions/bt_XX__<delivery>__cam_YY.jsonl`
 (one per camera; 56 cameras = 8 deliveries × 7 cameras spread across bt_01/02/03).
 `run_manifest.json` records config, timings, and FPS on completion.
 
@@ -122,15 +122,15 @@ ls data/derived/8_init/pipetrack_v9/*/00_inference/predictions/*.jsonl | wc -l
 
 ## Running on the L40S / remote capture machine
 
-The remote capture box stores frames in a different native layout —
-`/home/ubuntu/pose_data/{bt1,bt2,bt3}/<delivery>/camera<NN>/frame_*.jpg` — and writes to
+The remote capture box stores frames in a different native layout , 
+`/home/ubuntu/pose_data/{bt1,bt2,bt3}/<delivery>/camera<NN>/frame_*.jpg`, and writes to
 a caller-chosen output dir. Use the dedicated runner
 [`run_phase1_l40s.py`](../src/core/inference/run_phase1_l40s.py) (it reuses the exact same
 mmdet/mmpose building blocks and P1 schema (the 26-keypoint Halpe-26 `pose_2d`), and
 has the same prefetch + thread-cap optimisation). RTMPose-x is fully wired: just pass
 `--model-id rtmpose_x_body8`.
 
-**One-time setup on the remote machine** (same as §1–4 above): clone the repo, create the
+**One-time setup on the remote machine** (same as §1-4 above): clone the repo, create the
 `pose-lab` env, download the RTMPose-x weights + RTMDet detector,
 `sync_model_store.py`, then smoke. Confirm the GPU: `run_phase1_l40s.py --list` prints the
 selection with no GPU needed; add `--device cuda:0` runs to check CUDA.
@@ -148,7 +148,7 @@ python src/core/inference/run_phase1_l40s.py \
 and a projected full-run time. (The grid measures GPU + decode; with the prefetch overlap
 the real run is a bit faster than the projection.)
 
-**2. Full run over all data → `/home/ubuntu/pose-rtm-x/`** using the wrapper
+**2. Full run over all data to `/home/ubuntu/pose-rtm-x/`** using the wrapper
 [`run_rtmpose_x_l40s.sh`](../src/core/inference/run_rtmpose_x_l40s.sh):
 
 ```bash
@@ -166,8 +166,8 @@ python src/core/inference/run_phase1_l40s.py \
   --io-workers <W> --cv2-threads 2 --prefetch-batches 4
 ```
 
-Output → `/home/ubuntu/pose-rtm-x/predictions/bt_XX__<delivery>__cam_YY.jsonl`, plus
-`run_manifest.json` + `p1_metrics.json`. Runs are **resumable** — re-run the same command
+Output to `/home/ubuntu/pose-rtm-x/predictions/bt_XX__<delivery>__cam_YY.jsonl`, plus
+`run_manifest.json` + `p1_metrics.json`. Runs are **resumable**, re-run the same command
 to continue after any interruption. Run it under `tmux`/`nohup` so an SSH drop doesn't kill
 it:
 
@@ -187,23 +187,23 @@ The runner is built to keep the GPU fed while keeping the CPU light:
 
 - **Overlapped I/O ↔ GPU pipeline (`--prefetch-batches`, default 3).** A single
   persistent thread-pool reads + decodes the next N detector batches *while the GPU runs
-  detection + pose on the current batch*, instead of the old read → detect → pose stall
+  detection + pose on the current batch*, instead of the old read to detect to pose stall
   where the GPU idled during every cold-disk read. On a laptop 4060 this took cold-data
-  throughput from ~3.4 → ~8.6 FPS.
+  throughput from ~3.4 to ~8.6 FPS.
 - **No thread oversubscription (`--cv2-threads`, default 2).** OpenCV otherwise spawns a
-  thread per core inside *every* io-worker (e.g. 16 workers × 32 cores → thrash that
+  thread per core inside *every* io-worker (e.g. 16 workers × 32 cores to thrash that
   pegs the CPU and starves the GPU). Capping OpenCV/torch CPU threads keeps loadavg low.
   The wrapper also exports `OMP/MKL/OPENBLAS_NUM_THREADS=2`.
 - **One decode pool for the whole run**, not one per batch.
-- **GPU JPEG decode is deliberately NOT used** — on these images nvjpeg (~19 ms/frame,
+- **GPU JPEG decode is deliberately NOT used**, on these images nvjpeg (~19 ms/frame,
   incl. copy-back) is *slower* than CPU `cv2.imread` (~14 ms), and it competes with the
   pose model for the GPU. CPU decode overlapped with GPU compute wins.
 
-**Rules of thumb for a beefier server:** more CPU cores → raise `--io-workers`
-(16–32) and `--prefetch-batches` (4–8) to hide cold-disk latency; a bigger GPU → raise
-`--pose-batch-size` (256–512) since ~35 person-crops/frame batch well. Always confirm
-with the tuner. Keep `--cv2-threads` at 2–4 regardless.
+**Rules of thumb for a beefier server:** more CPU cores to raise `--io-workers`
+(16-32) and `--prefetch-batches` (4-8) to hide cold-disk latency; a bigger GPU to raise
+`--pose-batch-size` (256-512) since ~35 person-crops/frame batch well. Always confirm
+with the tuner. Keep `--cv2-threads` at 2-4 regardless.
 
 **Numerics are batch-invariant:** changing any of det/pose batch, io-workers, or
-prefetch changes speed only, never the predicted keypoints — so tuning is free of
+prefetch changes speed only, never the predicted keypoints, so tuning is free of
 accuracy risk and runs stay comparable.

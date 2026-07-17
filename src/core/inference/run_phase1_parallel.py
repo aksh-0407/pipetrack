@@ -40,7 +40,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-RUNNER = ROOT / "scripts" / "inference" / "run_phase1_l40s.py"
+# The single-process runner is a sibling of this launcher; derive it from __file__
+# so the path can never drift from the actual layout (the old scripts/inference/
+# path did not exist and broke every shard).
+RUNNER = Path(__file__).resolve().parent / "run_phase1_l40s.py"
 GROUP_RE = re.compile(r"^bt_?0*(?P<num>\d+)$", re.IGNORECASE)
 
 
@@ -126,6 +129,16 @@ def main() -> int:
     buckets = round_robin(deliveries, shards)
     log_dir = Path(args.log_dir).expanduser() if args.log_dir else Path(args.output_dir).expanduser() / "parallel_logs"
 
+    # Keep aggregate CPU threads near the core count: N shards each decoding with
+    # io-workers x cv2-threads must not blow past the ~8 vCPUs (JPEG decode is the
+    # >=3-shard ceiling). Only inject when the caller has not set these explicitly.
+    passthrough = list(args.passthrough)
+    cores = os.cpu_count() or 8
+    if "--io-workers" not in passthrough:
+        passthrough += ["--io-workers", str(max(1, cores // len(buckets)))]
+    if "--cv2-threads" not in passthrough:
+        passthrough += ["--cv2-threads", "1"]
+
     print(f"deliveries: {len(deliveries)} | shards: {len(buckets)} | output: {args.output_dir}")
     for i, bucket in enumerate(buckets):
         print(f"  shard {i}: {len(bucket)} deliveries -> {', '.join(bucket)}")
@@ -138,7 +151,7 @@ def main() -> int:
         "python": args.python,
         "pose_data": str(pose_data),
         "output_dir": args.output_dir,
-        "passthrough": list(args.passthrough),
+        "passthrough": passthrough,
         "log_path": str(log_dir / f"shard_{i}.log"),
     } for i, bucket in enumerate(buckets)]
 

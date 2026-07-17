@@ -55,7 +55,7 @@ gallery_repr: medoid
 # (OCM velocity-consistency cost, ORU virtual-trajectory re-update on recovery, OCR
 # last-observation recovery pass) to reduce fragmentation on sharp manoeuvres. All four
 # OC-SORT keys are inert unless tracker: ocsort.
-tracker: bytetrack
+tracker: ocsort
 ocm_weight: 0.2
 ocm_delta_t: 3
 ocr_enabled: true

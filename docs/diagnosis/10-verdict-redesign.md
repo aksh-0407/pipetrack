@@ -1,8 +1,8 @@
-# Verdict redesign — a usability grade that measures the right things
+# Verdict redesign, a usability grade that measures the right things
 
 **Written 2026-07-14. Applied to all 40 (table below). Code updated for future runs.**
 Reproduce: `regrade.py` (beside this file) reads the existing per-delivery metrics + the real
-emitted `ground_tracks.jsonl` and prints the new grade — no pipeline re-run needed.
+emitted `ground_tracks.jsonl` and prints the new grade, no pipeline re-run needed.
 
 ## Why the old verdict had to change
 
@@ -16,10 +16,10 @@ fail if same_camera_collision                 # 0 everywhere
 warn if coloc > 0
 ```
 Three fatal flaws:
-1. **It ignores cross-camera agreement entirely** — the project's *primary* identity axis is
+1. **It ignores cross-camera agreement entirely**, the project's *primary* identity axis is
    not in the verdict. So `M2_2_4_1` at **0.992 agreement** is `fail` while `M1_1_14_6` at
    **0.527 agreement** is merely `warn`. Backwards.
-2. **Its one live signal, `teleports`, is a noise metric** — computed on raw bbox-bottom foot
+2. **Its one live signal, `teleports`, is a noise metric**, computed on raw bbox-bottom foot
    projections averaged across cameras, dominated by single-camera grazing error, not the
    delivered trajectory (`03-issue-teleport-metric-and-verdict.md`).
 3. **The id-overmint thresholds never fire** (roster_max too loose), so "too many IDs" is
@@ -30,10 +30,10 @@ which clips are actually deliverable.
 
 ## The new rubric
 
-**Two hard gates (any → FAIL, regardless of score):**
+**Two hard gates (any to FAIL, regardless of score):**
 | Gate | Threshold | Rationale |
 |---|---|---|
-| same-camera collision | `collisions > 0` | Hard invariant — one ID on two people in one camera is never acceptable. |
+| same-camera collision | `collisions > 0` | Hard invariant, one ID on two people in one camera is never acceptable. |
 | identity broken | `agreement < 0.65` | Below this, cross-camera identity is too wrong to trust. |
 | gross over-mint | `distinct_ids > 20` | A field of ~15; >20 is genuine over-segmentation. |
 
@@ -41,11 +41,11 @@ which clips are actually deliverable.
 
 | Axis | Sub-score (clamped 0..1) | Weight | Why it's in |
 |---|---|---:|---|
-| **Agreement** | `(agreement − 0.72) / 0.24` | **0.40** | Primary identity-correctness axis. 0.72→0, 0.96→1. |
-| **Smoothness** | `1 − emitted_bigjumps / 50` | **0.25** | **Real** teleports — single-frame jumps >25 m/s in the emitted `ground_tracks.jsonl`, not the proxy. 0 jumps→1, ≥50→0. |
-| **Coverage** | `(tri_cov − 0.45) / 0.45` | **0.15** | Completeness of the 3D deliverable. 0.45→0, 0.90→1. |
+| **Agreement** | `(agreement − 0.72) / 0.24` | **0.40** | Primary identity-correctness axis. 0.72 to 0, 0.96 to 1. |
+| **Smoothness** | `1 − emitted_bigjumps / 50` | **0.25** | **Real** teleports, single-frame jumps >25 m/s in the emitted `ground_tracks.jsonl`, not the proxy. 0 jumps to 1, ≥50 to 0. |
+| **Coverage** | `(tri_cov − 0.45) / 0.45` | **0.15** | Completeness of the 3D deliverable. 0.45 to 0, 0.90 to 1. |
 | **Persistence** | `(id_persist − 0.80) / 0.18` | **0.10** | Confirmed-frame completeness per ID (fragmentation). |
-| **Parsimony** | `(16 − distinct_ids) / 3` | **0.10** | ID count vs roster. 13→1, 16→0. |
+| **Parsimony** | `(16 − distinct_ids) / 3` | **0.10** | ID count vs roster. 13 to 1, 16 to 0. |
 
 Then `score −= 0.10 × coloc_pairs` (residual split-ID penalty).
 
@@ -53,17 +53,17 @@ Then `score −= 0.10 × coloc_pairs` (residual split-ID penalty).
 | Tier | Score | Meaning |
 |---|---|---|
 | **GOOD** | ≥ 0.75 | Deliverable as-is; core + most periphery correct. |
-| **USABLE** | 0.55–0.75 | Deliverable with the `single_camera` / low-`tri_cov` caution flags; core solid, periphery noisy. |
-| **WEAK** | 0.40–0.55 | Needs work before delivery. |
+| **USABLE** | 0.55-0.75 | Deliverable with the `single_camera` / low-`tri_cov` caution flags; core solid, periphery noisy. |
+| **WEAK** | 0.40-0.55 | Needs work before delivery. |
 | **FAIL** | < 0.40 or any hard gate | Not deliverable. |
 
 Design choices worth defending in the meeting:
 - **Agreement dominates (0.40)** because identity correctness is the objective; a smooth wrong
   ID is worse than a slightly jumpy right one.
 - **Smoothness uses the real emitted metric (0.25)**, so a genuine teleport storm still
-  penalizes — but single-camera foot noise (which never enters `ground_tracks` as a >25 m/s
+  penalizes, but single-camera foot noise (which never enters `ground_tracks` as a >25 m/s
   emitted jump the way it enters the raw proxy) no longer dominates.
-- **Coverage is included but light (0.15)** — it's completeness, not correctness; a
+- **Coverage is included but light (0.15)**, it's completeness, not correctness; a
   low-coverage clip can still be GOOD if what it does emit is correct (`M2_2_4_1`).
 - Every threshold is a documented number, tunable in one place.
 
@@ -116,15 +116,15 @@ M2_2_4_5    fail  0.937   32 0.54 0.88  14   0 0.594 USABLE  cov
 M2_2_4_6    fail  0.783   29 0.55 0.90  16   0 0.298 FAIL    parsimony
 ```
 
-Distribution: **OLD** 2 pass / 11 warn / 27 fail → **NEW** 8 GOOD / 13 USABLE / 8 WEAK / 11 FAIL.
+Distribution: **OLD** 2 pass / 11 warn / 27 fail to **NEW** 8 GOOD / 13 USABLE / 8 WEAK / 11 FAIL.
 
 ## Notable flips (the ones to mention)
-- **fail → GOOD**: `M2_2_4_1` (0.992 agr, 7 jumps), `M2_2_4_3`, `M1_1_17_2`, `M2_1_11_4`.
+- **fail to GOOD**: `M2_2_4_1` (0.992 agr, 7 jumps), `M2_2_4_3`, `M1_1_17_2`, `M2_1_11_4`.
   The old verdict punished these for single-cam foot noise; they are among the best clips.
-- **warn/pass → FAIL**: `M1_1_14_5` (0.695), `M1_1_14_6` (0.527), and `M1_1_16_2` (0.625) —
+- **warn/pass to FAIL**: `M1_1_14_5` (0.695), `M1_1_14_6` (0.527), and `M1_1_16_2` (0.625) , 
   genuinely broken cross-camera identity the old verdict let through as `warn`.
-- **The M2_2_3 block stays bad** (mostly FAIL/WEAK) — correctly: low coverage (0.23–0.33) +
-  real teleport storms (91–170 jumps). This is where the work is.
+- **The M2_2_3 block stays bad** (mostly FAIL/WEAK), correctly: low coverage (0.23-0.33) +
+  real teleport storms (91-170 jumps). This is where the work is.
 
 ## How to adopt
 1. **Now (no re-run)**: `regrade.py` prints the table above from the existing tree; use it as

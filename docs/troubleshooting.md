@@ -7,10 +7,10 @@ Common failures and what to do. When in doubt, start with
 
 ### `download.openmmlab.com` times out
 
-The OpenMMLab host is unreliable on some networks — it serves the RTMPose-X pose weights
+The OpenMMLab host is unreliable on some networks, it serves the RTMPose-X pose weights
 and the RTMDet person-detector checkpoint. Options:
 
-- Retry — it's often transient.
+- Retry, it's often transient.
 - Download the file from another network or a verified mirror, then drop it at the exact
   `path` listed for that asset in [`configs/model_envs.yaml`](reference/configuration.md#shared).
 - Re-check with `python3 tools/check_assets.py --models rtmpose_x_body8 --fail-missing`.
@@ -37,9 +37,9 @@ going forward.
 
 ## Pipeline runs
 
-### Identity-stage (01–06) import errors (NumPy/SciPy)
+### Identity-stage (01-06) import errors (NumPy/SciPy)
 
-The tracking → global-ID → triangulation stages need NumPy ≥ 1.23.5 and SciPy ≥ 1.10. Run
+The tracking to global-ID to triangulation stages need NumPy ≥ 1.23.5 and SciPy ≥ 1.10. Run
 them in an env that has them (e.g. `pose-lab`), not the mmpose env.
 
 ### The mosaic render is missing tiles / roles / ground monitor
@@ -47,7 +47,7 @@ them in an env that has them (e.g. `pose-lab`), not the mmpose env.
 The renderer reads several artifacts from the 05_global_id run: `predictions/*.jsonl`,
 `diagnostics/correspondences.jsonl` (03 association badges), `diagnostics/ground_tracks.jsonl` (the
 bird's-eye monitor), and `../06_roles/roles.json` (the roster). A missing panel usually means the
-corresponding stage didn't write its diagnostic — re-run that stage. Camera 07 has a
+corresponding stage didn't write its diagnostic, re-run that stage. Camera 07 has a
 different native resolution (~3775×960); if a tile looks wrong, check the per-camera image
 size handling.
 
@@ -61,6 +61,6 @@ the fallback path works without a GPU encoder, just slower.
 
 Speed depends on GPU, CPU cores, and disk. P1 top-down inference scales with the number of
 players per frame; on large 2560×1440 JPEGs read cold, disk-read + decode is often the
-limiter, not the GPU — tune `--io-workers` / `--prefetch-batches` (see
+limiter, not the GPU, tune `--io-workers` / `--prefetch-batches` (see
 [rtmpose-x-runbook.md](rtmpose-x-runbook.md)). Batch sizes change speed only, never the
 predicted keypoints.

@@ -1,14 +1,14 @@
-# Halpe-26 skeleton — joint names & the 3D output schema
+# Halpe-26 skeleton, joint names & the 3D output schema
 
 The pipeline's canonical skeleton is **Halpe-26**. Every `pose_2d` and `pose_3d`
-block carries all 26 joints. Indices `0–16` are exactly **COCO-17** (COCO order);
-`17–25` add head/neck/hip and the six foot joints.
+block carries all 26 joints. Indices `0-16` are exactly **COCO-17** (COCO order);
+`17-25` add head/neck/hip and the six foot joints.
 
 > Visual reference (numbered skeleton on a body + colour-coded table):
 > <https://claude.ai/code/artifact/43ae8b17-8eae-4214-b318-4742c20f5860>.
 > Source constants: `src/core/keypoints.py` (`HALPE26_KEYPOINTS`, `HALPE26_EDGES`).
 
-## Index → joint name
+## Index to joint name
 
 | idx | name | group | idx | name | group |
 |----:|------|-------|----:|------|-------|
@@ -30,13 +30,13 @@ block carries all 26 joints. Indices `0–16` are exactly **COCO-17** (COCO orde
 
 ## Bones (connectivity)
 
-`HALPE26_EDGES`: face `(0,1)(0,2)(1,3)(2,4)`; spine `head(17)–neck(18)`,
-`neck–l/r_shoulder(5,6)`, `neck–hip(19)`; arms `5–7–9`, `6–8–10`;
-`hip–l/r_hip(11,12)`; legs `11–13–15`, `12–14–16`; left foot
-`ankle(15)–heel(24)/big_toe(20)/small_toe(22)`; right foot
-`ankle(16)–heel(25)/big_toe(21)/small_toe(23)`.
+`HALPE26_EDGES`: face `(0,1)(0,2)(1,3)(2,4)`; spine `head(17)-neck(18)`,
+`neck-l/r_shoulder(5,6)`, `neck-hip(19)`; arms `5-7-9`, `6-8-10`;
+`hip-l/r_hip(11,12)`; legs `11-13-15`, `12-14-16`; left foot
+`ankle(15)-heel(24)/big_toe(20)/small_toe(22)`; right foot
+`ankle(16)-heel(25)/big_toe(21)/small_toe(23)`.
 
-## 3D output — `pose_3d` and `pose_3d_named`
+## 3D output, `pose_3d` and `pose_3d_named`
 
 Each identified player carries the full 26-joint 3D (`pose_3d`, absolute world
 metres) plus a self-describing **named + root-relative** view (`pose_3d_named`):

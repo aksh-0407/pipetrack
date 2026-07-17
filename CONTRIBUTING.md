@@ -21,7 +21,7 @@ python3 tools/setup_model_envs.py --models rtmpose_x_body8 --download-assets
 python3 tools/check_assets.py --models rtmpose_x_body8 --fail-missing
 ```
 
-The tracking/association/global-ID/triangulation stages (P2–P6) run in an env with
+The tracking/association/global-ID/triangulation stages (P2-P6) run in an env with
 NumPy ≥ 1.23.5 and SciPy ≥ 1.10 (e.g. `pose-lab`). See the per-stage commands
 in [docs/reference/cli.md](docs/reference/cli.md).
 
@@ -37,7 +37,7 @@ in [docs/reference/cli.md](docs/reference/cli.md).
    ```
 4. Commit only source, configs, docs, and the small committed run metrics
    (`data/derived/<dataset>/pipetrack_v<num>/**/​*_metrics.json`, manifests). Do **not** commit weights,
-   frames, or raw per-frame prediction dumps — they are gitignored.
+   frames, or raw per-frame prediction dumps, they are gitignored.
 5. Push and open a pull request.
 
 ## Ground rules for pipeline changes

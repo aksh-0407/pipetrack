@@ -18,14 +18,14 @@ beside this doc and are reproducible.
   `ground_tracks.jsonl` whose implied speed exceeds 25 m/s (≈ 0.5 m in 20 ms). A sprinting
   cricketer tops out near 9 m/s, so 25 m/s is unambiguously non-physical.
 - **Re-acquisition gap**: an id present at frame *a*, absent, then present again at frame
-  *b* > *a*+1. Counted separately — this is the acceptable "occlusion restore" class.
+  *b* > *a*+1. Counted separately, this is the acceptable "occlusion restore" class.
 - **2D id-switch event**: within one `(camera, local_track_id)` (a P2 tracklet = one
   physical person in one camera), a frame-to-frame change of the non-null `global_player_id`.
 - **Split cluster**: a per-frame single-link ground cluster (radius 1.5 m) spanning ≥2
   cameras that carries more than one `global_player_id`. Overstated in dense packs (two real
-  people can fall inside 1.5 m) — read the camera-pair breakdown, not the absolute rate.
+  people can fall inside 1.5 m), read the camera-pair breakdown, not the absolute rate.
 
-## Table 1 — emitted-trajectory smoothness (from `emit_smoothness.py`)
+## Table 1, emitted-trajectory smoothness (from `emit_smoothness.py`)
 
 Columns: e_p95/e_max = per-frame speed m/s in the emitted ground track; bigjmp =
 single-frame jumps >25 m/s; gaps = re-acquisition gaps; proxyT = the panel's
@@ -76,10 +76,10 @@ M2_2_4_6   16  0.12  2.06  6.30   1153   29     47   126    0.783  fail
 ```
 
 Aggregate: emitted big jumps total **1528**; re-acquisition gaps **2134**; proxy teleports
-**4932**. Emitted p95 speed is healthy everywhere (1.24–4.14 m/s) — the problem is entirely
+**4932**. Emitted p95 speed is healthy everywhere (1.24-4.14 m/s), the problem is entirely
 in the **tail** (p99/max), i.e. rare catastrophic jumps, not general jitter.
 
-## Table 2 — 2D flicker + 3D coverage (from `idswitch_2d.py`)
+## Table 2, 2D flicker + 3D coverage (from `idswitch_2d.py`)
 
 ```
 delivery   2d_id_switch  tracklets  multi_id_tracklets  p6_cov
@@ -96,7 +96,7 @@ M2_2_4_5   26  38  10  0.79
 (full 40 in the script output). Total 2D id-switch events **517**; mean multi-id tracklets
 **5.5/delivery**; P6 coverage min/median/max **0.48 / 0.80 / 0.92**.
 
-## Table 3 — camera-pair split tally (from `split_identity.py`, 7-delivery sample)
+## Table 3, camera-pair split tally (from `split_identity.py`, 7-delivery sample)
 
 ```
 cam_01-cam_04: 5030     <- FACING PAIR, #1
@@ -111,6 +111,6 @@ cam_03-cam_05:  769     <- facing pair
 ```
 **cam_04 (end-on) appears in the top of nearly every pair**; cam_07 (panoramic) is the
 other repeat offender. Note the metric's own caveat: cam_04's grazing bbox-bottom ground
-projection has large depth error, so some of its clustering is spurious — but the recorded
+projection has large depth error, so some of its clustering is spurious, but the recorded
 `cross_camera_disagreement_examples` (see `05-...`) confirm the split is real, not just a
 projection artifact.

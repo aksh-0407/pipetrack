@@ -22,18 +22,18 @@ invariant or another clip. See [reference/metrics.md](reference/metrics.md).
 ## Where the quality lives (measured)
 
 The calibration is centimetre-accurate and **3D location is largely solved** (the emitted
-ground error is down ~36% and jitter is halved). **Identity is now the dominant ceiling** —
+ground error is down ~36% and jitter is halved). **Identity is now the dominant ceiling** , 
 mosaics place players correctly but their IDs swap and fragment. In rough priority:
 
 1. **Cross-camera under-merge** on the low-parallax facing pairs (`cam_01↔04`, `02↔06`,
-   `03↔05`) — the epipolar geometry is weak and the colour cue is dead, so two views of one
+   `03↔05`), the epipolar geometry is weak and the colour cue is dead, so two views of one
    player become two IDs.
-2. **Fragmentation / over-segmentation** — players lost through occlusion are re-born as new
-   IDs; stitching under-merges. 18–25 IDs vs a ~13 roster.
-3. **The colour-appearance cue is effectively dead** (d′ ≈ 0) — both teams wear near-identical
+2. **Fragmentation / over-segmentation**, players lost through occlusion are re-born as new
+   IDs; stitching under-merges. 18-25 IDs vs a ~13 roster.
+3. **The colour-appearance cue is effectively dead** (d′ ≈ 0), both teams wear near-identical
    kit and the footage is desaturated. Body proportions (pose-shape) and a learned,
    kit-robust re-ID embedding are the substitutes to invest in.
-4. **Teleports** — an ID jumps to a different nearby person in crowds/occlusion.
+4. **Teleports**, an ID jumps to a different nearby person in crowds/occlusion.
 
 The open issues, their evidence, and prioritised fixes are enumerated per phase in the
 [pipeline reference](pipeline/README.md) and in the measured [diagnosis/](diagnosis/README.md) (
@@ -41,16 +41,16 @@ The open issues, their evidence, and prioritised fixes are enumerated per phase 
 
 ## The levers the code already gives you
 
-- **2D denoising** — the P1 output feeds everything, so cleaner 2D helps every stage.
+- **2D denoising**, the P1 output feeds everything, so cleaner 2D helps every stage.
   Confidence gating, outlier rejection, and temporal smoothing of keypoints (One-Euro /
   Savitzky-Golay) are the front-line jitter levers.
-- **Multi-view geometric denoising** — `src/identity/common/triangulation.py`
+- **Multi-view geometric denoising**, `src/identity/common/triangulation.py`
   (`ransac_triangulate_point`, `triangulate_skeleton_ransac`) rejects a bad view using the
   geometry of the others; `confidence_ema_smooth` smooths the 3D trajectory.
-- **Ground-plane solving** — `src/identity/common/geometry.py` (`ground_from_reprojection`
+- **Ground-plane solving**, `src/identity/common/geometry.py` (`ground_from_reprojection`
   = the `z0_reproj` emitter, `ground_covariance`, `robust_fuse_ground`) turns multi-view foot
   pixels into a position with uncertainty on the low-parallax facing geometry.
-- **Cue fusion** — the P3 tracklet graph fuses ground/epipolar/appearance/pose-shape/motion
+- **Cue fusion**, the P3 tracklet graph fuses ground/epipolar/appearance/pose-shape/motion
   as log-likelihood ratios; the 05 global-id Singer-KF + min-cost-flow stitcher maintain identity.
   Most improvements are new/stronger cues or better gates behind a `configs/*` flag.
 

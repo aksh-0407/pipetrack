@@ -128,10 +128,11 @@ def parse_args() -> argparse.Namespace:
     rt.add_argument("--run-id", default=None, help="Run identifier (default: auto timestamp)")
     rt.add_argument("--det-batch-size", type=int, default=24, help="Frames per detector call")
     rt.add_argument("--pose-batch-size", type=int, default=256, help="Crops per RTMPose call")
-    rt.add_argument("--io-workers", type=int, default=12, help="Decode prefetch threads")
-    rt.add_argument("--cv2-threads", type=int, default=2,
-                    help="OpenCV internal threads per decode call (default: 2). Kept low so "
-                         "io-workers x cv2 threads does not oversubscribe the CPU.")
+    rt.add_argument("--io-workers", type=int, default=8, help="Decode prefetch threads")
+    rt.add_argument("--cv2-threads", type=int, default=1,
+                    help="OpenCV internal threads per decode call (default: 1). Kept low so "
+                         "io-workers x cv2 threads does not oversubscribe the CPU (8-core box: "
+                         "8 io-workers x 1 = 8).")
     rt.add_argument("--prefetch-batches", type=int, default=3,
                     help="Detector batches to read+decode ahead on the io-workers while the "
                          "GPU runs the current batch (default: 3). Overlaps cold-disk reads "

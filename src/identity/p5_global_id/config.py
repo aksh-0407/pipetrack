@@ -185,6 +185,16 @@ class P4AConfig:
     emit_velocity_gate: bool = False
     emit_velocity_max_mps: float = 12.0
     emit_velocity_max_consec_drops: int = 5
+    # Pre-identity 3D-ground smoothing (experiment 2026-07-17). Before global-id tracks anything,
+    # each P3 binding's ground_xy trajectory (the position 05 associates on) is temporally smoothed
+    # with the same zero-phase Butterworth used by 07 refine's root de-wobble, so identity is decided
+    # on a cleaner, less jumpy signal instead of raw per-frame fused feet. This moves 3D-ground
+    # smoothing BEFORE identity rather than after. Keyed by binding_id (the pre-identity cluster), so
+    # it never mixes players. False = disabled (byte-identical). Only contiguous segments longer than
+    # the filter padding are smoothed; short fragments and NaN gaps are left untouched.
+    presmooth_ground_enabled: bool = False
+    presmooth_ground_cutoff_hz: float = 3.0
+    presmooth_ground_min_frames: int = 16
     role_params: dict[str, dict[str, float]] = field(default_factory=_default_role_params)
 
     def __post_init__(self) -> None:
@@ -244,6 +254,11 @@ class P4AConfig:
             raise ValueError("single_view_hip_fallback must be a boolean")
         if type(self.emit_velocity_gate) is not bool:
             raise ValueError("emit_velocity_gate must be a boolean")
+        if type(self.presmooth_ground_enabled) is not bool:
+            raise ValueError("presmooth_ground_enabled must be a boolean")
+        _positive("presmooth_ground_cutoff_hz", self.presmooth_ground_cutoff_hz)
+        if type(self.presmooth_ground_min_frames) is not int or self.presmooth_ground_min_frames < 1:
+            raise ValueError("presmooth_ground_min_frames must be a positive integer")
         _positive("emit_velocity_max_mps", self.emit_velocity_max_mps)
         if type(self.emit_velocity_max_consec_drops) is not int or self.emit_velocity_max_consec_drops < 0:
             raise ValueError("emit_velocity_max_consec_drops must be a non-negative integer")

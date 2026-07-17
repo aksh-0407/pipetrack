@@ -97,6 +97,30 @@ class KalmanBoxTracker:
     def inflate_process_noise(self, factor: float) -> None:
         self._q = min(self._q * float(factor), 1.0e5)
 
+    def reupdate_virtual(self, prev_bbox_xywh: list[float], new_bbox_xywh: list[float], gap: int) -> None:
+        """OC-SORT ORU: re-derive the state from a virtual straight trajectory.
+
+        A track lost for ``gap`` frames has dead-reckoned on its stale pre-gap velocity
+        (the constant-velocity error that fragments sharp manoeuvres). On recovery, re-anchor
+        the filter at the last real observation and walk predict()/update() along ``gap``
+        linearly-interpolated virtual observations to the new one, so the velocity and
+        covariance reflect the ACTUAL displacement over the gap rather than the drift.
+        Ends exactly at ``new_bbox_xywh`` (its final update), so the posterior matches a
+        normal update but with a corrected trajectory behind it.
+        """
+        steps = max(int(gap), 1)
+        p = np.array(self._to_cxcywh(prev_bbox_xywh), dtype=float)
+        n = np.array(self._to_cxcywh(new_bbox_xywh), dtype=float)
+        # Re-anchor at the last real observation with a fresh (uncertain) covariance.
+        self._x = np.array([p[0], p[1], p[2], p[3], 0.0, 0.0, 0.0, 0.0], dtype=float)
+        self._P = np.eye(8) * 10.0
+        self._P[4:, 4:] *= 1000.0
+        self._q = 1.0
+        for s in range(1, steps + 1):
+            v = p + (n - p) * (s / steps)
+            self.predict()
+            self.update([v[0] - v[2] / 2.0, v[1] - v[3] / 2.0, v[2], v[3]])
+
     def reseed(self, bbox_xywh: list[float], keep_velocity: np.ndarray) -> None:
         cx, cy, w, h = self._to_cxcywh(bbox_xywh)
         self._x = np.array(

@@ -8,7 +8,7 @@ From a fresh checkout to a **rendered mosaic** on one cricket delivery. Every st
 - **Linux with an NVIDIA GPU** (P1 pose inference is the throughput bottleneck).
 - **Conda** on your `PATH`; a single env named **`pose-lab`** runs everything.
 - The frame dataset at `data/raw/<dataset>/bt_0{1,2,3}/<delivery>/camera<NN>/frame_*.jpg`
-  and calibration under `data/raw/8_init/calibration-data/` (not committed — provided out of band).
+  and calibration under `data/raw/8_init/calibration-data/` (not committed, provided out of band).
 
 ```bash
 pip install -e .            # puts src/ on the path (core.* / identity.* / tools.*)
@@ -17,7 +17,7 @@ python tools/check_environment.py
 
 **✓ Check:** it prints your Python version and, if a GPU is visible, your CUDA device.
 
-## Step 0 — Confirm the checkout is healthy
+## Step 0, Confirm the checkout is healthy
 
 ```bash
 python -m pytest -q
@@ -26,7 +26,7 @@ python tools/audit_repo.py --fail
 
 **✓ Check:** tests pass and the audit prints `Repository hygiene audit passed`.
 
-## Step 1 — Set up the P1 model (RTMPose-X + RTMDet detector)
+## Step 1, Set up the P1 model (RTMPose-X + RTMDet detector)
 
 P1 is top-down: an RTMDet person detector feeds the RTMPose-X pose model, both in `pose-lab`.
 
@@ -39,7 +39,7 @@ python tools/check_assets.py --models rtmpose_x_body8 --fail-missing
 **✓ Check:** `check_assets` exits 0 with the RTMPose-X pose weights and the RTMDet detector
 weights present under `models/`. Full runbook: [rtmpose-x-runbook.md](rtmpose-x-runbook.md).
 
-## Step 2 — P1: 2D pose over the delivery
+## Step 2, P1: 2D pose over the delivery
 
 ```bash
 python -m core.inference.run_phase1_rtmpose_inference \
@@ -50,9 +50,9 @@ python -m core.inference.run_phase1_rtmpose_inference \
 **✓ Check:** `data/derived/8_init/pipetrack_v9/CCPL080626M1_1_14_1/00_inference/predictions/` has
 7 JSONL files (one per camera), ~600 lines each. Every player record carries `pose_2d` (Halpe-26, 26 joints).
 
-## Step 3 — Run the identity chain
+## Step 3, Run the identity chain
 
-The whole chain (stabilization → tracking → association → lift → global-id → roles) is one command:
+The whole chain (stabilization to tracking to association to lift to global-id to roles) is one command:
 
 ```bash
 python -m main --dataset 8_init --version 9 --deliveries CCPL080626M1_1_14_1
@@ -78,9 +78,9 @@ python -m identity.p5_global_id.run_global_id \
 
 **✓ Check:** `$ROOT/05_global_id/` contains `predictions/*.jsonl` with `global_player_id`,
 `diagnostics/ground_tracks.jsonl`, and `global_id_metrics.json`. In the metrics, distinct IDs
-should be near the ~13–15 roster and same-camera collisions should be 0.
+should be near the ~13-15 roster and same-camera collisions should be 0.
 
-## Step 4 — Render the mosaic
+## Step 4, Render the mosaic
 
 ```bash
 python -m identity.visualization.render_videos \
@@ -90,9 +90,9 @@ python -m identity.visualization.render_videos \
 **✓ Check:** the mosaic `.mp4` plays: 7 camera tiles + a bird's-eye ground monitor + a roster
 panel, skeletons coloured by stable global ID. A top-down-only view is `--mode ground`.
 
-## You're done — now what?
+## You're done, now what?
 
-- Understand *why* each stage does what it does, and where it's weak → the
+- Understand *why* each stage does what it does, and where it's weak to the
   [pipeline reference](pipeline/README.md) and [architecture](architecture.md).
-- The current measured issues → [diagnosis/](diagnosis/README.md); the fix backlog →
-  [wip/to_do.md](../wip/to_do.md).
+- The current measured issues to [diagnosis/](diagnosis/README.md); the fix backlog  to 
+  [wip/open-work.md](../wip/open-work.md).

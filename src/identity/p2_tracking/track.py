@@ -60,6 +60,15 @@ class Track:
         self._spawn_frame = frame_index
         self._last_frame = frame_index
 
+        # OC-SORT: observation-centre history + last real observation bbox. Feeds OCM
+        # (velocity direction) and OCR/ORU (last-observation matching + virtual re-update).
+        # Populated for every tracker; only READ when config.tracker == "ocsort", so the
+        # bytetrack path stays byte-identical.
+        self._obs_history: deque[tuple[int, float, float]] = deque(maxlen=max(config.ocm_delta_t + 2, 5))
+        self._obs_history.append((frame_index, bbox_xywh[0] + bbox_xywh[2] / 2.0,
+                                  bbox_xywh[1] + bbox_xywh[3] / 2.0))
+        self._last_obs_bbox: list[float] = [float(v) for v in bbox_xywh]
+
         self.max_cov_trace = self.kalman.position_cov_trace()
         self.gap_count = 0
         self.max_gap_frames = 0
@@ -98,7 +107,16 @@ class Track:
         frame_index: int,
         ground_xy: np.ndarray | None = None,
     ) -> None:
-        self.kalman.update(bbox_xywh)
+        # ORU: on recovery after a gap, re-derive the KF from the virtual trajectory
+        # between the last real observation and this one (OC-SORT only; else plain update).
+        if (self._config.tracker == "ocsort" and self._config.oru_enabled
+                and self._current_gap > 0 and self._last_obs_bbox is not None):
+            self.kalman.reupdate_virtual(self._last_obs_bbox, bbox_xywh, self._current_gap)
+        else:
+            self.kalman.update(bbox_xywh)
+        self._obs_history.append((frame_index, bbox_xywh[0] + bbox_xywh[2] / 2.0,
+                                  bbox_xywh[1] + bbox_xywh[3] / 2.0))
+        self._last_obs_bbox = [float(v) for v in bbox_xywh]
         if ground_xy is not None:
             self.last_ground_xy = ground_xy.copy()
         if pose.defined:
@@ -177,6 +195,28 @@ class Track:
             self._config.ground_gate_base_m
             + (self._config.ground_vmax_mps / self._config.frame_rate_fps) * elapsed_frames
         )
+
+    def observation_velocity(self, delta_t: int) -> np.ndarray | None:
+        """OC-SORT OCM: unit velocity direction between the observation ~delta_t frames
+        back and the latest observation (raw observations, NOT the KF-smoothed velocity
+        OC-SORT deliberately avoids). None if <2 observations or degenerate."""
+        if len(self._obs_history) < 2:
+            return None
+        latest = self._obs_history[-1]
+        past = self._obs_history[max(0, len(self._obs_history) - 1 - int(delta_t))]
+        v = np.array([latest[1] - past[1], latest[2] - past[2]], dtype=float)
+        norm = float(np.linalg.norm(v))
+        return v / norm if norm > 1e-6 else None
+
+    def last_obs_center(self) -> np.ndarray:
+        _, cx, cy = self._obs_history[-1]
+        return np.array([cx, cy], dtype=float)
+
+    def last_obs_bbox(self) -> list[float]:
+        """OC-SORT OCR reference: the last REAL observation bbox (not the KF prediction)."""
+        if self._last_obs_bbox is not None:
+            return self._last_obs_bbox
+        return list(self.kalman.predicted_bbox())
 
     def gallery_repr(self) -> PoseVector | None:
         if self._gallery_repr_version == self._gallery_version:

@@ -53,6 +53,19 @@ class TrackingConfig:
     # Bit-identical to the legacy full recompute (reuses the same cosine values);
     # flag lets the byte-identity A/B prove flags-off equality.
     pose_medoid_incremental: bool = True
+    # --- OC-SORT (observation-centric tracker) -----------------------------------
+    # tracker="bytetrack" (default) is byte-identical to the historical path; every
+    # OC-SORT mechanism below is inert unless tracker="ocsort". OCM adds a velocity-
+    # direction consistency penalty to the association cost; ORU re-updates the KF
+    # along a virtual trajectory when a track is recovered after a gap (fixes the
+    # constant-velocity drift that fragments sharp manoeuvres); OCR runs a second
+    # association pass against each track's LAST OBSERVATION (not the KF prediction).
+    tracker: str = "bytetrack"
+    ocm_weight: float = 0.2
+    ocm_delta_t: int = 3
+    ocr_enabled: bool = True
+    ocr_cost_threshold: float = 0.7
+    oru_enabled: bool = True
 
     def __post_init__(self) -> None:
         _require_range("stage1_confidence_threshold", self.stage1_confidence_threshold, 0.0, 1.0)
@@ -74,8 +87,13 @@ class TrackingConfig:
             "max_ankle_above_bbox_fraction", self.max_ankle_above_bbox_fraction, 0.0, 1.0
         )
 
+        if self.tracker not in {"bytetrack", "ocsort"}:
+            raise ValueError("tracker must be one of: bytetrack, ocsort")
+        _require_range("ocm_weight", self.ocm_weight, 0.0, 1.0)
+        _require_range("ocr_cost_threshold", self.ocr_cost_threshold, 0.0, 2.0)
+
         for name in ("min_shared_keypoints", "dormant_max_frames", "tentative_confirm_hits",
-                     "tentative_confirm_window", "pose_gallery_size"):
+                     "tentative_confirm_window", "pose_gallery_size", "ocm_delta_t"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")

@@ -35,6 +35,7 @@ from identity.p5_global_id.stitching import (
     solve_flow,
 )
 from identity.common.geometry import upper_body_ground_estimate, pixel_to_plane_xy
+from identity.common.triangulation import butterworth_smooth
 from identity.p5_global_id.role_proxy import OnlineRoleProxy
 from identity.p5_global_id.track_manager import TrackManager
 from core.calibration import current_calibration_dir
@@ -184,6 +185,57 @@ def _velocity_gate_ground_rows(
     return filtered, len(dropped)
 
 
+def _presmooth_binding_ground(
+    correspondence_rows: list[dict], *, fps: float, cutoff_hz: float, min_frames: int,
+) -> int:
+    """Temporally smooth each P3 binding's ground_xy trajectory in place, BEFORE identity.
+
+    Groups the correspondence clusters by ``binding_id`` (the pre-identity cluster key, so two
+    players are never mixed) across frames, and low-pass filters each binding's ground_xy series
+    with the same zero-phase Butterworth used by 07 refine's root de-wobble. Global-id then
+    associates on this cleaner, less jumpy signal instead of raw per-frame fused feet. Mutates
+    ``cluster["ground_xy"]`` in place (the correspondence rows are consumed downstream by both the
+    tracker and the emit path). Only contiguous segments longer than the filter padding are
+    smoothed; NaN gaps and short fragments are left untouched. Returns the number of bindings
+    whose trajectory was changed.
+    """
+    by_binding: dict[str, dict[int, dict]] = defaultdict(dict)
+    for row in correspondence_rows:
+        frame_index = int(row["frame_index"])
+        for cluster in row.get("clusters", []):
+            binding_id = cluster.get("binding_id")
+            ground = cluster.get("ground_xy")
+            if binding_id is None or ground is None:
+                continue
+            xy = np.asarray(ground, dtype=float)
+            if xy.shape == (2,) and np.isfinite(xy).all():
+                by_binding[str(binding_id)][frame_index] = cluster
+    smoothed_count = 0
+    for frame_cluster in by_binding.values():
+        frames = sorted(frame_cluster)
+        if len(frames) < min_frames:
+            continue
+        lo, hi = frames[0], frames[-1]
+        seq = np.full((hi - lo + 1, 1, 3), np.nan, dtype=float)
+        for frame_index in frames:
+            seq[frame_index - lo, 0, :2] = np.asarray(
+                frame_cluster[frame_index]["ground_xy"], dtype=float
+            )
+            seq[frame_index - lo, 0, 2] = 0.0
+        smoothed = butterworth_smooth(seq, fps=fps, cutoff_hz=cutoff_hz)
+        changed = False
+        for frame_index in frames:
+            value = smoothed[frame_index - lo, 0, :2]
+            if np.isfinite(value).all():
+                new_xy = [float(value[0]), float(value[1])]
+                if new_xy != frame_cluster[frame_index]["ground_xy"]:
+                    changed = True
+                frame_cluster[frame_index]["ground_xy"] = new_xy
+        if changed:
+            smoothed_count += 1
+    return smoothed_count
+
+
 def run_global_id(
     input_run_dir: str | Path,
     output_run_dir: str | Path,
@@ -202,6 +254,20 @@ def run_global_id(
     if not correspondence_input.exists():
         raise FileNotFoundError(f"missing P3 correspondence artifact: {correspondence_input}")
     correspondence_rows = read_correspondence_rows(correspondence_input)
+    if config.p4a.presmooth_ground_enabled:
+        # Experiment (2026-07-17): smooth each binding's 3D-ground trajectory BEFORE identity, so
+        # global-id associates on a cleaner signal. Off by default = byte-identical.
+        n_smoothed = _presmooth_binding_ground(
+            correspondence_rows,
+            fps=config.frame_rate_fps,
+            cutoff_hz=config.p4a.presmooth_ground_cutoff_hz,
+            min_frames=config.p4a.presmooth_ground_min_frames,
+        )
+        print(
+            f"presmooth_ground: smoothed {n_smoothed} binding trajectories "
+            f"(cutoff {config.p4a.presmooth_ground_cutoff_hz} Hz)",
+            flush=True,
+        )
     correspondence_by_frame = {row["frame_index"]: row for row in correspondence_rows}
     missing_rows = sorted(set(records_by_frame) - set(correspondence_by_frame))
     if missing_rows:

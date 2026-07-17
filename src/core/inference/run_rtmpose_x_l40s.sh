@@ -23,8 +23,9 @@ DEVICE="${DEVICE:-cuda:0}"
 RUN_ID="${RUN_ID:-rtmpose-x-l40s}"
 DET_BATCH_SIZE="${DET_BATCH_SIZE:-24}"
 POSE_BATCH_SIZE="${POSE_BATCH_SIZE:-256}"
-IO_WORKERS="${IO_WORKERS:-16}"
-CV2_THREADS="${CV2_THREADS:-2}"
+# 8-core box: io-workers x cv2-threads should stay near the core count. 8 x 1 = 8.
+IO_WORKERS="${IO_WORKERS:-8}"
+CV2_THREADS="${CV2_THREADS:-1}"
 PREFETCH_BATCHES="${PREFETCH_BATCHES:-4}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 

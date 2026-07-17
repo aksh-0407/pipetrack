@@ -39,6 +39,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -437,6 +438,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    # This is the parallel batch driver: --render-jobs renders run concurrently, so
+    # default the mosaic renderer to CPU JPEG decode. GPU decode has each of N render
+    # subprocesses hammer the single GPU with a per-frame device sync (contention +
+    # H2D/D2H churn); NVENC still handles the encode. An explicit external env wins.
+    os.environ.setdefault("QT_RENDER_GPU_DECODE", "0")
     # Dataset abstraction: one layout under DATA_ROOT, identical on every machine.
     # --dataset + --version derive the footage/derived/viz trees; explicit flags win.
     if args.dataset:
